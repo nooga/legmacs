@@ -44,13 +44,18 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
+          # Stage each binary outside build/: `build/legmacs` is the AOT-lowered
+          # Go package DIRECTORY, so `go build -o legmacs` there would collide
+          # with it (writes into the dir) instead of producing a file.
+          stage="$RUNNER_TEMP/legmacs-stage"
+          mkdir -p "$stage"
           for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
             os="${target%/*}"; arch="${target#*/}"
             echo "==> $os/$arch"
             (cd build && GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-               go build -trimpath -ldflags "-s -w" -o legmacs .)
-            tar -C build -czf "dist/legmacs_${version}_${os}_${arch}.tar.gz" legmacs
-            rm build/legmacs
+               go build -trimpath -ldflags "-s -w" -o "$stage/legmacs" .)
+            tar -C "$stage" -czf "dist/legmacs_${version}_${os}_${arch}.tar.gz" legmacs
+            rm "$stage/legmacs"
           done
           (cd dist && shasum -a 256 *.tar.gz > checksums.txt)
           ls -la dist
