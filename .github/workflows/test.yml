@@ -33,10 +33,12 @@ jobs:
           go-version-file: build/go.mod
 
       - name: Build lg from the pinned let-go
-        run: go build -C "$GITHUB_WORKSPACE/../let-go" -o "$GITHUB_WORKSPACE/../lg" .
+        run: |
+          go build -C "$GITHUB_WORKSPACE/../let-go" -o "$GITHUB_WORKSPACE/../lg" .
 
       - name: Run test suite
-        run: "$GITHUB_WORKSPACE/../lg" test/run.lg
+        run: |
+          "$GITHUB_WORKSPACE/../lg" test/run.lg
 
       # Full AOT native build (build lg, lower legmacs.*, bundle, go build) -- the
       # same path release.yml ships. Guards against a build break landing on main.
