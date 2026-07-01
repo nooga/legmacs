@@ -1,0 +1,60 @@
+(ns test.completion-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.completion :as c]))
+
+(deftest longest-common-prefix-cases
+  (testing "shared prefix, no shared prefix, single/empty input"
+    (is (= "eval-" (c/longest-common-prefix ["eval-buffer" "eval-last-sexp"])))
+    (is (= "" (c/longest-common-prefix ["abc" "xyz"])))
+    (is (= "abc" (c/longest-common-prefix ["abc"])))
+    (is (= "" (c/longest-common-prefix [])))))
+
+(deftest complete-input-policy
+  (testing "no candidates -> a note, input unchanged"
+    (is (= {:input "zz" :note "[No match]"} (c/complete-input "zz" []))))
+
+  (testing "exactly one candidate -> completes fully, no note"
+    (is (= {:input "forward-char" :note nil} (c/complete-input "forward-c" ["forward-char"]))))
+
+  (testing "multiple candidates with a longer common prefix -> extends, no note yet"
+    (is (= {:input "eval-" :note nil} (c/complete-input "eval" ["eval-buffer" "eval-last-sexp"]))))
+
+  (testing "multiple candidates already at the common prefix -> input unchanged, note lists them"
+    (let [result (c/complete-input "eval-" ["eval-buffer" "eval-last-sexp"])]
+      (is (= "eval-" (:input result)))
+      (is (string/includes? (:note result) "eval-buffer"))
+      (is (string/includes? (:note result) "eval-last-sexp")))))
+
+(deftest fuzzy-matching
+  (testing "a subsequence matches; a non-subsequence doesn't"
+    (is (some? (c/fuzzy-score "fch" "forward-char")))     ; f..c..h in order
+    (is (some? (c/fuzzy-score "" "anything")))            ; empty pattern matches
+    (is (nil? (c/fuzzy-score "xyz" "forward-char"))))
+
+  (testing "matching is case-insensitive"
+    (is (some? (c/fuzzy-score "FC" "forward-char"))))
+
+  (testing "an earlier, tighter match scores better (sorts first)"
+    (let [ranked (c/fuzzy-filter "for" ["before" "for-each" "reinforce"])]
+      (is (= "for-each" (first ranked)))                  ; contiguous, at the start
+      (is (= 3 (count ranked)))))                          ; all three contain f..o..r
+
+  (testing "a blank pattern keeps everything, sorted"
+    (is (= ["a" "b" "c"] (c/fuzzy-filter "" ["c" "a" "b"])))))
+
+(deftest command-completer-matches-registered-commands
+  (testing "fuzzy-matches against whatever's currently registered"
+    (is (some #{"forward-char"} (c/command-completer "forward-c")))
+    (is (some #{"forward-char"} (c/command-completer "fwc")))    ; scattered subsequence
+    (is (empty? (c/command-completer "there-is-no-command-named-this")))))
+
+(deftest path-completer-lists-matching-directory-entries
+  (testing "fuzzy-matches entries in this project, marking directories"
+    (let [matches (c/path-completer "legmacs/comp")]
+      (is (some #{"legmacs/completion.lg"} matches)))
+    (let [matches (c/path-completer "bi")]
+      (is (some #{"bin/"} matches))))
+
+  (testing "an unreadable directory yields no candidates, not an error"
+    (is (= [] (c/path-completer "no-such-dir-at-all/anything")))))

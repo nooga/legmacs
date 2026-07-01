@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve let-go ref
+        id: letgo
+        run: echo "ref=$(grep -v '^#' .let-go-version | grep . | head -1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      # Sibling of the workspace so build.sh's LETGO_DIR (../let-go) and
+      # build/go.mod's `replace => ../../let-go` both resolve to it.
+      - name: Clone let-go
+        run: |
+          git clone https://github.com/nooga/let-go.git "$GITHUB_WORKSPACE/../let-go"
+          git -C "$GITHUB_WORKSPACE/../let-go" checkout "${{ steps.letgo.outputs.ref }}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: build/go.mod
+
+      # Builds lg, lowers legmacs.* to native Go under build/legmacs, and
+      # compiles the embedded bytecode bundle build/legmacs.lgb. These outputs
+      # are host-independent Go source + bytecode; the per-platform binaries are
+      # produced by the cross-compile step below. (The host binary build.sh
+      # emits at the end is discarded -- we rebuild per target.)
+      - name: Generate AOT tree + bundle
+        run: ./build.sh
+
+      - name: Cross-compile release binaries
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "==> $os/$arch"
+            (cd build && GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+               go build -trimpath -ldflags "-s -w" -o legmacs .)
+            tar -C build -czf "dist/legmacs_${version}_${os}_${arch}.tar.gz" legmacs
+            rm build/legmacs
+          done
+          (cd dist && shasum -a 256 *.tar.gz > checksums.txt)
+          ls -la dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/checksums.txt \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+      # Cross-repo push needs a PAT (the default GITHUB_TOKEN can't write to
+      # nooga/homebrew-tap). Add GORELEASER_PAT as a repo/org secret with
+      # `repo` + `workflow` scope, same token let-go/xsofy use.
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.GORELEASER_PAT }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          branch="legmacs-${version}"
+          base="https://github.com/nooga/legmacs/releases/download/${TAG}"
+          sha() { shasum -a 256 "dist/legmacs_${version}_$1.tar.gz" | awk '{print $1}'; }
+          sha_darwin_arm64="$(sha darwin_arm64)"
+          sha_darwin_amd64="$(sha darwin_amd64)"
+          sha_linux_arm64="$(sha linux_arm64)"
+          sha_linux_amd64="$(sha linux_amd64)"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/nooga/homebrew-tap.git" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          mkdir -p Formula
+
+          cat > Formula/legmacs.rb <<RUBY
+          class Legmacs < Formula
+            desc "Terminal text editor scriptable in let-go, a Clojure-dialect Lisp"
+            homepage "https://github.com/nooga/legmacs"
+            version "${version}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${base}/legmacs_${version}_darwin_arm64.tar.gz"
+                sha256 "${sha_darwin_arm64}"
+              end
+              on_intel do
+                url "${base}/legmacs_${version}_darwin_amd64.tar.gz"
+                sha256 "${sha_darwin_amd64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/legmacs_${version}_linux_arm64.tar.gz"
+                sha256 "${sha_linux_arm64}"
+              end
+              on_intel do
+                url "${base}/legmacs_${version}_linux_amd64.tar.gz"
+                sha256 "${sha_linux_amd64}"
+              end
+            end
+
+            def install
+              bin.install "legmacs"
+            end
+
+            test do
+              # legmacs refuses to start without a TTY and exits 1; assert it
+              # got far enough to print that message rather than crash.
+              assert_match "terminal", shell_output("#{bin}/legmacs 2>&1", 1)
+            end
+          end
+          RUBY
+
+          git add Formula/legmacs.rb
+          if git diff --cached --quiet; then
+            echo "Formula/legmacs.rb already current for ${TAG}."
+            exit 0
+          fi
+          git commit -m "Update legmacs to ${TAG}"
+          git push --force-with-lease origin "$branch"
+          gh pr create \
+            --repo nooga/homebrew-tap \
+            --head "$branch" \
+            --base main \
+            --title "Update legmacs to ${TAG}" \
+            --body "Updates legmacs formula for ${TAG}."
+          gh pr merge "$branch" --repo nooga/homebrew-tap --squash --admin --delete-branch

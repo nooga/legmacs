@@ -1,0 +1,110 @@
+(ns test.lisp-syntax-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.lisp-syntax :as ls]))
+
+(deftest basic-matching
+  (testing "nested brackets all match correctly, both directions"
+    (let [text "(defn foo [x] (+ x 1))"
+          s (ls/scan text)]
+      (is (= (dec (count text)) (ls/matching s 0)))                    ;; outer ( ... )
+      (is (= (string/index-of text "]") (ls/matching s (string/index-of text "["))))
+      (is (= (string/index-of text ")") (ls/matching s (string/index-of text "(+")))))))
+
+(deftest comments-are-skipped
+  (testing "a paren inside a line comment doesn't count as structure"
+    (let [text "(a) ; comment (fake paren)\n(b)"
+          s (ls/scan text)
+          second-open (string/last-index-of text "(")]
+      (is (= (string/index-of text ")") (ls/matching s 0)))
+      (is (= (dec (count text)) (ls/matching s second-open)))
+      (is (= 1 (count (:spans s))))
+      (is (= :comment (:type (first (:spans s))))))))
+
+(deftest strings-are-skipped
+  (testing "a paren or quote inside a string doesn't count as structure"
+    (let [text "(a \"str ) with paren and \\\" escaped quote\" b)"
+          s (ls/scan text)]
+      (is (= (dec (count text)) (ls/matching s 0)))
+      (is (= 1 (count (:spans s))))
+      (is (= :string (:type (first (:spans s))))))))
+
+(deftest in-string?-distinguishes-open-from-just-closed-at-the-same-offset
+  (testing "an unterminated string scanned exactly to its own end is :in-string? true"
+    (is (:in-string? (ls/scan "\"" 1)))
+    (is (:in-string? (ls/scan "\"unterminated" 13))))
+
+  (testing "a string closed exactly at the scan's cutoff is :in-string? false, even though its
+            trailing span looks identical in shape to the unterminated case above"
+    (is (not (:in-string? (ls/scan "\"foo\"" 5))))
+    (is (= (:spans (ls/scan "\"foo\"" 5)) (:spans (ls/scan "\"foob" 5))) "same shape, different :in-string?"))
+
+  (testing "top level (no open string at all) is :in-string? false"
+    (is (not (:in-string? (ls/scan "(foo)" 5))))))
+
+(deftest char-literals-dont-confuse-the-scanner
+  (testing "\\( \\) \\\" are character literals, not real brackets/quotes"
+    (is (= {0 7 7 0} (:pairs (ls/scan "(a \\( b)"))))
+    (is (= {0 6 6 0} (:pairs (ls/scan "(a \\\"b)"))))))
+
+(deftest char-literals-produce-a-:char-span
+  (testing "a single-char literal spans just the backslash and that one char"
+    (let [s (ls/scan "(a \\( b)")]
+      (is (= [{:type :char :start 3 :end 5}] (:spans s)))))
+
+  (testing "a named literal (\\newline, \\space, ...) spans the whole word"
+    (let [s (ls/scan "(a \\newline b)")]
+      (is (= [{:type :char :start 3 :end 11}] (:spans s)))))
+
+  (testing "\\uXXXX and \\oNNN span the whole escape, not just the u/o"
+    (is (= [{:type :char :start 0 :end 6}] (:spans (ls/scan "\\u0041"))))
+    (is (= [{:type :char :start 0 :end 5}] (:spans (ls/scan "\\o101")))))
+
+  (testing "a digit character literal doesn't get confused with a number"
+    (is (= [{:type :char :start 0 :end 2}] (:spans (ls/scan "\\5")))))
+
+  (testing "a backslash character literal (\\\\) still lets real code after it scan normally"
+    (let [s (ls/scan "\\\\(foo)")]
+      (is (= [{:type :char :start 0 :end 2}] (:spans s)))
+      (is (= {2 6 6 2} (:pairs s))))))
+
+(deftest unclosed-and-mismatched-brackets-dont-crash
+  (testing "unclosed brackets leave their offsets on the stack, unmatched"
+    (let [s (ls/scan "(unclosed (nested")]
+      (is (= {} (:pairs s)))
+      (is (= [10 0] (map second (:stack s))) "innermost (most recently opened) first")))
+
+  (testing "a mismatched closer is dropped, not fatal"
+    (is (= {} (:pairs (ls/scan "(mismatched]"))))))
+
+(deftest depth-at-tracks-currently-open-brackets
+  (testing "depth grows with unmatched opens before point, ignoring closed ones"
+    (let [text "(defn foo [x]\n  (+ x 1))"]
+      (is (= 0 (ls/depth-at text 0)))
+      (is (= 2 (ls/depth-at text (string/index-of text "x]"))))  ;; inside (defn ... [x
+      (is (= 1 (ls/depth-at text (string/index-of text "(+ x")))))))  ;; [x] already closed
+
+(deftest innermost-open-before-finds-the-nearest-unclosed-bracket
+  (testing "returns [char offset] of the nearest still-open bracket"
+    (let [text "(defn foo [x]\n  body"]
+      (is (= \( (first (ls/innermost-open-before text (count text)))))
+      (is (nil? (ls/innermost-open-before "no brackets here" 5))))))
+
+(deftest innermost-pair-containing-and-enclosing-pair
+  (testing "innermost-pair-containing finds the tightest bracket pair around a point"
+    (let [text "(a (b (c) d) e)"
+          s (ls/scan text)
+          inner-open (string/index-of text "(c)")
+          inner-close (inc (string/index-of text "c)"))]
+      (is (= [inner-open inner-close] (ls/innermost-pair-containing s (inc inner-open))))))
+
+  (testing "enclosing-pair grows outward one level from a known pair's own inclusive span"
+    (let [text "(a (b (c) d) e)"
+          s (ls/scan text)
+          pair->region (fn [[o c]] [o (inc c)])
+          inner (ls/innermost-pair-containing s (inc (string/index-of text "(c)")))
+          outer (apply ls/enclosing-pair s (pair->region inner))
+          top (apply ls/enclosing-pair s (pair->region outer))]
+      (is (= [(string/index-of text "(b") (inc (string/index-of text "d)"))] outer))
+      (is (= [0 (dec (count text))] top))
+      (is (nil? (apply ls/enclosing-pair s (pair->region top)))))))

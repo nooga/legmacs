@@ -1,0 +1,128 @@
+;; legmacs — a small terminal text editor, scriptable in let-go.
+;;
+;; Usage:
+;;   lg main.lg [file]
+;;
+;; or, installed via bin/legmacs (which arranges for ~/.config/legmacs/ to be
+;; on the namespace search path so legmacs-init.lg gets picked up):
+;;
+;;   legmacs [file]
+
+(ns legmacs.main
+  (:require [term]
+            [os]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keys :as keys]
+            [legmacs.keymap :as km]
+            [legmacs.commands :as commands]
+            [legmacs.bindings :as bindings]
+            [legmacs.modes :as modes]
+            [legmacs.modes.letgo]
+            [legmacs.modes.markdown]
+            [legmacs.modes.crutch]
+            [legmacs.modes.keycast]
+            [legmacs.modes.help]
+            [legmacs.dispatch :as dispatch]
+            [legmacs.render :as render]
+            [legmacs.buffers :as bufs]))
+
+(def fallback-size [80 24])
+
+(defn- term-size []
+  (let [[cols rows] (or (term/size) fallback-size)]
+    (if (and (pos? cols) (pos? rows)) [cols rows] fallback-size)))
+
+(defn init-terminal! []
+  (when (nil? (term/size))
+    (println "legmacs: stdin/stdout must be a terminal.")
+    (os/exit 1))
+  (term/raw-mode!)
+  (term/alternate-screen)
+  (term/clear))
+
+(defn shutdown-terminal! []
+  (term/reset-style)
+  (term/show-cursor)
+  (term/main-screen)
+  (term/flush)
+  (term/restore-mode!))
+
+(def scratch-banner
+  [";; *scratch* -- a let-go-mode buffer."
+   ";; C-x C-e evaluates the sexp before point and shows the result below."
+   ";; C-j evaluates it and inserts the result right here, REPL-transcript"
+   ";; style. C-c C-e evaluates the whole buffer."
+   ""])
+
+(defn load-file-or-scratch [path]
+  (if path
+    (first (commands/new-file-state path))
+    (-> (buf/new-state nil scratch-banner)
+        (modes/switch-to-mode :let-go)
+        (assoc :cursor-row (dec (count scratch-banner))))))
+
+(defn- load-user-config! []
+  ;; legmacs-init is an ordinary namespace -- if the namespace search path
+  ;; (LG_SOURCE_PATHS, see bin/legmacs) includes a directory with
+  ;; legmacs_init.lg or legmacs-init.lg, its top-level forms (typically
+  ;; legmacs.keymap/bind-key! and legmacs.keymap/defcommand calls) run now,
+  ;; after the defaults are installed, so user bindings win.
+  (try
+    (require 'legmacs-init)
+    (catch e nil)))
+
+(defn render! [state]
+  (let [[cols rows] (term-size)
+        layout (render/dims state cols rows)
+        state (buf/ensure-visible state (:text-rows layout) (:text-cols layout))]
+    (term/write (render/frame state cols rows))
+    (term/flush)
+    state))
+
+(defn run
+  "Threads a workspace (see legmacs.buffers) rather than a single flat
+   buffer state, so multiple buffers can exist -- but render!/dispatch
+   still only ever see the flat, current-buffer view; workspace-level
+   bookkeeping (switching, opening, killing) happens in the fold back via
+   bufs/put-current, driven by whatever :buffer-command a command set."
+  [workspace]
+  (loop [workspace workspace]
+    (let [flat (render! (bufs/current workspace))
+          workspace (bufs/put-current workspace flat)]
+      (if (:quit? workspace)
+        workspace
+        (let [chord (keys/read-chord)]
+          (if (nil? chord)
+            (assoc workspace :quit? true)
+            (recur (bufs/put-current workspace (dispatch/dispatch (bufs/current workspace) chord)))))))))
+
+(defn- open-additional-buffer [workspace path]
+  (bufs/put-current workspace
+                     (assoc (bufs/current workspace)
+                            :buffer-command {:op :open-new :state (first (commands/new-file-state path))})))
+
+(defn build-workspace
+  "One buffer per command-line file argument (like `emacs a.txt b.txt`),
+   with the first one focused -- the rest are just open, reachable with
+   C-x b. No arguments at all -> the *scratch* buffer."
+  [paths]
+  (let [initial-state (load-file-or-scratch (first paths))
+        workspace (reduce open-additional-buffer (bufs/new-workspace initial-state) (rest paths))]
+    (assoc workspace :current 0)))
+
+(defn main []
+  (bindings/install!)
+  (load-user-config!)
+  (let [workspace (build-workspace *command-line-args*)]
+    (init-terminal!)
+    (try
+      (run workspace)
+      (finally
+        (shutdown-terminal!)))))
+
+;; Guard the launch so AOT compilation (`lg -c` / `lg -b`, which set
+;; *compiling-aot* true before running top-level forms to harvest the
+;; namespace chunks into a bundle) doesn't start the interactive editor.
+;; At real startup the flag is false, so the bundled binary boots normally.
+(when-not *compiling-aot* (main))

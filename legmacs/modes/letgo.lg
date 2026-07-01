@@ -1,0 +1,348 @@
+;; legmacs.modes.letgo — a small REPL built into the editor: evaluate
+;; let-go code straight out of the buffer, live, in the same process.
+;;
+;; This works because let-go's `eval`/`read-string`/`load-string` (see
+;; pkg/compiler/eval.go) compile and run an already-read form *in whatever
+;; namespace is current* -- and that's legmacs.main the whole time legmacs
+;; is running (nothing after main.lg's own `ns` form ever calls `in-ns`), so
+;; code typed here sees exactly the aliases main.lg set up: `buf/`, `keys/`,
+;; `km/`, `dispatch/`, `render/`, plus all of clojure.core unqualified. It's
+;; not a sandboxed toy evaluator -- it's the running editor's own namespace.
+
+(ns legmacs.modes.letgo
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]
+            [legmacs.lisp-syntax :as ls]))
+
+(def keymap (atom {}))
+
+;; --- syntax highlighting -------------------------------------------------
+;;
+;; Scanned one line at a time (not full-buffer-aware), so a string literal
+;; spanning multiple lines will mis-highlight at the line boundary -- the
+;; same simplification most lightweight highlighters make; getting it
+;; exactly right needs carrying scan state between lines (Emacs does this
+;; via syntax-table text properties). Paren *matching* below doesn't have
+;; this limitation since it scans the whole buffer.
+
+(def special-forms
+  #{"def" "defn" "defn-" "defmacro" "defcommand" "defcommand!" "defmethod" "defmulti"
+    "ns" "require" "import" "in-ns"
+    "let" "let*" "letfn" "loop" "recur" "fn" "fn*" "do"
+    "if" "if-let" "if-not" "when" "when-let" "when-not" "when-first" "cond" "cond->" "cond->>" "case"
+    "and" "or" "not" "->" "->>" "as->" "some->" "some->>"
+    "quote" "var" "throw" "try" "catch" "finally"
+    "doseq" "dotimes" "while" "for"
+    "atom" "deref" "swap!" "reset!"
+    "true" "false" "nil"})
+
+(defn- digit-char? [ch] (<= 48 (int ch) 57))
+
+(defn- symbol-char? [ch]
+  (let [c (int ch)]
+    (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)
+        (contains? #{45 95 42 43 33 63 60 62 61 46 47 58 39} c))))
+
+(defn- tokenize-words [line]
+  (let [chars (vec (seq line)), n (count chars)]
+    (loop [i 0, tokens []]
+      (if (>= i n)
+        tokens
+        (let [ch (nth chars i)]
+          (if (symbol-char? ch)
+            (let [j (loop [j i] (if (and (< j n) (symbol-char? (nth chars j))) (recur (inc j)) j))]
+              (recur j (conj tokens [i j (subs line i j)])))
+            (recur (inc i) tokens)))))))
+
+(defn- number-token?
+  "Same coarse dispatch rule pkg/compiler/reader.go's Read() uses to decide
+   a token is a number: starts with a digit, or +/- immediately followed by
+   one -- e.g. -5 and 0x1F are numbers, but -foo and -> are symbols."
+  [text]
+  (and (pos? (count text))
+       (let [c0 (nth text 0)]
+         (or (digit-char? c0)
+             (and (contains? #{\+ \-} c0) (> (count text) 1) (digit-char? (nth text 1)))))))
+
+(defn- keyword-token?
+  "A :foo or ::foo/bar keyword literal -- anything tokenize-words grouped
+   together (since : is a symbol-char) that starts with a colon."
+  [text]
+  (and (> (count text) 1) (= \: (nth text 0))))
+
+(defn highlight-line [line]
+  (let [scanned (ls/scan line)
+        covered? (fn [pos] (some (fn [{:keys [start end]}] (and (<= start pos) (< pos end))) (:spans scanned)))
+        span-highlights (map (fn [{:keys [type start end]}] {:style type :start start :end end}) (:spans scanned))
+        words (tokenize-words line)
+        ;; :spans now also covers character literals (legmacs.lisp-syntax/
+        ;; scan tags \5, \newline, etc. as :char), so this one check keeps
+        ;; a digit or colon inside a char literal from also being read as
+        ;; a number/keyword token.
+        plain? (fn [s] (not (covered? s)))
+        keyword-highlights (->> words
+                                 (filter (fn [[s _e text]] (and (contains? special-forms text) (plain? s))))
+                                 (map (fn [[s e _text]] {:style :keyword :start s :end e})))
+        number-highlights (->> words
+                                (filter (fn [[s _e text]] (and (number-token? text) (plain? s))))
+                                (map (fn [[s e _text]] {:style :number :start s :end e})))
+        keyword-literal-highlights (->> words
+                                         (filter (fn [[s _e text]] (and (keyword-token? text) (plain? s))))
+                                         (map (fn [[s e _text]] {:style :keyword-literal :start s :end e})))]
+    (concat span-highlights keyword-highlights number-highlights keyword-literal-highlights)))
+
+;; --- paren matching --------------------------------------------------
+;;
+;; Full-buffer-aware (unlike the per-line highlighter above), since a
+;; matched bracket routinely spans many lines. Runs as :after-command, so
+;; it stays current after every edit or cursor move while let-go-mode is
+;; active -- see legmacs.modes/register-mode!.
+
+(defn- char-at [text offset]
+  (when (< -1 offset (count text)) (first (subs text offset (inc offset)))))
+
+(defn update-paren-match
+  "Emacs show-paren-mode's rule: if the character *after* point is an
+   open bracket, or the character *before* point is a close bracket,
+   highlight it and its match. Otherwise clear :paren-match."
+  [state]
+  (let [text (buf/buffer-text state)
+        offset (buf/offset-of state (:cursor-row state) (:cursor-col state))
+        after (char-at text offset)
+        before (char-at text (dec offset))
+        point (cond
+                (and after (ls/open-bracket? after)) offset
+                (and before (ls/close-bracket? before)) (dec offset)
+                :else nil)]
+    (assoc state :paren-match
+           (when point
+             (when-let [match (ls/matching (ls/scan text) point)]
+               [(buf/row-col-of state point) (buf/row-col-of state match)])))))
+
+;; --- auto-pairing brackets ----------------------------------------------
+;;
+;; Emacs electric-pair-mode's core behavior, scoped to (), [], {}: typing an
+;; opener inserts its closer too, cursor between them; typing a closer that
+;; already sits right under the cursor just moves over it instead of
+;; inserting a second one; backspacing between an empty pair (`(|)`) deletes
+;; both sides at once. All three stand down inside a string or comment so
+;; pairing doesn't kick in while typing literal punctuation inside
+;; string/comment text.
+;;
+;; Deliberately *not* legmacs.lisp-syntax/in-string-or-comment? on a full
+;; scan: that answers "does an already-typed character at this offset fall
+;; inside a string/comment," using a half-open span (:end exclusive) --
+;; correct for update-paren-match's already-typed brackets, but wrong for
+;; *point itself* sitting at the end of an in-progress string, e.g. right
+;; after typing the opening `"` of `"|`: point's offset there equals the
+;; span's own (still-open) :end, which the exclusive check reads as
+;; "just past it," not "inside it." legmacs.lisp-syntax/scan's :in-string?
+;; (scanning only up to point) exists for exactly this question; comments
+;; don't share the ambiguity (nothing "closes" a comment early the way a
+;; closing quote does), so a plain end-of-span check suffices for those.
+
+(def ^:private open->close-char {\( \) \[ \] \{ \}})
+
+(defn- point-in-string-or-comment? [text offset]
+  (let [scanned (ls/scan text offset)]
+    (or (:in-string? scanned)
+        (some (fn [{:keys [type end]}] (and (= type :comment) (= end offset))) (:spans scanned)))))
+
+(defn- point-info [state]
+  (let [text (buf/buffer-text state)
+        offset (buf/offset-of state (:cursor-row state) (:cursor-col state))]
+    {:before (char-at text (dec offset))
+     :after (char-at text offset)
+     :in-str-or-comment? (point-in-string-or-comment? text offset)}))
+
+(defn- insert-pair [state open-ch close-ch]
+  (if (:in-str-or-comment? (point-info state))
+    (buf/insert-string state (str open-ch))
+    (-> state
+        (buf/insert-string (str open-ch close-ch))
+        (update :cursor-col dec))))
+
+(defcommand auto-insert-paren
+  "\"(\" in let-go-mode: insert \"()\" with point between them, unless
+   point is inside a string or comment."
+  [state] (insert-pair state \( \)))
+
+(defcommand auto-insert-bracket
+  "\"[\" in let-go-mode: insert \"[]\" with point between them, unless
+   point is inside a string or comment."
+  [state] (insert-pair state \[ \]))
+
+(defcommand auto-insert-brace
+  "\"{\" in let-go-mode: insert \"{}\" with point between them, unless
+   point is inside a string or comment."
+  [state] (insert-pair state \{ \}))
+
+(defn- skip-or-insert-close [state close-ch]
+  (let [{:keys [after in-str-or-comment?]} (point-info state)]
+    (if (and (not in-str-or-comment?) (= after close-ch))
+      (buf/move-right state)
+      (buf/insert-string state (str close-ch)))))
+
+(defcommand auto-close-paren
+  "\")\" in let-go-mode: move over a following \")\" rather than inserting
+   a second one, unless point is inside a string or comment."
+  [state] (skip-or-insert-close state \)))
+
+(defcommand auto-close-bracket
+  "\"]\" in let-go-mode: move over a following \"]\" rather than inserting
+   a second one, unless point is inside a string or comment."
+  [state] (skip-or-insert-close state \]))
+
+(defcommand auto-close-brace
+  "\"}\" in let-go-mode: move over a following \"}\" rather than inserting
+   a second one, unless point is inside a string or comment."
+  [state] (skip-or-insert-close state \}))
+
+(defcommand auto-delete-pair
+  "DEL in let-go-mode: backspacing right between an empty auto-inserted
+   pair (e.g. \"(|)\") deletes both characters; otherwise a normal
+   backward delete."
+  [state]
+  (let [{:keys [before after in-str-or-comment?]} (point-info state)]
+    (if (and before (not in-str-or-comment?) (= after (get open->close-char before)))
+      (-> state buf/delete-char-forward buf/delete-char-backward)
+      (buf/delete-char-backward state))))
+
+(defn- format-result [v]
+  (try (pr-str v) (catch e (str "#<unprintable " (ex-message e) ">"))))
+
+(defn- last-sexp-before-point [state]
+  (let [text (buf/text-before-cursor state)]
+    (try
+      (let [forms (read-all-string text)]
+        (if (seq forms) [:ok (last forms)] [:none nil]))
+      (catch e [:error (ex-message e)]))))
+
+(defn- run-eval [state f]
+  (let [[status form] (last-sexp-before-point state)]
+    (case status
+      :none (assoc state :message "No preceding sexp")
+      :error (assoc state :message (str "Read error: " form))
+      (try
+        (f state form (eval form))
+        (catch e (assoc state :message (str "Eval error: " (ex-message e))))))))
+
+(defcommand eval-last-sexp
+  "Evaluate the s-expression immediately before point; show the result in
+   the echo area, like Emacs's C-x C-e."
+  [state]
+  (run-eval state (fn [state _form result]
+                     (assoc state :message (str "=> " (format-result result))))))
+
+(defcommand eval-print-last-sexp
+  "Evaluate the s-expression immediately before point and insert the
+   result right after it, like Emacs's C-j in lisp-interaction-mode --
+   this is what makes *scratch* feel like a REPL transcript."
+  [state]
+  (run-eval state (fn [state _form result]
+                     (buf/insert-string state (str "\n" (format-result result))))))
+
+(defcommand eval-buffer
+  "Evaluate the entire buffer, top to bottom, as one `load-string`."
+  [state]
+  (try
+    (let [result (load-string (buf/buffer-text state))]
+      (assoc state :message (str "=> " (format-result result))))
+    (catch e (assoc state :message (str "Eval error: " (ex-message e))))))
+
+;; --- auto-indent --------------------------------------------------------
+
+(def indent-width 2)
+
+(defcommand newline-and-indent
+  "RET in let-go-mode: insert a newline, then indent it by paren depth --
+   depth*indent-width spaces, not column-aligned to the opening form (a
+   simpler rule than real Lisp indenters use, but a lot less code, and
+   still gets the common case -- nested defn/let/if bodies -- right)."
+  [state]
+  (let [state (buf/insert-newline state)
+        text (buf/text-before-cursor state)
+        depth (ls/depth-at text (count text))]
+    (buf/insert-string state (apply str (repeat (* indent-width depth) \space)))))
+
+;; --- expand-region / contract-region -------------------------------------
+;;
+;; Structural selection: grow the region outward one syntactic unit at a
+;; time -- the word at point, then its innermost enclosing sexp (brackets
+;; included), then the next sexp up, and so on -- using the same paren-pair
+;; map paren-matching is built on. Each step is pushed onto :expand-stack
+;; so contract-region can shrink back to exactly where it was, the same way
+;; the real expand-region package works.
+;;
+;; Known simplification: :expand-stack isn't reset by other commands, so
+;; interleaving expand-region with unrelated edits/motions and then
+;; contracting can restore a stale-looking region. Harmless, just a little
+;; surprising -- not worth the bookkeeping to fix for v1.
+
+(defn- pair->region [[o c]] [o (inc c)])
+
+(defn- region-offsets [state]
+  (when-let [[[sr sc] [er ec]] (buf/region-bounds state)]
+    [(buf/offset-of state sr sc) (buf/offset-of state er ec)]))
+
+(defn- set-region-from-offsets [state start end]
+  (let [[msr msc] (buf/row-col-of state start)
+        [csr csc] (buf/row-col-of state end)]
+    (assoc state :mark [msr msc] :cursor-row csr :cursor-col csc)))
+
+(defn- word-region-at-point [state]
+  (when-let [[[sr sc] [er ec]] (buf/symbol-bounds-at state)]
+    [(buf/offset-of state sr sc) (buf/offset-of state er ec)]))
+
+(defn- next-region-to-select [state]
+  (let [scanned (ls/scan (buf/buffer-text state))
+        current (region-offsets state)]
+    (if current
+      (let [[s e] current]
+        (when-let [pair (ls/enclosing-pair scanned s e)] (pair->region pair)))
+      (or (word-region-at-point state)
+          (let [point (buf/offset-of state (:cursor-row state) (:cursor-col state))]
+            (when-let [pair (ls/innermost-pair-containing scanned point)] (pair->region pair)))))))
+
+(defcommand expand-region
+  "Grow the selection outward by one syntactic unit."
+  [state]
+  (if-let [[s e] (next-region-to-select state)]
+    (-> state
+        (update :expand-stack conj (region-offsets state))
+        (set-region-from-offsets s e))
+    (assoc state :message "Nothing more to select")))
+
+(defcommand contract-region
+  "Undo the last expand-region step."
+  [state]
+  (if (seq (:expand-stack state))
+    (let [prev (first (:expand-stack state))
+          state (update state :expand-stack rest)]
+      (if prev
+        (apply set-region-from-offsets state prev)
+        (assoc state :mark nil)))
+    (assoc state :message "Nothing to contract")))
+
+(km/bind-key! keymap "C-x C-e" :eval-last-sexp)
+(km/bind-key! keymap "C-j" :eval-print-last-sexp)
+(km/bind-key! keymap "C-c C-e" :eval-buffer)
+(km/bind-key! keymap "RET" :newline-and-indent)
+(km/bind-key! keymap "C-c e" :expand-region)
+(km/bind-key! keymap "C-c u" :contract-region)
+(km/bind-key! keymap "(" :auto-insert-paren)
+(km/bind-key! keymap "[" :auto-insert-bracket)
+(km/bind-key! keymap "{" :auto-insert-brace)
+(km/bind-key! keymap ")" :auto-close-paren)
+(km/bind-key! keymap "]" :auto-close-bracket)
+(km/bind-key! keymap "}" :auto-close-brace)
+(km/bind-key! keymap "DEL" :auto-delete-pair)
+
+(modes/register-mode! :let-go keymap
+                       (str "let-go-mode: C-x C-e eval-last-sexp, C-j eval-print-last-sexp, "
+                            "C-c C-e eval-buffer, RET auto-indents, C-c e/u expand/contract-region")
+                       {:highlighter highlight-line
+                        :after-command update-paren-match})
+(modes/register-auto-mode! ".lg" :let-go)

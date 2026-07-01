@@ -1,0 +1,237 @@
+(ns test.letgo-mode-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as dispatch]
+            [legmacs.modes.letgo :as lg-mode]))
+
+(bindings/install!)
+
+(defn- at-end [state]
+  (let [row (dec (count (:lines state)))]
+    (assoc state :cursor-row row :cursor-col (count (nth (:lines state) row)))))
+
+(deftest eval-last-sexp-shows-result-in-message
+  (testing "evaluates the sexp before point, leaves the buffer untouched"
+    (let [s (at-end (buf/new-state nil ["(+ 1 2 3)"]))
+          s (lg-mode/eval-last-sexp s)]
+      (is (= "=> 6" (:message s)))
+      (is (= ["(+ 1 2 3)"] (:lines s)))))
+
+  (testing "only the LAST sexp before point is evaluated, not earlier ones"
+    ;; mirrors real Emacs eval-last-sexp: a `def` earlier on the same line
+    ;; isn't implicitly evaluated just because it's textually before point
+    (let [s (at-end (buf/new-state nil ["(+ 1 2) (+ 10 20)"]))
+          s (lg-mode/eval-last-sexp s)]
+      (is (= "=> 30" (:message s)))))
+
+  (testing "no sexp before point reports itself instead of erroring"
+    (let [s (lg-mode/eval-last-sexp (buf/new-state nil [""]))]
+      (is (= "No preceding sexp" (:message s)))))
+
+  (testing "a runtime error during eval is caught and reported, not raised"
+    (let [s (at-end (buf/new-state nil ["(/ 1 0)"]))
+          s (lg-mode/eval-last-sexp s)]
+      (is (string/includes? (:message s) "Eval error"))
+      (is (string/includes? (:message s) "divide by zero")))))
+
+(deftest eval-print-last-sexp-inserts-the-result
+  (testing "inserts the printed result right after point, REPL-transcript style"
+    (let [s (at-end (buf/new-state nil ["(+ 1 2)"]))
+          s (lg-mode/eval-print-last-sexp s)]
+      (is (= ["(+ 1 2)" "3"] (:lines s))))))
+
+(deftest eval-buffer-runs-the-whole-thing
+  (testing "evaluates every form top to bottom; later forms see earlier defs"
+    (let [s (buf/new-state nil ["(def letgo-mode-test-a 10)" "(def letgo-mode-test-b 20)" "(+ letgo-mode-test-a letgo-mode-test-b)"])
+          s (lg-mode/eval-buffer s)]
+      (is (= "=> 30" (:message s))))))
+
+(deftest let-go-mode-is-registered-for-dot-lg-files
+  (testing ".lg is in the auto-mode-alist, pointing at :let-go"
+    (is (= :let-go (modes/mode-for-filename "foo.lg")))))
+
+(deftest highlight-line-cases
+  (testing "special forms are tagged :keyword"
+    (let [spans (lg-mode/highlight-line "(defn foo [x] x)")]
+      (is (some #(= {:style :keyword :start 1 :end 5} %) spans))))
+
+  (testing "strings and comments are tagged, and their contents aren't also scanned for keywords"
+    (let [spans (lg-mode/highlight-line "\"def is not a keyword in here\" ; nor is def here")]
+      (is (= 2 (count spans)))
+      (is (every? #(not= :keyword (:style %)) spans))))
+
+  (testing "a word that isn't a special form isn't highlighted at all"
+    (is (empty? (lg-mode/highlight-line "(my-function foo bar)"))))
+
+  (testing "integers, floats, hex, ratios and BigInt/BigDecimal suffixes are tagged :number"
+    (is (some #(= {:style :number :start 7 :end 9} %) (lg-mode/highlight-line "(def x 42)")))
+    (is (some #(= {:style :number :start 7 :end 12} %) (lg-mode/highlight-line "(def y -3.14)")))
+    (is (some #(= {:style :number :start 7 :end 11} %) (lg-mode/highlight-line "(def z 0xFF)")))
+    (is (some #(= {:style :number :start 7 :end 10} %) (lg-mode/highlight-line "(def r 3/4)")))
+    (is (some #(= {:style :number :start 9 :end 13} %) (lg-mode/highlight-line "(def big 123N)"))))
+
+  (testing "a leading -/+ only reads as a number sign when a digit follows, mirroring the reader"
+    (let [spans (lg-mode/highlight-line "(-> x foo)")]
+      (is (some #(= {:style :keyword :start 1 :end 3} %) spans))
+      (is (not (some #(= :number (:style %)) spans))))
+    (let [spans (lg-mode/highlight-line "(- 5 3)")]
+      (is (some #(= {:style :number :start 3 :end 4} %) spans))
+      (is (some #(= {:style :number :start 5 :end 6} %) spans))))
+
+  (testing ":foo and ::bar keyword literals are tagged :keyword-literal, distinct from :keyword"
+    (let [spans (lg-mode/highlight-line "(assoc m :foo 1 ::bar 2)")]
+      (is (some #(= {:style :keyword-literal :start 9 :end 13} %) spans))
+      (is (some #(= {:style :keyword-literal :start 16 :end 21} %) spans))))
+
+  (testing "a character literal for a digit isn't mistaken for a numeric literal"
+    (let [spans (lg-mode/highlight-line "(def c \\5)")]
+      (is (not (some #(= :number (:style %)) spans)))))
+
+  (testing "character literals (single-char, named, and \\uXXXX) are tagged :char"
+    (is (some #(= {:style :char :start 7 :end 9} %) (lg-mode/highlight-line "(def c \\5)")))
+    (is (some #(= {:style :char :start 7 :end 15} %) (lg-mode/highlight-line "(def c \\newline)")))
+    (is (some #(= {:style :char :start 7 :end 13} %) (lg-mode/highlight-line "(def c \\u0041)")))))
+
+(deftest update-paren-match-cases
+  (testing "point right before an open bracket highlights it and its match"
+    (let [s (assoc (buf/new-state nil ["(defn foo [x]" "  (+ x 1))"]) :cursor-row 0 :cursor-col 0)]
+      (is (= [[0 0] [1 9]] (:paren-match (lg-mode/update-paren-match s))))))
+
+  (testing "point right after a close bracket highlights it and its match"
+    (let [s (assoc (buf/new-state nil ["(defn foo [x]" "  (+ x 1))"]) :cursor-row 1 :cursor-col 10)]
+      (is (= [[1 9] [0 0]] (:paren-match (lg-mode/update-paren-match s))))))
+
+  (testing "point not adjacent to any bracket clears the match"
+    (let [s (assoc (buf/new-state nil ["(foo bar)"]) :cursor-row 0 :cursor-col 3)]
+      (is (nil? (:paren-match (lg-mode/update-paren-match s))))))
+
+  (testing "an unmatched bracket has no match to show, but doesn't error"
+    (let [s (assoc (buf/new-state nil ["(foo bar"]) :cursor-row 0 :cursor-col 0)]
+      (is (nil? (:paren-match (lg-mode/update-paren-match s))))))
+
+  (testing "at the very start/end of the buffer, doesn't error looking one char out of bounds"
+    (let [s (assoc (buf/new-state nil ["x"]) :cursor-row 0 :cursor-col 0)]
+      (is (nil? (:paren-match (lg-mode/update-paren-match s)))))
+    (let [s (assoc (buf/new-state nil ["x"]) :cursor-row 0 :cursor-col 1)]
+      (is (nil? (:paren-match (lg-mode/update-paren-match s)))))))
+
+(deftest update-paren-match-runs-automatically-while-in-let-go-mode
+  (testing "dispatching a movement command in let-go-mode keeps :paren-match current"
+    (let [s (-> (buf/new-state nil ["(foo)"])
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "C-a"))] ;; move-beginning-of-line, point now right before "("
+      (is (= [[0 0] [0 4]] (:paren-match s))))))
+
+(deftest auto-pairing-cases
+  (testing "typing an opener inserts its closer too, point between them"
+    (let [s (dispatch/dispatch (modes/switch-to-mode (buf/new-state nil [""]) :let-go) "(")]
+      (is (= ["()"] (:lines s)))
+      (is (= 1 (:cursor-col s)))))
+
+  (testing "typing a closer that's already right under point moves over it instead of doubling it"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                     ["(" "f" "o" "o" ")"])]
+      (is (= ["(foo)"] (:lines s)))
+      (is (= 5 (:cursor-col s)))))
+
+  (testing "nested pairs skip-over correctly all the way out"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                     ["(" "(" ")" ")"])]
+      (is (= ["(())"] (:lines s)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "a closer with no matching opener under point just inserts normally"
+    (let [s (dispatch/dispatch (modes/switch-to-mode (buf/new-state nil [""]) :let-go) ")")]
+      (is (= [")"] (:lines s)))))
+
+  (testing "backspacing between an empty auto-inserted pair deletes both sides"
+    (let [s (dispatch/dispatch
+             (dispatch/dispatch (modes/switch-to-mode (buf/new-state nil [""]) :let-go) "(")
+             "DEL")]
+      (is (= [""] (:lines s)))
+      (is (= 0 (:cursor-col s)))))
+
+  (testing "backspacing when point isn't between an empty pair is a normal delete"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                     ["a" "b" "DEL"])]
+      (is (= ["a"] (:lines s)))))
+
+  (testing "inside an (unterminated) string, an opener doesn't pair"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                     ["\"" "("])]
+      (is (= ["\"("] (:lines s))))))
+
+(deftest newline-and-indent-cases
+  (testing "indents the new line by paren depth * 2 spaces"
+    (let [s (at-end (buf/new-state nil ["(defn foo [x]"]))
+          s (lg-mode/newline-and-indent s)]
+      (is (= ["(defn foo [x]" "  "] (:lines s)))
+      (is (= 2 (:cursor-col s)))))
+
+  (testing "depth 0 (top level) indents nothing"
+    (let [s (at-end (buf/new-state nil ["(foo)"]))
+          s (lg-mode/newline-and-indent s)]
+      (is (= ["(foo)" ""] (:lines s)))))
+
+  (testing "deeper nesting indents further"
+    (let [s (at-end (buf/new-state nil ["(defn foo [x]" "  (let [y 1]"]))
+          s (lg-mode/newline-and-indent s)]
+      (is (= "    " (nth (:lines s) 2)))))
+
+  (testing "wired up as RET in let-go-mode via dispatch"
+    (let [s (-> (at-end (buf/new-state nil ["(foo"]))
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "RET"))]
+      (is (= ["(foo" "  "] (:lines s))))))
+
+(defn- cursor-at [state row col] (assoc state :cursor-row row :cursor-col col))
+
+(deftest expand-and-contract-region
+  (testing "first expand selects the word at point"
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          s (lg-mode/expand-region s)]
+      (is (= "foo" (buf/region-text s)))))
+
+  (testing "each further expand grows to the next enclosing sexp, brackets included"
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          s (lg-mode/expand-region s)
+          s (lg-mode/expand-region s)]
+      (is (= "(c foo)" (buf/region-text s))))
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          s (nth (iterate lg-mode/expand-region s) 3)]
+      (is (= "(b (c foo) d)" (buf/region-text s))))
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          s (nth (iterate lg-mode/expand-region s) 4)]
+      (is (= "(a (b (c foo) d) e)" (buf/region-text s)))))
+
+  (testing "expanding past the top level reports itself instead of erroring"
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          s (nth (iterate lg-mode/expand-region s) 4)
+          s (lg-mode/expand-region s)]
+      (is (= "Nothing more to select" (:message s)))
+      (is (= "(a (b (c foo) d) e)" (buf/region-text s)))))
+
+  (testing "contract-region undoes exactly one expand step at a time"
+    (let [s (cursor-at (buf/new-state nil ["(a (b (c foo) d) e)"]) 0 10)
+          expanded (nth (iterate lg-mode/expand-region s) 3)
+          contracted (lg-mode/contract-region expanded)]
+      (is (= "(c foo)" (buf/region-text contracted)))
+      (is (= "foo" (buf/region-text (lg-mode/contract-region contracted))))
+      (is (nil? (:mark (lg-mode/contract-region (lg-mode/contract-region contracted)))))))
+
+  (testing "no point on a word and no enclosing sexp -> nothing to select"
+    (let [s (cursor-at (buf/new-state nil ["   "]) 0 1)
+          s (lg-mode/expand-region s)]
+      (is (= "Nothing more to select" (:message s)))
+      (is (nil? (:mark s)))))
+
+  (testing "contracting with nothing expanded reports itself"
+    (let [s (lg-mode/contract-region (buf/new-state nil ["x"]))]
+      (is (= "Nothing to contract" (:message s))))))

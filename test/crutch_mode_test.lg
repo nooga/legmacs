@@ -1,0 +1,127 @@
+(ns test.crutch-mode-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as d]
+            [legmacs.modes.crutch :as crutch]))
+
+(bindings/install!)
+
+(defn- crutch-buf [lines]
+  (modes/enable-minor-mode (buf/new-state nil lines) :crutch))
+
+(defn- press [state & chords] (reduce d/dispatch state chords))
+
+(deftest starts-in-normal-state
+  (testing "enabling CRUTCH puts the buffer in normal state"
+    (is (= :normal (:crutch-state (crutch-buf ["hi"]))))))
+
+(deftest normal-state-suppresses-self-insert
+  (testing "an unbound printable in normal state does not type itself"
+    (let [s (press (crutch-buf ["abc"]) "z" "q" "x")]
+      ;; z/q are inert; x deletes the char under point
+      (is (= ["bc"] (:lines s))))))
+
+(deftest hjkl-motion
+  (testing "l/h move right/left, j/k move down/up"
+    (let [s (crutch-buf ["hello" "world"])]
+      (is (= 2 (:cursor-col (press s "l" "l"))))
+      (is (= 1 (:cursor-col (press s "l" "l" "h"))))
+      (is (= 1 (:cursor-row (press s "j"))))
+      (is (= 0 (:cursor-row (press s "j" "k")))))))
+
+(deftest counts-repeat-motions
+  (testing "a numeric count repeats the following motion"
+    (let [s (crutch-buf ["0123456789"])]
+      (is (= 5 (:cursor-col (press s "5" "l"))))
+      ;; multi-digit count (12l) clamps at the line end (col = length 10)
+      (is (= 10 (:cursor-col (press s "1" "2" "l")))))
+    (let [s (crutch-buf ["a" "b" "c" "d" "e"])]
+      (is (= 3 (:cursor-row (press s "3" "j")))))))
+
+(deftest count-is-cleared-after-use
+  (testing "a count applies once, then resets"
+    (let [s (press (crutch-buf ["0123456789"]) "2" "l" "l")]
+      ;; 2l -> col 2, then a bare l -> col 3 (count did not linger)
+      (is (= 3 (:cursor-col s))))))
+
+(deftest bare-zero-is-start-of-line
+  (testing "0 with no count pending jumps to column 0"
+    (let [s (press (crutch-buf ["hello"]) "l" "l" "l" "0")]
+      (is (= 0 (:cursor-col s))))))
+
+(deftest insert-mode-typing-and-escape
+  (testing "i enters insert, keys type, ESC returns to normal"
+    (let [s (press (crutch-buf ["bc"]) "i" "a")]
+      (is (= :insert (:crutch-state s)))
+      (is (= ["abc"] (:lines s)))
+      (let [s (press s "ESC")]
+        (is (= :normal (:crutch-state s)))
+        ;; back in normal, letters are inert again
+        (is (= ["abc"] (:lines (press s "z"))))))))
+
+(deftest append-open-variants
+  (testing "a appends after point; o opens a line below in insert"
+    (let [s (press (crutch-buf ["ab"]) "a" "X")]
+      (is (= ["aXb"] (:lines s))))
+    (let [s (press (crutch-buf ["one" "two"]) "o")]
+      (is (= :insert (:crutch-state s)))
+      (is (= 1 (:cursor-row s)))
+      (is (= ["one" "" "two"] (:lines s))))
+    (let [s (press (crutch-buf ["one"]) "O")]
+      (is (= 0 (:cursor-row s)))
+      (is (= ["" "one"] (:lines s))))))
+
+(deftest dd-and-dw-delete-into-clipboard
+  (testing "dd kills the whole line, dw the next word, both yankable"
+    (let [s (press (crutch-buf ["line one" "line two"]) "d" "d")]
+      (is (= ["line two"] (:lines s)))
+      (is (= "line one\n" (:clipboard s))))
+    (let [s (press (crutch-buf ["one" "two"]) "2" "d" "d")]
+      (is (= [""] (:lines s))))
+    (let [s (press (crutch-buf ["foo bar"]) "d" "w")]
+      (is (= [" bar"] (:lines s)))
+      (is (= "foo" (:clipboard s))))))
+
+(deftest x-deletes-and-p-pastes
+  (testing "x deletes under point; p pastes the clipboard"
+    (let [s (press (crutch-buf ["abc"]) "x")]
+      (is (= ["bc"] (:lines s))))
+    (let [s (press (crutch-buf ["ab"]) "d" "d" "p")]
+      ;; dd yanked "ab\n"; p pastes it back
+      (is (string/includes? (buf/buffer-text s) "ab")))))
+
+(deftest visual-select-and-operate
+  (testing "v starts a selection, motions extend it, y/d act on it"
+    (let [s (crutch-buf ["hello"])]
+      (let [sv (press s "v" "l" "l")]
+        (is (= :visual (:crutch-state sv)))
+        (is (some? (:mark sv))))
+      ;; visual yank copies the selection and returns to normal
+      (let [sy (press s "v" "l" "l" "y")]
+        (is (= :normal (:crutch-state sy)))
+        (is (= "he" (:clipboard sy)))
+        (is (nil? (:mark sy))))
+      ;; visual delete removes the selection
+      (let [sd (press s "v" "l" "l" "d")]
+        (is (= :normal (:crutch-state sd)))
+        (is (= ["llo"] (:lines sd)))))))
+
+(deftest undo-redo
+  (testing "u undoes an edit, C-r redoes it"
+    (let [s (press (crutch-buf ["abc"]) "x")            ;; -> "bc"
+          s (press s "u")]                              ;; undo -> "abc"
+      (is (= ["abc"] (:lines s)))
+      (let [s (press s "C-r")]                          ;; redo -> "bc"
+        (is (= ["bc"] (:lines s)))))))
+
+(deftest disabling-cleans-up_state
+  (testing "toggling CRUTCH off clears its buffer-local state and restores self-insert"
+    (let [s (crutch-buf ["x"])
+          s (crutch/crutch-mode s)]                     ;; toggle: was on -> now off
+      (is (not (modes/minor-mode-active? s :crutch)))
+      (is (nil? (:crutch-state s)))
+      ;; plain typing works again
+      (is (= ["zx"] (:lines (d/dispatch s "z")))))))

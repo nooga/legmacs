@@ -1,0 +1,29 @@
+;; Example legmacs user config.
+;;
+;; Copy this to ~/.config/legmacs/legmacs_init.lg (the namespace must stay
+;; `legmacs-init` -- that's the name bin/legmacs asks main.lg to require).
+;; Only picked up when you run the editor via bin/legmacs; `lg main.lg`
+;; directly doesn't know to put ~/.config/legmacs on the search path.
+
+(ns legmacs-init
+  (:require [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.buffer :as buf]
+            [legmacs.minibuffer :as mb]))
+
+;; Rebind a default: M-j to move down 5 lines, M-k to move up 5 lines.
+(defcommand jump-down "Move point down 5 lines." [state]
+  (nth (iterate buf/move-down state) 5))
+
+(defcommand jump-up "Move point up 5 lines." [state]
+  (nth (iterate buf/move-up state) 5))
+
+(km/bind-key! "M-j" :jump-down)
+(km/bind-key! "M-k" :jump-up)
+
+;; A brand new command with its own key, demonstrating the minibuffer API:
+;; prompts for a word and inserts it doubled.
+(defcommand insert-doubled "Prompt for text, insert it twice." [state]
+  (mb/open state "Double: "
+           (fn [state text] (buf/insert-string state (str text text)))))
+
+(km/bind-key! "C-c d" :insert-doubled)

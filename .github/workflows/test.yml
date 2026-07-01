@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # let-go ref is single-sourced from .let-go-version (shared with release.yml).
+      - name: Resolve let-go ref
+        id: letgo
+        run: echo "ref=$(grep -v '^#' .let-go-version | grep . | head -1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      # Cloned as a sibling of the workspace so build.sh's default LETGO_DIR
+      # (../let-go) and build/go.mod's `replace => ../../let-go` both resolve.
+      - name: Clone let-go
+        run: |
+          git clone https://github.com/nooga/let-go.git "$GITHUB_WORKSPACE/../let-go"
+          git -C "$GITHUB_WORKSPACE/../let-go" checkout "${{ steps.letgo.outputs.ref }}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: build/go.mod
+
+      - name: Build lg from the pinned let-go
+        run: go build -C "$GITHUB_WORKSPACE/../let-go" -o "$GITHUB_WORKSPACE/../lg" .
+
+      - name: Run test suite
+        run: "$GITHUB_WORKSPACE/../lg" test/run.lg
+
+      # Full AOT native build (build lg, lower legmacs.*, bundle, go build) -- the
+      # same path release.yml ships. Guards against a build break landing on main.
+      - name: Native build smoke
+        run: ./build.sh

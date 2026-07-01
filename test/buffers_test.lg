@@ -1,0 +1,129 @@
+(ns test.buffers-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]))
+
+(deftest new-workspace-has-one-current-buffer
+  (testing "starts with exactly the given buffer as id 0, current"
+    (let [ws (bufs/new-workspace (buf/new-state "a.txt" ["hi"]))]
+      (is (= 0 (:current ws)))
+      (is (= [0] (:order ws)))
+      (is (= ["hi"] (:lines (bufs/current ws)))))))
+
+(deftest current-merges-shared-fields-and-metadata
+  (testing "the flat view carries filename/lines from the buffer plus shared/global fields"
+    (let [ws (assoc (bufs/new-workspace (buf/new-state "a.txt" ["hi"])) :message "hello" :clipboard "clip")
+          flat (bufs/current ws)]
+      (is (= "a.txt" (:filename flat)))
+      (is (= "hello" (:message flat)))
+      (is (= "clip" (:clipboard flat)))
+      (is (= 0 (:current-buffer-id flat)))
+      (is (= [{:id 0 :name "a.txt" :filename "a.txt" :modified? false :mode nil}] (:buffer-list flat))))))
+
+(deftest put-current-round-trips-edits
+  (testing "editing the flat view and folding it back updates the stored buffer"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          edited (assoc (bufs/current ws) :lines ["x" "y"] :cursor-row 1)
+          ws (bufs/put-current ws edited)]
+      (is (= ["x" "y"] (:lines (bufs/current ws))))
+      (is (= 1 (:cursor-row (bufs/current ws)))))))
+
+(deftest shared-fields-persist-across-a-buffer-switch
+  (testing "clipboard/message set in one buffer are still there after switching to another"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :clipboard "killed text" :message "note"))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          flat (bufs/current ws)]
+      (is (= ["b"] (:lines flat)))
+      (is (= "killed text" (:clipboard flat)))
+      (is (= "note" (:message flat))))))
+
+(deftest open-new-buffer-command
+  (testing "creates a new buffer, appends it to :order, and switches to it"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :open-new :state (buf/new-state "b.txt" ["b"])}))]
+      (is (= [0 1] (:order ws)))
+      (is (= 1 (:current ws)))
+      (is (= ["b"] (:lines (bufs/current ws))))
+      ;; the buffer left behind is untouched, still reachable
+      (is (= ["a"] (:lines (get-in ws [:buffers 0])))))))
+
+(deftest switch-buffer-command
+  (testing "switches :current without touching either buffer's content"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :switch :id 0}))]
+      (is (= 0 (:current ws)))
+      (is (= ["a"] (:lines (bufs/current ws)))))))
+
+(deftest next-and-previous-buffer-cycle-with-wraparound
+  (testing "next/prev walk :order and wrap around at the ends"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["c"])}))]
+      ;; order is [0 1 2], current is 2
+      (let [ws2 (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :next}))]
+        (is (= 0 (:current ws2))) ;; wraps around
+        (let [ws3 (bufs/put-current ws2 (assoc (bufs/current ws2) :buffer-command {:op :prev}))]
+          (is (= 2 (:current ws3)))))))) ;; wraps the other way
+
+(deftest kill-buffer-command
+  (testing "killing a non-current buffer leaves current alone"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :kill :id 0}))]
+      (is (= [1] (:order ws)))
+      (is (= 1 (:current ws)))))
+
+  (testing "killing the current buffer falls back to another existing one"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :kill :id 1}))]
+      (is (= [0] (:order ws)))
+      (is (= 0 (:current ws)))))
+
+  (testing "killing the only buffer falls back to the supplied fresh buffer, never leaving zero"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["only"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :kill :id 0 :fallback (buf/new-state nil ["fresh"])}))]
+      (is (= 1 (count (:order ws))))
+      (is (= ["fresh"] (:lines (bufs/current ws)))))))
+
+(deftest buffer-list-deduplicates-names-like-emacs
+  (testing "the first buffer with a given base name keeps it; later ones get <2>, <3>, ..."
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["b"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :open-new :state (buf/new-state nil ["c"])}))]
+      (is (= ["*scratch*" "*scratch*<2>" "*scratch*<3>"] (map :name (bufs/buffer-list ws)))))))
+
+(deftest buffer-names-are-basenames-not-full-paths
+  (testing "a buffer's display name is the last path segment, like Emacs, not the full path"
+    (let [ws (bufs/new-workspace (buf/new-state "/some/deep/dir/a.txt" ["x"]))]
+      (is (= "a.txt" (:name (first (bufs/buffer-list ws)))))))
+
+  (testing "two files with the same basename in different directories still get deduplicated, not merged"
+    (let [ws (bufs/new-workspace (buf/new-state "/dir1/a.txt" ["x"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :open-new :state (buf/new-state "/dir2/a.txt" ["y"])}))]
+      (is (= ["a.txt" "a.txt<2>"] (map :name (bufs/buffer-list ws))))
+      ;; :filename stays the real, full path -- only :name is shortened
+      (is (= ["/dir1/a.txt" "/dir2/a.txt"] (map :filename (bufs/buffer-list ws)))))))
+
+(deftest quit-flag-flows-through-put-current
+  (testing "a command setting :quit? true on the flat state surfaces on the workspace"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :quit? true))]
+      (is (:quit? ws)))))
+
+(deftest clearing-a-shared-field-by-dissoc-actually-clears-it
+  (testing "dissoc-ing a shared key (not just assoc-ing it to nil) still clears it on the workspace
+            -- this is exactly what dispatch does to dismiss an overlay"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :overlay {:title "t" :lines []}))]
+      (is (some? (:overlay (bufs/current ws))))
+      (let [ws (bufs/put-current ws (dissoc (bufs/current ws) :overlay))]
+        (is (nil? (:overlay (bufs/current ws))))
+        (is (nil? (:overlay ws)))))))

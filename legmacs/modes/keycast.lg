@@ -1,0 +1,50 @@
+;; legmacs.modes.keycast — a live keystroke preview in the mode line, the
+;; kind screencasts use to show what's being pressed. Toggle it with
+;; `M-x keycast-mode`; it's most fun alongside CRUTCH, where the same
+;; physical keys read completely differently between normal and insert state.
+;;
+;; It's a pure minor mode with an empty keymap -- it binds nothing and
+;; changes no behavior. It only observes: legmacs.dispatch stamps each
+;; pressed chord onto the state as :last-chord, so this mode's
+;; :after-command can append it to a bounded :keycast-log, and its
+;; :status-right renders that log flush against the right edge of the mode
+;; line. Because it reads the *canonical* chord names the rest of the editor
+;; speaks ("C-x", "M-w", "j"), the display is exactly what any keymap would
+;; dispatch on -- which is what makes the per-mode difference visible.
+
+(ns legmacs.modes.keycast
+  (:require [string]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]))
+
+(def keymap (atom {})) ;; intentionally empty -- keycast observes, never binds
+
+(def max-keys
+  "How many recent chords to keep on screen."
+  8)
+
+(defn- push-key
+  "Append `chord` to `log`, keeping only the last `max-keys`."
+  [log chord]
+  (let [log (conj (or log []) chord)]
+    (vec (drop (max 0 (- (count log) max-keys)) log))))
+
+(defn- keycast-after-command [state]
+  (if-let [chord (:last-chord state)]
+    (update state :keycast-log #(push-key % chord))
+    state))
+
+(defn- keycast-status-right [state]
+  (string/join " " (:keycast-log state)))
+
+(defcommand keycast-mode
+  "Toggle a live keystroke preview on the right of the mode line."
+  [state]
+  (modes/toggle-minor-mode state :keycast))
+
+(modes/register-minor-mode! :keycast keymap
+  "Keycast: show recent keystrokes on the right of the mode line."
+  {:on-enter (fn [state] (assoc state :keycast-log []))
+   :on-exit (fn [state] (dissoc state :keycast-log))
+   :after-command keycast-after-command
+   :status-right keycast-status-right})

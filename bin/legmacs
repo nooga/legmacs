@@ -1,0 +1,32 @@
+#!/bin/sh
+# legmacs launcher -- runs main.lg through the system-installed `lg`,
+# regardless of the caller's current directory.
+#
+# Namespace search path is set explicitly (rather than relying on the
+# default ".") to two places, in order:
+#   1. this install's own directory, so (require 'legmacs.*) resolves no
+#      matter where the user invokes `legmacs` from;
+#   2. ~/.config/legmacs, so an optional legmacs-init.lg (or
+#      legmacs_init.lg) there is picked up by (require 'legmacs-init) in
+#      main.lg.
+#
+# File arguments on the command line are untouched -- we don't `cd`, so
+# relative paths resolve against the caller's actual working directory.
+
+set -e
+
+if ! command -v lg >/dev/null 2>&1; then
+  echo "legmacs: 'lg' (the let-go runtime) was not found on PATH." >&2
+  echo "         install it first -- see https://github.com/nooga/let-go" >&2
+  exit 1
+fi
+
+dir=$(cd "$(dirname "$0")/.." && pwd)
+config_dir="${LEGMACS_CONFIG_DIR:-$HOME/.config/legmacs}"
+
+search_path="$dir:$config_dir"
+if [ -n "$LG_SOURCE_PATHS" ]; then
+  search_path="$search_path:$LG_SOURCE_PATHS"
+fi
+
+LG_SOURCE_PATHS="$search_path" exec lg "$dir/main.lg" "$@"

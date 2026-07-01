@@ -1,0 +1,434 @@
+;; legmacs.render — turns editor state into one ANSI string per frame.
+;;
+;; Every function here is pure (state -> string); nothing touches the
+;; terminal directly. main.lg is the only place that actually calls
+;; term/write. That split means the whole rendering pipeline can be unit
+;; tested without a TTY -- and it is, see test/render_test.lg.
+;;
+;; Strategy: build the *entire* frame as one string and hand it to a single
+;; term/write + term/flush per key. Every row is padded to the full terminal
+;; width, so there is no need to clear the screen between frames (and no
+;; flicker from doing so) -- a shorter new line simply overwrites a longer
+;; old one with spaces.
+
+(ns legmacs.render
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.modeline :as ml]))
+
+(defn- csi [s] (str (char 27) "[" s))
+(def reset (csi "0m"))
+(def inverse-on (csi "7m"))
+(def bold-on (csi "1m"))
+(def italic-on (csi "3m"))
+(def underline-on (csi "4m"))
+(def hide-cursor (csi "?25l"))
+(def show-cursor (csi "?25h"))
+
+(defn- fg [r g b] (csi (str "38;2;" r ";" g ";" b "m")))
+(defn- bg [r g b] (csi (str "48;2;" r ";" g ";" b "m")))
+(defn- move-to [col row] (csi (str row ";" col "H")))
+
+(def gutter-fg (fg 110 110 130))
+(def gutter-fg-current (str bold-on (fg 235 200 90)))
+(def tilde-fg (fg 90 90 105))
+(def message-fg (fg 140 200 140))
+(def error-fg (fg 220 120 120))
+(def region-bg (bg 55 70 95))
+(def search-match-bg (bg 80 70 40))
+(def search-current-bg (bg 170 120 40))
+
+(defn pad-right
+  "Truncate or space-pad `s` to exactly `width` display columns."
+  [s width]
+  (let [n (count s)]
+    (cond
+      (= n width) s
+      (> n width) (subs s 0 width)
+      :else (str s (apply str (repeat (- width n) \space))))))
+
+(defn gutter-width
+  "How many columns the line-number gutter needs for a buffer this long,
+   including the trailing separator space."
+  [total-lines]
+  (max 4 (+ 2 (count (str total-lines)))))
+
+;; --- variable-height bottom area --------------------------------------
+;;
+;; The bottom of the screen is a status line plus an echo/minibuffer area
+;; that is one row by default but grows on demand: to hold a live candidate
+;; list (swiper, and later completion) or a multi-line message. Making that
+;; height a pure function of state is the single change that lets the same
+;; area host all three -- dims just shrinks the text viewport to fit.
+
+(def ^:private mb-list-cap 12)
+
+(defn- wrap-line [s cols]
+  (if (<= (count s) cols)
+    [s]
+    (loop [s s, out []]
+      (if (<= (count s) cols)
+        (conj out s)
+        (recur (subs s cols) (conj out (subs s 0 cols)))))))
+
+(defn message-lines
+  "A message split into display rows: on explicit newlines first, then any
+   over-long piece wrapped to `cols`. This is what keeps a multi-line eval
+   error (or any long message) from injecting a raw newline into the frame
+   and corrupting the layout -- it becomes N padded rows instead."
+  [msg cols]
+  (mapcat #(wrap-line % cols) (string/split msg "\n")))
+
+(defn minibuffer-height
+  "How many rows the bottom echo/minibuffer area wants for `state`: one row
+   normally, more to fit a live candidate list (prompt + candidates) or a
+   multi-line message. Never grows past half the screen, and always leaves
+   at least one text row plus the status line. Always >= 1."
+  [state cols rows]
+  (let [room (max 1 (- rows 2))
+        cap (min mb-list-cap (max 1 (quot rows 2)))
+        want (cond
+               (:minibuffer state)
+               (+ 1 (min cap (count (:candidates (:minibuffer state)))))
+               (:message state)
+               (min cap (max 1 (count (message-lines (:message state) cols))))
+               :else 1)]
+    (max 1 (min want room))))
+
+(defn dims
+  "The layout for a `cols` x `rows` terminal: gutter width, the dimensions of
+   the scrollable text viewport, and how many rows the bottom minibuffer/echo
+   area currently occupies (one for the status line is always reserved on top
+   of that)."
+  [state cols rows]
+  (let [g (gutter-width (count (:lines state)))
+        mb-rows (minibuffer-height state cols rows)
+        text-rows (max 1 (- rows 1 mb-rows))
+        text-cols (max 1 (- cols g))]
+    {:gutter g :text-rows text-rows :text-cols text-cols :mb-rows mb-rows}))
+
+(defn- right-align [s width]
+  (let [n (count s)]
+    (if (>= n width) s (str (apply str (repeat (- width n) \space)) s))))
+
+(defn- gutter-cell [line-no width is-current?]
+  (let [color (if is-current? gutter-fg-current gutter-fg)]
+    (str color (right-align (str line-no) (dec width)) reset \space)))
+
+(defn- visible-slice [line scroll-col text-cols]
+  (let [len (count line)]
+    (if (>= scroll-col len)
+      ""
+      (subs line scroll-col (min len (+ scroll-col text-cols))))))
+
+;; --- span compositor --------------------------------------------------
+;;
+;; A row can carry several independent highlight layers at once (the
+;; active region, a matched paren, syntax colors from the current mode),
+;; each expressed as spans in *absolute* buffer-column space. This turns
+;; a list of such spans plus the scroll offset into two per-column style
+;; arrays (fg and bg), then walks those alongside the actual text once,
+;; only emitting an ANSI code where the style actually changes.
+
+(def ^:private open-ended 999999)
+
+(def fg-color-for
+  {:comment tilde-fg
+   :string (fg 150 190 120)
+   :char (fg 215 130 160)
+   :keyword (fg 100 170 220)
+   :number (fg 210 150 90)
+   :keyword-literal (fg 90 200 190)
+   :paren-match (str bold-on (fg 255 255 255))
+   ;; legmacs.modes.markdown's styles
+   :md-header (str bold-on (fg 235 170 60))
+   :md-hr gutter-fg
+   :md-quote (str italic-on (fg 140 150 120))
+   :md-list (fg 220 150 80)
+   :md-code (fg 200 130 190)
+   :md-bold bold-on
+   :md-italic italic-on
+   :md-link (str underline-on (fg 120 180 240))
+   :md-url tilde-fg
+   ;; legmacs.modes.help's styles
+   :help-header (str bold-on (fg 235 170 60))
+   :help-key (str bold-on (fg 100 170 220))
+   :help-command (fg 150 190 120)})
+
+(def bg-color-for
+  {:region region-bg
+   :paren-match (bg 80 80 40)
+   :search-match search-match-bg
+   :search-current search-current-bg})
+
+(defn- clamp-span
+  "[start end) in absolute columns -> screen-relative, clamped to
+   [0, text-cols); nil if it doesn't land in the visible window at all."
+  [start end scroll-col text-cols]
+  (let [s (max 0 (- start scroll-col))
+        e (min text-cols (- end scroll-col))]
+    (when (< s e) [s e])))
+
+(defn- paint [styles start end style]
+  (reduce (fn [arr i] (assoc arr i style)) styles (range start end)))
+
+(defn style-array
+  "spans: [{:start :end :style} ...] in absolute columns. Later spans in
+   the list win over earlier ones on overlap. Returns a plain vector of
+   length text-cols, each element a style keyword or nil."
+  [text-cols spans scroll-col]
+  (reduce (fn [arr {:keys [start end style]}]
+            (if-let [[s e] (clamp-span start end scroll-col text-cols)]
+              (paint arr s e style)
+              arr))
+          (vec (repeat text-cols nil))
+          spans))
+
+(defn render-spans
+  "Walk `text` (already scroll-clipped and padded to length text-cols)
+   alongside its per-column fg/bg style arrays, wrapping each maximal
+   same-style run in the right ANSI codes."
+  [text fg-styles bg-styles]
+  (let [n (count text)]
+    (loop [i 0, out []]
+      (if (>= i n)
+        (apply str out)
+        (let [f (nth fg-styles i), b (nth bg-styles i)
+              j (loop [j i] (if (and (< j n) (= (nth fg-styles j) f) (= (nth bg-styles j) b)) (recur (inc j)) j))
+              seg (subs text i j)
+              prefix (str (get fg-color-for f "") (get bg-color-for b ""))]
+          (recur j (conj out (if (or f b) (str prefix seg reset) seg))))))))
+
+(defn- region-spans-for-row
+  "The active region's span(s) on `buf-row`, as a list for style-array
+   (region is a single contiguous span per row, so at most one). end can
+   be open-ended -- clamp-span bounds it -- so a first/interior line of a
+   multi-line region visibly extends to the edge of the text area,
+   matching how Emacs shows a region spanning a line break."
+  [state buf-row]
+  (if-let [[[sr sc] [er ec]] (buf/region-bounds state)]
+    (if (<= sr buf-row er)
+      [{:style :region
+        :start (if (= buf-row sr) sc 0)
+        :end (cond (= sr er) ec (= buf-row er) ec :else open-ended)}]
+      [])
+    []))
+
+(defn- paren-match-spans-for-row
+  "Single-character spans at each end of the active paren match (see
+   legmacs.modes/register-mode!'s :after-command, which is what sets
+   :paren-match), whichever end(s) fall on `buf-row`."
+  [state buf-row]
+  (if-let [[[r1 c1] [r2 c2]] (:paren-match state)]
+    (cond-> []
+      (= buf-row r1) (conj {:style :paren-match :start c1 :end (inc c1)})
+      (= buf-row r2) (conj {:style :paren-match :start c2 :end (inc c2)}))
+    []))
+
+(defn- search-match-spans-for-row
+  "Spans for every swiper match on `buf-row`, read straight off the live
+   minibuffer's :candidates so they vanish automatically when the session
+   closes. The currently-selected match gets :search-current (a brighter
+   bg), the rest :search-match -- same span-layer mechanism as the region
+   and paren-match, so all three compose on one line."
+  [state buf-row]
+  (let [mb (:minibuffer state)]
+    (if (= :swiper (:list-kind mb))
+      (let [sel (or (:selection mb) 0)]
+        (remove nil?
+                (map-indexed (fn [i c]
+                               (when (= (:row c) buf-row)
+                                 {:style (if (= i sel) :search-current :search-match)
+                                  :start (:col c) :end (:end c)}))
+                             (:candidates mb))))
+      [])))
+
+(defn- mode-highlight-spans-for-row
+  "Syntax spans for `buf-row` from every active mode's :highlighter --
+   computed fresh per frame, only for visible rows, since each is just a
+   pure (fn [line-text] -> spans) over one line. Painted in reverse
+   active-modes order (major first, minor modes on top) so a minor mode's
+   colors win on overlap, matching how the keymap layers shadow."
+  [state buf-row]
+  (let [line (nth (:lines state) buf-row)]
+    (mapcat (fn [mode-kw]
+              (if-let [highlighter (modes/mode-highlighter mode-kw)]
+                (highlighter line)
+                []))
+            (reverse (modes/active-modes state)))))
+
+(defn- text-row
+  [state screen-row buf-row {:keys [gutter text-cols]}]
+  (let [total (count (:lines state))]
+    (str (move-to 1 screen-row)
+         (if (< buf-row total)
+           (let [scroll-col (:scroll-col state)
+                 visible (pad-right (visible-slice (nth (:lines state) buf-row) scroll-col text-cols) text-cols)
+                 bg-spans (concat (region-spans-for-row state buf-row)
+                                  (paren-match-spans-for-row state buf-row)
+                                  (search-match-spans-for-row state buf-row))
+                 fg-spans (concat (mode-highlight-spans-for-row state buf-row)
+                                  (paren-match-spans-for-row state buf-row))
+                 fg-arr (style-array text-cols fg-spans scroll-col)
+                 bg-arr (style-array text-cols bg-spans scroll-col)]
+             (str (gutter-cell (inc buf-row) gutter (= buf-row (:cursor-row state)))
+                  (render-spans visible fg-arr bg-arr)))
+           (str tilde-fg (pad-right "~" gutter) reset (pad-right "" text-cols))))))
+
+(defn- text-area [state screen-row0 layout]
+  (let [{:keys [text-rows]} layout]
+    (apply str
+           (map (fn [i] (text-row state (+ screen-row0 i) (+ (:scroll-row state) i) layout))
+                (range text-rows)))))
+
+;; --- mode-line segment compositor --------------------------------------
+;;
+;; legmacs.modeline supplies *data* (ordered {:text :fg :bg} segments plus
+;; a theme); this is the only place that turns that into ANSI, same split
+;; as the syntax-highlight spans above. Segments are clipped to a column
+;; budget left-to-right so the whole bar always comes out exactly `cols`
+;; wide, same guarantee pad-right gives every other row.
+
+(defn- clip-text [s remaining] (subs s 0 (max 0 (min (count s) remaining))))
+
+(defn- render-segments-clipped
+  "Render `segs` ({:text :fg :bg} maps) joined by `sep`, each falling back
+   to `default-fg`/`default-bg` when it doesn't specify its own, clipped to
+   at most `width` visible columns total. Returns [ansi-string visible-width]."
+  [segs sep default-fg default-bg width]
+  (loop [segs segs, first? true, remaining width, out []]
+    (if (or (empty? segs) (<= remaining 0))
+      [(apply str out) (- width remaining)]
+      (let [seg (first segs)
+            sep-piece (clip-text (if first? "" sep) remaining)
+            remaining (- remaining (count sep-piece))
+            text-piece (clip-text (:text seg) remaining)
+            remaining (- remaining (count text-piece))]
+        (recur (rest segs) false remaining
+               (conj out
+                     (str (apply bg default-bg) (apply fg default-fg) sep-piece reset)
+                     (str (apply bg (or (:bg seg) default-bg)) (apply fg (or (:fg seg) default-fg))
+                          text-piece reset)))))))
+
+(defn- status-line [state screen-row cols]
+  (let [theme @ml/theme
+        default-bg (:bg theme)
+        default-fg (:fg theme)
+        sep @ml/separator
+        left-segs (ml/left-segments state)
+        right-segs (ml/right-segments state)
+        right-plain (string/join sep (map :text right-segs))
+        right-width (min cols (if (seq right-plain) (inc (count right-plain)) 0))
+        avail-left (max 0 (- cols right-width))
+        [left-ansi left-visible] (render-segments-clipped left-segs sep default-fg default-bg avail-left)
+        [right-ansi right-visible] (render-segments-clipped right-segs sep default-fg default-bg
+                                                             (max 0 (dec right-width)))
+        ;; each segment piece above ends in `reset` (so it never bleeds
+        ;; into the next segment's colors), which also means the gaps
+        ;; between/after segments must re-open the theme's default colors
+        ;; themselves rather than inheriting them -- otherwise those gaps
+        ;; render in the terminal's own background and the bar looks like
+        ;; it stops at the last segment instead of spanning the full row.
+        fill (fn [n] (str (apply bg default-bg) (apply fg default-fg)
+                           (apply str (repeat (max 0 n) \space)) reset))
+        left-fill (fill (- avail-left left-visible))
+        right-fill (fill (- right-width right-visible 1))
+        trailing (if (pos? right-width) (fill 1) "")]
+    (str (move-to 1 screen-row)
+         left-ansi left-fill right-ansi right-fill trailing)))
+
+;; --- echo area (bottom `mb-rows` rows) ---------------------------------
+;;
+;; One writer per case, each responsible for filling exactly `mb-rows` rows
+;; starting at screen-row0 (padding any it doesn't use), so the frame stays
+;; the promised height no matter what: a plain prompt, a live candidate list
+;; below the prompt (swiper), or a multi-line message.
+
+(defn- blank-row [screen-row cols] (str (move-to 1 screen-row) reset (pad-right "" cols)))
+
+(defn- candidate-window
+  "The slice of `candidates` to show given a `cap`-row budget, scrolled so
+   `selection` stays visible. Returns [start-index shown-vector]."
+  [candidates selection cap]
+  (let [v (vec candidates)
+        n (count v)]
+    (if (<= n cap)
+      [0 v]
+      (let [start (max 0 (min (- n cap) (- (or selection 0) (quot cap 2))))]
+        [start (subvec v start (min n (+ start cap)))]))))
+
+(defn- candidate-row [screen-row cand selected? cols]
+  (let [text (pad-right (str (if selected? "> " "  ") (:label cand)) cols)]
+    (str (move-to 1 screen-row) (if selected? (str inverse-on text reset) text))))
+
+(defn- minibuffer-view [state screen-row0 mb-rows cols]
+  (let [{:keys [prompt input note candidates selection]} (:minibuffer state)
+        cap (max 0 (dec mb-rows))
+        [start shown] (candidate-window candidates selection cap)
+        used (inc (count shown))]
+    (apply str
+           (str (move-to 1 screen-row0) reset
+                (pad-right (str prompt input (if note (str "  " note) "")) cols))
+           (concat
+            (map-indexed (fn [i c] (candidate-row (+ screen-row0 1 i) c
+                                                  (= (+ start i) (or selection 0)) cols))
+                         shown)
+            (map (fn [i] (blank-row (+ screen-row0 used i) cols)) (range (- mb-rows used)))))))
+
+(defn- message-view [state screen-row0 mb-rows cols]
+  (let [lines (take mb-rows (message-lines (:message state) cols))
+        n (count lines)]
+    (apply str
+           (concat
+            (map-indexed (fn [i l] (str (move-to 1 (+ screen-row0 i)) message-fg (pad-right l cols) reset))
+                         lines)
+            (map (fn [i] (blank-row (+ screen-row0 n i) cols)) (range (- mb-rows n)))))))
+
+(defn- echo-area [state screen-row0 mb-rows cols]
+  (cond
+    (:minibuffer state) (minibuffer-view state screen-row0 mb-rows cols)
+    (:message state) (message-view state screen-row0 mb-rows cols)
+    :else (apply str (map (fn [i] (blank-row (+ screen-row0 i) cols)) (range mb-rows)))))
+
+(defn cursor-placement
+  "Where the real terminal cursor should land: [col row] (1-based). With a
+   minibuffer open the cursor sits on its prompt row -- the first row of the
+   echo area (just below the status line), not the very bottom of the
+   screen, since that area may now span several rows below the prompt."
+  [state layout screen-row0 rows]
+  (if-let [mb (:minibuffer state)]
+    [(inc (+ (count (:prompt mb)) (:cursor-col mb))) (+ 2 (:text-rows layout))]
+    [(inc (+ (:gutter layout) (- (:cursor-col state) (:scroll-col state))))
+     (+ screen-row0 (- (:cursor-row state) (:scroll-row state)))]))
+
+(defn- overlay-frame [overlay cols rows]
+  (let [{:keys [title lines]} overlay
+        body-rows (max 1 (- rows 2))
+        visible (take body-rows lines)
+        more (- (count lines) (count visible))]
+    (apply str
+           (move-to 1 1) bold-on (pad-right (str " " title) cols) reset
+           (concat
+            (map-indexed (fn [i l] (str (move-to 1 (+ 2 i)) (pad-right (str "  " l) cols))) visible)
+            (map (fn [i] (str (move-to 1 (+ 2 (count visible) i)) (pad-right "" cols)))
+                 (range (- body-rows (count visible))))
+            [(str (move-to 1 rows) inverse-on
+                  (pad-right (if (pos? more) (format " %d more -- press any key" more) " press any key to continue") cols)
+                  reset)]))))
+
+(defn frame
+  "Build the full-screen ANSI string for one render of `state`, sized to
+   `cols` x `rows`. Caller is responsible for calling buf/ensure-visible
+   with the same dims (see `dims`) before this so scrolling matches."
+  [state cols rows]
+  (if-let [overlay (:overlay state)]
+    (str hide-cursor (overlay-frame overlay cols rows))
+    (let [layout (dims state cols rows)
+          text-rows (:text-rows layout)]
+      (str hide-cursor
+           (text-area state 1 layout)
+           (status-line state (inc text-rows) cols)
+           (echo-area state (+ 2 text-rows) (:mb-rows layout) cols)
+           (let [[col row] (cursor-placement state layout 1 rows)]
+             (str (move-to col row) show-cursor))))))

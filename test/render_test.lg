@@ -1,0 +1,167 @@
+(ns test.render-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.render :as r]))
+
+(deftest pad-right-behavior
+  (testing "pads short strings, truncates long ones, leaves exact-width alone"
+    (is (= "ab  " (r/pad-right "ab" 4)))
+    (is (= "abcd" (r/pad-right "abcdef" 4)))
+    (is (= "abcd" (r/pad-right "abcd" 4)))))
+
+(deftest gutter-width-grows-with-line-count
+  (testing "gutter has room for the largest line number plus a separator"
+    (is (= 4 (r/gutter-width 9)))
+    (is (= 4 (r/gutter-width 99)))
+    (is (= 5 (r/gutter-width 100)))
+    (is (= 6 (r/gutter-width 1000)))))
+
+(deftest dims-reserve-status-and-echo-rows
+  (testing "text-rows is rows minus 2; text-cols is cols minus the gutter"
+    (let [s (buf/new-state nil ["a"])
+          d (r/dims s 80 24)]
+      (is (= 22 (:text-rows d)))
+      (is (= (- 80 (:gutter d)) (:text-cols d))))))
+
+(deftest frame-contains-visible-text
+  (testing "buffer lines, filename, and position show up in the frame"
+    (let [s (buf/new-state "foo.txt" ["hello world" "second line"])
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "hello world"))
+      (is (string/includes? out "second line"))
+      (is (string/includes? out "foo.txt"))
+      (is (string/includes? out "Ln 1, Col 1")))))
+
+(deftest frame-shows-active-mode
+  (testing "the status line shows the active mode's name in parens"
+    (let [s (assoc (buf/new-state "x.lg" ["x"]) :mode :let-go)
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "(let-go)"))))
+
+  (testing "no mode set shows no mode label"
+    (let [s (buf/new-state "x.txt" ["x"])
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (not (string/includes? out "(let-go)"))))))
+
+(deftest frame-shows-scratch-buffer-name
+  (testing "a buffer with no filename is labeled *scratch*"
+    (let [s (buf/new-state nil [""])
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "*scratch*")))))
+
+(deftest frame-shows-minibuffer-prompt
+  (testing "an active minibuffer replaces the echo area with prompt+input"
+    (let [s (buf/new-state nil ["x"])
+          s (assoc s :minibuffer {:prompt "Find file: " :input "foo" :cursor-col 3})
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "Find file: foo")))))
+
+(deftest frame-shows-message
+  (testing "a status message shows in the echo area when no minibuffer is active"
+    (let [s (assoc (buf/new-state nil ["x"]) :message "Wrote foo.txt")
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "Wrote foo.txt")))))
+
+(deftest minibuffer-height-defaults-to-one
+  (testing "no minibuffer / single-line message keeps the classic 2-row bottom"
+    (let [s (buf/new-state nil ["a"])]
+      (is (= 1 (r/minibuffer-height s 80 24)))
+      (is (= 1 (r/minibuffer-height (assoc s :message "hi") 80 24))))))
+
+(deftest minibuffer-list-grows-and-shrinks-text
+  (testing "a candidate list reserves prompt + candidate rows, stealing them from the text area"
+    (let [s (assoc (buf/new-state nil ["a"])
+                   :minibuffer {:prompt "swiper: " :input "" :cursor-col 0
+                                :list-kind :swiper :selection 0
+                                :candidates [{:row 0 :col 0 :end 1 :label "1: a"}
+                                             {:row 0 :col 0 :end 1 :label "1: a"}]})]
+      (is (= 3 (r/minibuffer-height s 80 24)))          ; 1 prompt + 2 candidates
+      (is (= (- 24 1 3) (:text-rows (r/dims s 80 24)))))))
+
+(deftest minibuffer-height-never-eats-the-whole-screen
+  (testing "even a huge candidate list leaves at least one text row plus the status line"
+    (let [cands (vec (repeat 100 {:row 0 :col 0 :end 1 :label "x"}))
+          s (assoc (buf/new-state nil ["a"])
+                   :minibuffer {:prompt "p" :input "" :cursor-col 0 :candidates cands :selection 0})
+          d (r/dims s 80 10)]
+      (is (<= (:mb-rows d) (- 10 2)))
+      (is (>= (:text-rows d) 1))
+      (is (= 10 (+ (:text-rows d) 1 (:mb-rows d)))))))     ; text + status + echo == rows
+
+(deftest multi-line-message-expands-without-overflowing
+  (testing "a message with newlines becomes several padded rows, not a raw newline in the frame"
+    (let [s (assoc (buf/new-state nil ["x"]) :message "line one\nline two\nline three")]
+      (is (= 3 (r/minibuffer-height s 80 24)))
+      (let [out (r/frame s 80 24)]
+        (is (string/includes? out "line one"))
+        (is (string/includes? out "line three"))))))
+
+(deftest swiper-current-match-highlighted-in-buffer
+  (testing "the selected swiper match paints search-current-bg on its buffer line"
+    (let [s (assoc (buf/new-state nil ["hello world"])
+                   :minibuffer {:prompt "swiper: " :input "world" :cursor-col 5
+                                :list-kind :swiper :selection 0
+                                :candidates [{:row 0 :col 6 :end 11 :label "1: hello world"}]})
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 24)]
+      (is (string/includes? out r/search-current-bg)))))
+
+(deftest overlay-replaces-the-frame
+  (testing "an overlay shows its title and lines instead of the buffer"
+    (let [s (assoc (buf/new-state nil ["x"]) :overlay {:title "Key Bindings" :lines ["C-a  move-beginning-of-line"]})
+          out (r/frame s 40 12)]
+      (is (string/includes? out "Key Bindings"))
+      (is (string/includes? out "move-beginning-of-line"))
+      (is (string/includes? out "press any key")))))
+
+(deftest active-region-is-highlighted
+  (testing "an active region shows region-bg somewhere in the frame"
+    (let [s (assoc (buf/new-state nil ["hello world"]) :mark [0 0] :cursor-row 0 :cursor-col 5)
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out r/region-bg))))
+
+  (testing "no mark set -> no highlight at all"
+    (let [s (buf/new-state nil ["hello world"])
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (not (string/includes? out r/region-bg))))))
+
+(deftest cursor-placement-accounts-for-gutter-and-scroll
+  (testing "cursor lands at gutter + (cursor-col - scroll-col), row offset by scroll-row"
+    (let [s (buf/new-state nil (vec (map str (range 30))))
+          s (assoc s :cursor-row 12 :cursor-col 0)
+          s (buf/ensure-visible s 10 40)
+          layout (r/dims s 40 12)]
+      (is (= [(inc (:gutter layout)) (inc (- 12 (:scroll-row s)))]
+             (r/cursor-placement s layout 1 12))))))
+
+(deftest mode-highlighter-colors-the-frame
+  (testing "a mode's :highlighter contributes fg spans for its visible lines"
+    (let [km (atom {})]
+      (modes/register-mode! :test-render-hl km "hl test"
+                             {:highlighter (fn [line] (if (string/includes? line "shout")
+                                                         [{:start 0 :end (count line) :style :keyword}]
+                                                         []))})
+      (let [s (-> (buf/new-state nil ["shout" "quiet"])
+                  (modes/switch-to-mode :test-render-hl)
+                  (buf/ensure-visible 10 40))
+            out (r/frame s 40 12)]
+        (is (string/includes? out (get r/fg-color-for :keyword)))))))
+
+(deftest paren-match-is-highlighted
+  (testing ":paren-match spans both ends, even on different rows"
+    (let [s (-> (buf/new-state nil ["(foo" "bar)"])
+                (assoc :paren-match [[0 0] [1 3]])
+                (buf/ensure-visible 10 40))
+          out (r/frame s 40 12)]
+      (is (string/includes? out (get r/fg-color-for :paren-match)))
+      (is (string/includes? out (get r/bg-color-for :paren-match))))))

@@ -1,0 +1,58 @@
+(ns test.keys-test
+  (:require [test :refer :all]
+            [legmacs.keys :as k]))
+
+(defn- esc [s] (str (char 27) s))
+
+(deftest control-chords
+  (testing "raw control bytes map to C-<letter>"
+    (is (= "C-a" (k/raw->chord (str (char 1)))))
+    (is (= "C-x" (k/raw->chord (str (char 24)))))
+    (is (= "C-z" (k/raw->chord (str (char 26)))))
+    (is (= "C-_" (k/raw->chord (str (char 31)))))
+    (is (= "C-SPC" (k/raw->chord (str (char 0))))
+        "Ctrl-Space is sent as NUL by every terminal, not a printable space -- must not be mistaken for self-insert or EOF")
+    (is (= "C-j" (k/raw->chord (str (char 10))))
+        "LF/byte 10 is Ctrl-J, distinct from RET (CR/byte 13) -- needed for eval-print-last-sexp")
+    (is (= "C-g" (k/raw->chord (str (char 7))))
+        "BEL/byte 7 is genuinely also Ctrl-G; term/read-key reuses it as a resize wake-up too, but mapping it to C-g is the only choice that lets a real Ctrl-G keypress work at all -- see raw->chord's docstring")))
+
+(deftest named-keys
+  (testing "RET, TAB, DEL, ESC"
+    (is (= "RET" (k/raw->chord (str (char 13)))))
+    (is (= "TAB" (k/raw->chord (str (char 9)))))
+    (is (= "DEL" (k/raw->chord (str (char 127)))))
+    (is (= "ESC" (k/raw->chord (str (char 27)))))))
+
+(deftest arrow-and-nav-keys
+  (testing "CSI sequences map to direction/navigation names"
+    (is (= "up" (k/raw->chord (esc "[A"))))
+    (is (= "down" (k/raw->chord (esc "[B"))))
+    (is (= "left" (k/raw->chord (esc "[D"))))
+    (is (= "right" (k/raw->chord (esc "[C"))))
+    (is (= "home" (k/raw->chord (esc "[H"))))
+    (is (= "end" (k/raw->chord (esc "[F"))))
+    (is (= "delete" (k/raw->chord (esc "[3~"))))
+    (is (= "pageup" (k/raw->chord (esc "[5~"))))
+    (is (= "pagedown" (k/raw->chord (esc "[6~"))))))
+
+(deftest printable-chars
+  (testing "plain characters pass through unchanged"
+    (is (= "a" (k/raw->chord "a")))
+    (is (= " " (k/raw->chord " ")))
+    (is (k/printable? "a"))
+    (is (k/printable? "Z"))
+    (is (not (k/printable? "RET")))
+    (is (not (k/printable? "DEL")))
+    (is (not (k/printable? "ESC")))
+    (is (not (k/printable? "C-a")))
+    (is (not (k/printable? "M-x")))
+    (is (not (k/printable? "up")))))
+
+(deftest meta-combination
+  (testing "meta-chord prefixes whatever came after a lone ESC with M-"
+    (is (= "M-x" (k/meta-chord "x")))
+    (is (= "M-C-f" (k/meta-chord "C-f")))
+    (is (= "ESC" (k/meta-chord "ESC")))
+    (is (= "ESC" (k/meta-chord nil)))
+    (is (= :resize (k/meta-chord :resize)))))

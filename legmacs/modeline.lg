@@ -1,0 +1,161 @@
+;; legmacs.modeline — a themable, user-programmable status line.
+;;
+;; This namespace only holds *data*: a registry of named segments and a
+;; color theme, plus the pure logic to pick which segments are visible this
+;; frame and in what order. It never touches ANSI -- that split mirrors how
+;; a mode's :highlighter returns style keywords rather than escape codes;
+;; legmacs.render is still the only place anything becomes actual terminal
+;; bytes. A user's init.lg reaches this through the exact same
+;; register-modeline-segment!/set-modeline-theme! the built-in segments
+;; below are defined with -- there is no privileged built-in path.
+;;
+;; A segment is registered under an id (keyword) with a :side (:left or
+;; :right) and a render fn (fn [state] -> seg), where seg is one of:
+;;   nil or ""                          -- segment is omitted this frame
+;;   a plain string                     -- shown in the theme's default colors
+;;   {:text s :fg [r g b] :bg [r g b]}  -- either color optional; a segment
+;;                                          with its own colors is a "block"
+;;                                          that pops out of the bar
+;;
+;; Segments render left-to-right in registration order unless
+;; set-modeline-order! has changed it, each side joined by `separator`.
+
+(ns legmacs.modeline
+  (:require [string]
+            [legmacs.modes :as modes]))
+
+(def segments
+  "id (keyword) -> {:side :left|:right :fn (fn [state] -> seg) :order N}"
+  (atom {}))
+
+(def ^:private order-counter (atom 0))
+
+(def theme
+  "Default [r g b] colors used by any segment that doesn't specify its own."
+  (atom {:bg [40 44 58] :fg [190 195 210]}))
+
+(def separator
+  "String placed between adjacent segments on the same side."
+  (atom " "))
+
+(defn register-modeline-segment!
+  "Register or replace the mode-line segment `id`. Re-registering an
+   existing id keeps its original position; use set-modeline-order! to
+   move it."
+  [id side f]
+  (let [ord (or (:order (get @segments id)) (swap! order-counter inc))]
+    (swap! segments assoc id {:side side :fn f :order ord}))
+  id)
+
+(defn remove-modeline-segment!
+  "Remove a mode-line segment. Removing a built-in id (e.g. :position)
+   just takes it off the bar -- there's nothing else watching for it."
+  [id]
+  (swap! segments dissoc id)
+  nil)
+
+(defn set-modeline-order!
+  "Reorder segments left-to-right within each side to match `ids`.
+   Segments not mentioned keep their relative order, placed after every
+   id that was mentioned."
+  [ids]
+  (let [rank (into {} (map-indexed (fn [i id] [id i]) ids))]
+    (swap! segments
+           (fn [segs]
+             (into {}
+                   (map (fn [[id seg]]
+                          [id (assoc seg :order (get rank id (+ 1000000 (:order seg))))])
+                        segs))))))
+
+(defn set-modeline-theme!
+  "Merge `m` (a map with any of :bg :fg, each an [r g b] triple) into the
+   default mode-line theme."
+  [m]
+  (swap! theme merge m))
+
+(defn set-modeline-separator!
+  "Set the string placed between adjacent segments on the same side."
+  [s]
+  (reset! separator s))
+
+(defn- normalize-seg [s]
+  (cond
+    (nil? s) nil
+    (string? s) (when (seq s) {:text s})
+    (map? s) (when (seq (:text s)) s)
+    :else nil))
+
+(defn- ordered [side state]
+  (->> @segments
+       (filter (fn [[_ seg]] (= side (:side seg))))
+       (sort-by (fn [[_ seg]] (:order seg)))
+       (keep (fn [[_ seg]] (normalize-seg ((:fn seg) state))))))
+
+(defn left-segments
+  "Every :left segment visible this frame, as {:text :fg :bg} maps, in
+   display order."
+  [state]
+  (ordered :left state))
+
+(defn right-segments
+  "Every :right segment visible this frame, as {:text :fg :bg} maps, in
+   display order."
+  [state]
+  (ordered :right state))
+
+;; --- built-in segments --------------------------------------------------
+;;
+;; These are registered the same way any user segment would be; nothing
+;; here is privileged. Remove or replace any of them from init.lg with
+;; remove-modeline-segment!/register-modeline-segment!.
+
+(defn- buffer-label [state] (or (:filename state) "*scratch*"))
+
+(defn- buffer-segment
+  "A colored badge: dusty indigo when saved, warm red when there are
+   unsaved changes -- the color alone flags modified state, same info the
+   old \"[*]\"/\"[-]\" suffix carried, just louder."
+  [state]
+  (let [modified? (:modified? state)]
+    {:text (str " " (buffer-label state) (if modified? " *" "") " ")
+     :fg [245 246 250]
+     :bg (if modified? [204 90 90] [98 114 164])}))
+
+(defn- mode-segment
+  "A sage-green badge naming the major mode, e.g. \"(let-go)\"."
+  [state]
+  (when-let [m (:mode state)]
+    {:text (str " (" (name m) ") ")
+     :fg [30 36 30]
+     :bg [152 195 121]}))
+
+(defn- mode-lighters [state accessor]
+  (->> (modes/active-modes state)
+       (keep (fn [mode-kw]
+               (when-let [f (accessor mode-kw)]
+                 (let [s (f state)] (when (seq s) s)))))
+       (string/join " ")))
+
+(defn- modes-status-segment [state] (mode-lighters state modes/mode-status))
+(defn- modes-status-right-segment [state] (mode-lighters state modes/mode-status-right))
+
+(defn- pending-keys-segment
+  "An amber badge for an in-progress chord (e.g. \"C-x-\") -- transient
+   state, so it gets the same badge treatment as buffer/mode instead of
+   just a color change, making it hard to miss mid-keystroke."
+  [state]
+  (when (seq (:pending-keys state))
+    {:text (str " " (string/join " " (:pending-keys state)) "- ")
+     :fg [40 36 20]
+     :bg [229 192 123]}))
+
+(defn- position-segment [state]
+  (format "Ln %d, Col %d  (%d lines)"
+          (inc (:cursor-row state)) (inc (:cursor-col state)) (count (:lines state))))
+
+(register-modeline-segment! :buffer :left buffer-segment)
+(register-modeline-segment! :mode :left mode-segment)
+(register-modeline-segment! :modes-status :left modes-status-segment)
+(register-modeline-segment! :pending-keys :left pending-keys-segment)
+(register-modeline-segment! :position :left position-segment)
+(register-modeline-segment! :modes-status-right :right modes-status-right-segment)

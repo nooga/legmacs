@@ -1,0 +1,98 @@
+(ns test.buffer-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]))
+
+(deftest split-and-join
+  (testing "split-lines / join-lines round-trip"
+    (is (= ["a" "b" "c"] (buf/split-lines "a\nb\nc\n")))
+    (is (= ["a" "b" "c"] (buf/split-lines "a\nb\nc")))
+    (is (= [""] (buf/split-lines "")))
+    (is (= "a\nb\n" (buf/join-lines ["a" "b"])))))
+
+(deftest insertion
+  (testing "typing characters"
+    (let [s (buf/new-state nil [""])
+          s (buf/insert-string s "hi")]
+      (is (= ["hi"] (:lines s)))
+      (is (= 2 (:cursor-col s)))
+      (is (:modified? s))))
+
+  (testing "inserting text with newlines splits the line"
+    (let [s (buf/new-state nil ["abcd"])
+          s (assoc s :cursor-col 2)
+          s (buf/insert-string s "X\nY")]
+      (is (= ["abX" "Ycd"] (:lines s)))
+      (is (= 1 (:cursor-row s)))
+      (is (= 1 (:cursor-col s)))))
+
+  (testing "RET splits the current line"
+    (let [s (buf/new-state nil ["hello world"])
+          s (assoc s :cursor-col 5)
+          s (buf/insert-newline s)]
+      (is (= ["hello" " world"] (:lines s)))
+      (is (= 1 (:cursor-row s)))
+      (is (= 0 (:cursor-col s))))))
+
+(deftest deletion
+  (testing "delete-char-forward at end of line joins with next"
+    (let [s (buf/new-state nil ["foo" "bar"])
+          s (assoc s :cursor-col 3)
+          s (buf/delete-char-forward s)]
+      (is (= ["foobar"] (:lines s)))
+      (is (= 1 (count (:lines s))))))
+
+  (testing "delete-char-backward at column 0 joins with previous line"
+    (let [s (buf/new-state nil ["foo" "bar"])
+          s (assoc s :cursor-row 1 :cursor-col 0)
+          s (buf/delete-char-backward s)]
+      (is (= ["foobar"] (:lines s)))
+      (is (= 0 (:cursor-row s)))
+      (is (= 3 (:cursor-col s))))))
+
+(deftest kill-and-yank
+  (testing "C-k kills to end of line, C-y yanks it back"
+    (let [s (buf/new-state nil ["hello world"])
+          s (assoc s :cursor-col 5)
+          s (buf/kill-line s)]
+      (is (= ["hello"] (:lines s)))
+      (is (= " world" (:clipboard s)))
+      (let [s (buf/yank s)]
+        (is (= ["hello world"] (:lines s)))))))
+
+(deftest undo-redo
+  (testing "undo restores the previous shape; redo replays it"
+    (let [s (buf/new-state nil ["abc"])
+          s (buf/insert-string s "X")
+          s (buf/undo s)]
+      (is (= ["abc"] (:lines s)))
+      (let [s (buf/redo s)]
+        (is (= ["Xabc"] (:lines s)))))))
+
+(deftest movement
+  (testing "left/right/up/down respect line boundaries"
+    (let [s (buf/new-state nil ["ab" "cd"])
+          s (assoc s :cursor-row 0 :cursor-col 2)
+          s (buf/move-right s)]
+      (is (= 1 (:cursor-row s)))
+      (is (= 0 (:cursor-col s)))
+      (let [s (buf/move-left s)]
+        (is (= 0 (:cursor-row s)))
+        (is (= 2 (:cursor-col s))))))
+
+  (testing "move-word-forward / move-word-backward skip whole words"
+    (let [s (buf/new-state nil ["foo  bar baz"])
+          s (buf/move-word-forward s)]
+      (is (= 3 (:cursor-col s)))
+      (let [s (buf/move-word-forward s)]
+        (is (= 8 (:cursor-col s)))
+        (let [s (buf/move-word-backward s)]
+          (is (= 5 (:cursor-col s))))))))
+
+(deftest scrolling
+  (testing "ensure-visible scrolls the viewport to keep the cursor on screen"
+    (let [lines (vec (map str (range 50)))
+          s (buf/new-state nil lines)
+          s (assoc s :cursor-row 30)
+          s (buf/ensure-visible s 10 80)]
+      (is (<= (:scroll-row s) 30))
+      (is (< 30 (+ (:scroll-row s) 10))))))

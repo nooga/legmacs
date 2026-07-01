@@ -1,0 +1,161 @@
+;; legmacs.buffers — a collection of buffers behind the exact same flat
+;; state shape legmacs.dispatch/render/commands already expect, so none of
+;; them need to know multiple buffers exist.
+;;
+;; A "workspace" holds every buffer plus the handful of things that are
+;; genuinely global rather than per-buffer (the kill-ring, the echo-area
+;; message, an open minibuffer/overlay, a pending prefix key -- there's
+;; only one of each visible regardless of which buffer you're looking at).
+;; `current` merges the active buffer with those shared fields into one
+;; flat map; `put-current` splits the result back apart afterward.
+;;
+;; The one thing a normal (fn [state] -> state) command can't express is
+;; "switch to a different buffer" -- there is no different buffer in its
+;; view, just the current one. Commands that need to (switch-to-buffer,
+;; kill-buffer, find-file opening a second buffer, ...) say so by setting
+;; :buffer-command on the state they return, e.g. {:op :switch :id 2}.
+;; put-current reads that field and applies it to the workspace, then
+;; clears it -- ordinary state, not a side channel.
+
+(ns legmacs.buffers
+  (:require [string]
+            [os]))
+
+(def shared-keys [:clipboard :message :minibuffer :pending-prefix :pending-keys :overlay])
+
+(defn new-workspace
+  "A workspace holding one buffer (id 0, current), seeded from
+   `initial-buffer-state`'s own :clipboard (everything else shared starts
+   empty)."
+  [initial-buffer-state]
+  {:buffers {0 initial-buffer-state}
+   :order [0]
+   :current 0
+   :next-id 1
+   :clipboard (:clipboard initial-buffer-state "")
+   :message nil
+   :minibuffer nil
+   :pending-prefix nil
+   :pending-keys []
+   :overlay nil
+   :quit? false})
+
+(defn- basename
+  "The last path segment of `path` -- \"/a/b/c.txt\" -> \"c.txt\" -- so
+   buffer names read like Emacs's, not like a full path. Falls back to
+   `path` unchanged if it has no separator."
+  [path]
+  (if-let [i (string/last-index-of path os/file-separator)]
+    (subs path (inc i))
+    path))
+
+(defn- buffer-base-name [buf]
+  (or (:buffer-name buf) (some-> (:filename buf) basename) "*scratch*"))
+
+(defn buffer-list
+  "[{:id :name :filename :modified? :mode} ...] in creation/display order.
+   Names collide the way Emacs's do -- the first buffer with a given base
+   name keeps it, later ones get \"<2>\", \"<3>\", etc."
+  [workspace]
+  (loop [ids (:order workspace), seen {}, out []]
+    (if (empty? ids)
+      out
+      (let [id (first ids)
+            buf (get-in workspace [:buffers id])
+            base (buffer-base-name buf)
+            n (inc (get seen base 0))
+            name (if (= n 1) base (str base "<" n ">"))]
+        (recur (rest ids) (assoc seen base n)
+               (conj out {:id id :name name :filename (:filename buf)
+                          :modified? (:modified? buf) :mode (:mode buf)}))))))
+
+(defn current
+  "The active buffer, flattened with the shared fields and a read-only
+   :buffer-list/:current-buffer-id, in exactly the shape legmacs.dispatch
+   and legmacs.render already expect."
+  [workspace]
+  (merge (get-in workspace [:buffers (:current workspace)])
+         (select-keys workspace shared-keys)
+         {:quit? (:quit? workspace)
+          :buffer-list (buffer-list workspace)
+          :current-buffer-id (:current workspace)
+          :buffer-command nil}))
+
+(defn- index-of [coll x]
+  (loop [i 0, xs (seq coll)]
+    (cond (empty? xs) nil
+          (= (first xs) x) i
+          :else (recur (inc i) (rest xs)))))
+
+(defn- cycle-id [workspace delta]
+  (let [order (:order workspace)
+        n (count order)
+        idx (index-of order (:current workspace))]
+    (nth order (mod (+ idx delta) n))))
+
+(defn- kill-buffer-op
+  "Remove `id`. If that empties the workspace, `fallback` (a fresh
+   buffer-state the caller supplies, e.g. a scratch buffer) becomes the
+   sole remaining buffer -- a workspace is never left with zero buffers.
+   Otherwise, if `id` was current, the buffer that lands in the same slot
+   (or the new last slot, if `id` was last) becomes current."
+  [workspace id fallback]
+  (let [old-order (:order workspace)
+        remaining (vec (remove #(= % id) old-order))
+        buffers (dissoc (:buffers workspace) id)]
+    (if (empty? remaining)
+      (let [new-id (:next-id workspace)]
+        (-> workspace
+            (assoc :buffers {new-id fallback} :order [new-id] :current new-id)
+            (update :next-id inc)))
+      (assoc workspace
+             :buffers buffers
+             :order remaining
+             :current (if (= id (:current workspace))
+                        (nth remaining (min (index-of old-order id) (dec (count remaining))))
+                        (:current workspace))))))
+
+(defn put-current
+  "Fold `flat-state` (whatever legmacs.dispatch produced) back into
+   `workspace`: the current buffer's own fields go back into :buffers,
+   the shared fields go back onto the workspace, :quit? is read off
+   directly, and a :buffer-command (if any) is applied and consumed."
+  [workspace flat-state]
+  (let [cmd (:buffer-command flat-state)
+        stored (apply dissoc flat-state (concat shared-keys [:buffer-command :buffer-list :current-buffer-id :quit?]))
+        workspace (-> workspace
+                      (assoc-in [:buffers (:current workspace)] stored)
+                      ;; explicit get, not select-keys: a command that
+                      ;; *dissoc*s a shared key (e.g. dispatch's overlay
+                      ;; dismissal) rather than assoc-ing it to nil would
+                      ;; otherwise vanish from select-keys' result and
+                      ;; never overwrite the workspace's stale copy --
+                      ;; get defaults to nil either way, so both styles
+                      ;; of "clear this" actually clear it here.
+                      (merge (reduce (fn [m k] (assoc m k (get flat-state k))) {} shared-keys))
+                      (assoc :quit? (boolean (:quit? flat-state))))]
+    (case (:op cmd)
+      :switch (assoc workspace :current (:id cmd))
+      :open-new (let [id (:next-id workspace)]
+                  (-> workspace
+                      (assoc-in [:buffers id] (:state cmd))
+                      (update :order conj id)
+                      (update :next-id inc)
+                      (assoc :current id)))
+      :kill (kill-buffer-op workspace (:id cmd) (:fallback cmd))
+      :next (assoc workspace :current (cycle-id workspace 1))
+      :prev (assoc workspace :current (cycle-id workspace -1))
+      ;; :help find-or-create -- a named singleton buffer (e.g. *Help*)
+      ;; whose content is (re)filled from :state, then focused. Reusing the
+      ;; slot keeps repeated C-h from piling up *Help*<2>, *Help*<3>, ... and
+      ;; refreshes stale content, the way Emacs reuses its *Help* buffer.
+      :help (if-let [existing (some (fn [id] (when (= (:name cmd) (:buffer-name (get-in workspace [:buffers id]))) id))
+                                    (:order workspace))]
+              (-> workspace (assoc-in [:buffers existing] (:state cmd)) (assoc :current existing))
+              (let [id (:next-id workspace)]
+                (-> workspace
+                    (assoc-in [:buffers id] (:state cmd))
+                    (update :order conj id)
+                    (update :next-id inc)
+                    (assoc :current id))))
+      workspace)))

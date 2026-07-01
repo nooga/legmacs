@@ -1,0 +1,94 @@
+;; The read-only *Help* buffer feature: read-only enforcement in the buffer
+;; mutation primitives, help-mode's two-column highlighter, describe-bindings
+;; producing a read-only help buffer, and the named-singleton :help workspace
+;; op that reuses it.
+
+(ns test.help-mode-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.render :as r]
+            [legmacs.modes :as modes]
+            [legmacs.modes.help :as help]
+            [legmacs.buffers :as bufs]
+            [legmacs.bindings :as bindings]
+            [legmacs.commands :as c]))
+
+(deftest read-only-buffers-refuse-edits
+  (testing "every mutation primitive is a no-op on a :read-only? buffer, with a message"
+    (let [ro (assoc (buf/new-state nil ["hello"]) :read-only? true)]
+      (is (not (buf/writable? ro)))
+      (is (= ["hello"] (:lines (buf/insert-string ro "x"))))
+      (is (string/includes? (:message (buf/insert-string ro "x")) "read-only"))
+      (is (= ["hello"] (:lines (buf/insert-newline ro))))
+      (is (= ["hello"] (:lines (buf/delete-char-forward ro))))
+      (is (= ["hello"] (:lines (buf/delete-char-backward (assoc ro :cursor-col 3)))))
+      (is (= ["hello"] (:lines (buf/kill-line ro))))
+      (is (= ["hello"] (:lines (buf/kill-whole-line ro))))
+      (is (= ["hello"] (:lines (buf/yank (assoc ro :clipboard "z")))))))
+
+  (testing "a writable buffer still edits normally (guard doesn't leak)"
+    (let [s (buf/new-state nil ["hello"])]
+      (is (= ["xhello"] (:lines (buf/insert-string s "x")))))))
+
+(deftest toggle-read-only-flips-the-flag
+  (testing "C-x C-q toggles editability both ways"
+    (let [s (buf/new-state nil ["x"])
+          s (c/toggle-read-only s)]
+      (is (:read-only? s))
+      (is (string/includes? (:message s) "read-only"))
+      (let [s (c/toggle-read-only s)]
+        (is (not (:read-only? s)))
+        (is (string/includes? (:message s) "writable"))))))
+
+(deftest help-highlighter-colors-keys-and-commands
+  (testing "a header line (column 0) is one header span"
+    (is (= [{:style :help-header :start 0 :end 12}] (help/highlight-line "Key bindings")))
+    (is (= [] (help/highlight-line ""))))
+
+  (testing "an entry splits into a key span and a command span at the 2-space gap"
+    (let [line (format "  %-18s  %s" "C-x C-s" "save-buffer")
+          spans (help/highlight-line line)]
+      (is (= 2 (count spans)))
+      (is (= {:style :help-key :start 2 :end 9} (first spans)))       ; "C-x C-s" is [2,9)
+      (is (= :help-command (:style (second spans))))
+      (is (= 22 (:start (second spans))))))                            ; after 2 + 18 + 2
+
+  (testing "the boundary tracks the actual key length, not a fixed column"
+    (let [line (format "  %-18s  %s" "C-x C-really-long-chord" "cmd")
+          spans (help/highlight-line line)]
+      (is (= {:style :help-key :start 2 :end 25} (first spans))))))    ; 2 + len(23)
+
+(deftest help-mode-frame-is-highlighted
+  (testing "rendering a help-mode buffer emits the help-key color"
+    (let [s (-> (buf/new-state nil ["Key bindings" "" (format "  %-18s  %s" "C-x C-s" "save-buffer")])
+                (modes/switch-to-mode :help)
+                (buf/ensure-visible 10 60))
+          out (r/frame s 60 12)]
+      (is (string/includes? out (get r/fg-color-for :help-key)))
+      (is (string/includes? out (get r/fg-color-for :help-header))))))
+
+(deftest describe-bindings-opens-a-read-only-help-buffer
+  (testing "describe-bindings signals a *Help* buffer in help-mode, read-only, listing bindings"
+    (bindings/install!)
+    (let [s (c/describe-bindings (buf/new-state nil ["x"]))
+          cmd (:buffer-command s)]
+      (is (= :help (:op cmd)))
+      (is (= "*Help*" (:name cmd)))
+      (is (:read-only? (:state cmd)))
+      (is (= :help (:mode (:state cmd))))
+      (is (= "Key bindings" (first (:lines (:state cmd)))))
+      (is (string/includes? (str (:lines (:state cmd))) "save-buffer")))))
+
+(deftest help-op-reuses-the-named-buffer
+  (testing "opening *Help* twice reuses the one buffer and refreshes its content"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["main"]))
+          mk (fn [lines] (assoc (buf/new-state nil (vec lines)) :buffer-name "*Help*" :read-only? true :mode :help))
+          open (fn [ws lines]
+                 (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :help :name "*Help*" :state (mk lines)})))
+          ws (open ws ["Key bindings" "" "  C-a  x"])]
+      (is (= 2 (count (:buffers ws))))                       ; main + *Help*
+      (is (= :help (:mode (bufs/current ws))))
+      (let [ws (open ws ["Key bindings" "" "  C-a  x" "  C-b  y"])]
+        (is (= 2 (count (:buffers ws))))                     ; reused, not a third buffer
+        (is (= 4 (count (:lines (bufs/current ws)))))))))    ; content refreshed

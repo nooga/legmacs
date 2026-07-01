@@ -1,0 +1,30 @@
+(ns test.offset-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]))
+
+(def sample (buf/new-state nil ["abc" "de" "fghij" ""]))
+
+(deftest offset-of-known-positions
+  (testing "row 0 is unaffected by earlier lines"
+    (is (= 0 (buf/offset-of sample 0 0)))
+    (is (= 3 (buf/offset-of sample 0 3))))
+
+  (testing "each earlier line contributes its length plus one for the newline"
+    (is (= 4 (buf/offset-of sample 1 0)))
+    (is (= 7 (buf/offset-of sample 2 0)))
+    (is (= 10 (buf/offset-of sample 2 3)))
+    (is (= 13 (buf/offset-of sample 3 0)))))
+
+(deftest row-col-of-known-offsets
+  (testing "inverse of offset-of at the same points"
+    (is (= [0 0] (buf/row-col-of sample 0)))
+    (is (= [1 0] (buf/row-col-of sample 4)))
+    (is (= [2 3] (buf/row-col-of sample 10)))
+    (is (= [3 0] (buf/row-col-of sample 13)))))
+
+(deftest round-trip
+  (testing "row-col-of undoes offset-of for every valid position in the buffer"
+    (doseq [row (range (count (:lines sample)))
+            col (range (inc (count (nth (:lines sample) row))))]
+      (is (= [row col] (buf/row-col-of sample (buf/offset-of sample row col)))
+          (str "row " row " col " col)))))

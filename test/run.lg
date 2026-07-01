@@ -1,0 +1,22 @@
+(ns test.run
+  (:require [test :refer [run-tests]]
+            [test.buffer-test]
+            [test.keys-test]
+            [test.keymap-test]
+            [test.commands-test]
+            [test.render-test]
+            [test.dispatch-test]
+            [test.modes-test]
+            [test.letgo-mode-test]
+            [test.crutch-mode-test]
+            [test.keycast-mode-test]
+            [test.markdown-mode-test]
+            [test.completion-test]
+            [test.swiper-test]
+            [test.help-mode-test]
+            [test.region-test]
+            [test.offset-test]
+            [test.lisp-syntax-test]
+            [test.buffers-test]))
+
+(run-tests)

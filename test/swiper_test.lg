@@ -1,0 +1,72 @@
+;; Swiper: the reactive-minibuffer incremental regexp search. Driven end to
+;; end through the public API -- commands/swiper opens the session, then
+;; mb/insert-char and mb/select-* exercise its :on-change/:on-select hooks
+;; exactly the way legmacs.dispatch would from real keystrokes.
+
+(ns test.swiper-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.minibuffer :as mb]
+            [legmacs.commands :as commands]))
+
+(defn- type-input [state s]
+  (reduce (fn [st ch] (mb/insert-char st (str ch))) state (seq s)))
+
+(deftest swiper-live-matches-and-preview
+  (testing "typing lists matching lines and previews the first match at point"
+    (let [s (-> (buf/new-state nil ["alpha" "beta" "gamma alpha" "delta"])
+                commands/swiper
+                (type-input "alpha"))
+          cands (get-in s [:minibuffer :candidates])]
+      (is (= 2 (count cands)))
+      (is (= {:row 0 :col 0 :end 5} (select-keys (first cands) [:row :col :end])))
+      (is (= {:row 2 :col 6 :end 11} (select-keys (second cands) [:row :col :end])))
+      (is (= 0 (:cursor-row s)))
+      (is (= 0 (:cursor-col s))))))
+
+(deftest swiper-treats-input-as-regexp
+  (testing "a regexp pattern matches and reports the right columns"
+    (let [s (-> (buf/new-state nil ["x123y" "abc"])
+                commands/swiper
+                (type-input "[0-9]+"))
+          cands (get-in s [:minibuffer :candidates])]
+      (is (= 1 (count cands)))
+      (is (= {:row 0 :col 1 :end 4} (select-keys (first cands) [:row :col :end]))))))
+
+(deftest swiper-invalid-regexp-is-harmless
+  (testing "a half-typed pattern shows no matches instead of erroring"
+    (let [s (-> (buf/new-state nil ["a"]) commands/swiper (type-input "[0-9"))]
+      (is (= [] (get-in s [:minibuffer :candidates]))))))
+
+(deftest swiper-next-and-prev-move-point
+  (testing "stepping through matches drags point along, clamped at the ends"
+    (let [s (-> (buf/new-state nil ["foo" "foo" "foo"])
+                commands/swiper
+                (type-input "foo"))]
+      (is (= 0 (:cursor-row s)))
+      (let [s (mb/select-next s)]
+        (is (= 1 (:cursor-row s)))
+        (let [s (-> s mb/select-next mb/select-next)]  ; clamps at last
+          (is (= 2 (:cursor-row s)))
+          (is (= 0 (:cursor-row (-> s mb/select-prev mb/select-prev mb/select-prev)))))))))
+
+(deftest swiper-cancel-restores-origin
+  (testing "C-g returns point to where the search started"
+    (let [s (-> (assoc (buf/new-state nil ["target" "here target"]) :cursor-row 1 :cursor-col 5)
+                commands/swiper
+                (type-input "target"))]
+      (is (= 0 (:cursor-row s)))            ; previewed the first match
+      (let [s (mb/cancel s)]
+        (is (nil? (:minibuffer s)))
+        (is (= 1 (:cursor-row s)))
+        (is (= 5 (:cursor-col s)))))))
+
+(deftest swiper-submit-keeps-point
+  (testing "RET leaves point on the previewed match and closes the session"
+    (let [s (-> (buf/new-state nil ["one" "two match" "three"])
+                commands/swiper
+                (type-input "match")
+                mb/submit)]
+      (is (nil? (:minibuffer s)))
+      (is (= 1 (:cursor-row s)))
+      (is (= 4 (:cursor-col s))))))

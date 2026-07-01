@@ -1,0 +1,447 @@
+;; legmacs.buffer — pure text-buffer operations.
+;;
+;; A buffer's text lives as a vector of line strings (no trailing \n on any
+;; line). All functions here are pure: they take a state map and return a new
+;; state map. Nothing in this namespace touches the terminal.
+
+(ns legmacs.buffer
+  (:require [string]))
+
+(defn split-lines
+  "Split file content into a vector of lines, the way a text editor wants it:
+   a trailing newline does not produce a phantom empty last line, but any
+   other newline does. An empty string yields one empty line."
+  [content]
+  (let [content (string/replace content "\r\n" "\n")
+        content (if (string/ends-with? content "\n")
+                  (subs content 0 (dec (count content)))
+                  content)]
+    (vec (string/split content "\n"))))
+
+(defn join-lines [lines]
+  (str (string/join "\n" lines) "\n"))
+
+(defn new-state
+  "Build a fresh editor state for the given filename (or nil for a scratch
+   buffer) and initial lines."
+  [filename lines]
+  {:lines (if (seq lines) (vec lines) [""])
+   :cursor-row 0
+   :cursor-col 0
+   :scroll-row 0
+   :scroll-col 0
+   :goal-col nil
+   :filename filename
+   :buffer-name nil
+   :modified? false
+   :message nil
+   :minibuffer nil
+   :mode nil
+   :minor-modes []
+   :pending-prefix nil
+   :pending-keys []
+   :undo-stack ()
+   :redo-stack ()
+   :mark nil
+   :expand-stack ()
+   :clipboard ""
+   :quit? false})
+
+(defn line-count [state] (count (:lines state)))
+
+(defn current-line [state]
+  (nth (:lines state) (:cursor-row state) ""))
+
+(defn line-length [state row]
+  (count (nth (:lines state) row "")))
+
+(defn clamp [v lo hi] (max lo (min v hi)))
+
+;; --- cursor clamping -----------------------------------------------------
+
+(defn clamp-cursor
+  "Cursor row must point at an existing line; cursor col must be within
+   [0, line-length] (one past the last char is the valid append position)."
+  [state]
+  (let [n (line-count state)
+        row (clamp (:cursor-row state) 0 (dec n))
+        col (clamp (:cursor-col state) 0 (line-length state row))]
+    (assoc state :cursor-row row :cursor-col col)))
+
+;; --- undo bookkeeping ------------------------------------------------------
+
+(def undo-depth-limit 1000)
+
+(defn snapshot [state]
+  {:lines (:lines state) :cursor-row (:cursor-row state) :cursor-col (:cursor-col state)})
+
+(defn push-undo
+  "Record the buffer's current shape on the undo stack before a mutation.
+   Coalesces nothing (every edit is its own undo step) -- simple and
+   predictable beats clever for an editor this size."
+  [state]
+  (-> state
+      (update :undo-stack #(cons (snapshot state) %))
+      (update :undo-stack #(if (> (count %) undo-depth-limit) (take undo-depth-limit %) %))
+      (assoc :redo-stack ())))
+
+(defn writable?
+  "False if this buffer refuses edits -- a read-only buffer like *Help*. The
+   mutation primitives below all short-circuit on it (and self-insert flows
+   through insert-string, so it's covered too), so no command -- built-in or
+   from a user's config -- can modify a read-only buffer."
+  [state] (not (:read-only? state)))
+
+(defn- blocked [state] (assoc state :message "Buffer is read-only"))
+
+(defn undo [state]
+  (if-not (writable? state)
+    (blocked state)
+    (if-let [prev (first (:undo-stack state))]
+      (-> state
+          (assoc :lines (:lines prev) :cursor-row (:cursor-row prev) :cursor-col (:cursor-col prev))
+          (update :undo-stack rest)
+          (update :redo-stack #(cons (snapshot state) %))
+          (assoc :modified? true)
+          (assoc :message "Undo!"))
+      (assoc state :message "No further undo information"))))
+
+(defn redo [state]
+  (if-not (writable? state)
+    (blocked state)
+    (if-let [next (first (:redo-stack state))]
+      (-> state
+          (assoc :lines (:lines next) :cursor-row (:cursor-row next) :cursor-col (:cursor-col next))
+          (update :redo-stack rest)
+          (update :undo-stack #(cons (snapshot state) %))
+          (assoc :modified? true)
+          (assoc :message "Redo!"))
+      (assoc state :message "No further redo information"))))
+
+;; --- editing ---------------------------------------------------------------
+
+(defn insert-string
+  "Insert text at the cursor, splitting on newlines if the text contains any.
+   Leaves the cursor immediately after the inserted text."
+  [state text]
+  (if-not (writable? state) (blocked state)
+   (let [state (push-undo state)
+        {:keys [lines cursor-row cursor-col]} state
+        line (nth lines cursor-row)
+        before (subs line 0 cursor-col)
+        after (subs line cursor-col)
+        pieces (vec (string/split text "\n"))
+        n (count pieces)]
+    (if (= n 1)
+      (-> state
+          (assoc :lines (assoc lines cursor-row (str before text after)))
+          (assoc :cursor-col (+ cursor-col (count text)))
+          (assoc :modified? true))
+      (let [first-piece (nth pieces 0)
+            last-piece (nth pieces (dec n))
+            middle (subvec pieces 1 (dec n))
+            new-lines (-> [(str before first-piece)]
+                          (into middle)
+                          (conj (str last-piece after)))
+            lines* (vec (concat (subvec lines 0 cursor-row)
+                                 new-lines
+                                 (subvec lines (inc cursor-row))))]
+        (-> state
+            (assoc :lines lines*)
+            (assoc :cursor-row (+ cursor-row (dec n)))
+            (assoc :cursor-col (count last-piece))
+            (assoc :modified? true)))))))
+
+(defn insert-newline [state]
+  (insert-string state "\n"))
+
+(defn delete-char-forward
+  "Delete the character under the cursor (or join with the next line at
+   end-of-line). No-op at the very end of the buffer."
+  [state]
+  (if-not (writable? state) (blocked state)
+   (let [{:keys [lines cursor-row cursor-col]} state
+        line (nth lines cursor-row)
+        len (count line)]
+    (cond
+      (< cursor-col len)
+      (-> state push-undo
+          (assoc :lines (assoc lines cursor-row (str (subs line 0 cursor-col) (subs line (inc cursor-col)))))
+          (assoc :modified? true))
+
+      (< cursor-row (dec (count lines)))
+      (let [next-line (nth lines (inc cursor-row))
+            merged (str line next-line)
+            lines* (vec (concat (subvec lines 0 cursor-row) [merged] (subvec lines (+ cursor-row 2))))]
+        (-> state push-undo
+            (assoc :lines lines*)
+            (assoc :modified? true)))
+
+      :else state))))
+
+(defn delete-char-backward
+  "Backspace: delete the character before the cursor, or join with the
+   previous line at column 0."
+  [state]
+  (let [{:keys [cursor-row cursor-col]} state]
+    (cond
+      (> cursor-col 0)
+      (let [state (delete-char-forward (assoc state :cursor-col (dec cursor-col)))]
+        state)
+
+      (> cursor-row 0)
+      (let [prev-len (line-length state (dec cursor-row))
+            state (delete-char-forward (assoc state :cursor-row (dec cursor-row) :cursor-col prev-len))]
+        state)
+
+      :else state)))
+
+(defn kill-line
+  "Emacs C-k: kill from the cursor to end of line; if already at end of
+   line, kill the newline (joining with the next line). Returns the new
+   state plus the killed text via :clipboard."
+  [state]
+  (if-not (writable? state) (blocked state)
+   (let [{:keys [lines cursor-row cursor-col]} state
+        line (nth lines cursor-row)]
+    (if (< cursor-col (count line))
+      (let [killed (subs line cursor-col)]
+        (-> state push-undo
+            (assoc :lines (assoc lines cursor-row (subs line 0 cursor-col)))
+            (assoc :clipboard killed)
+            (assoc :modified? true)))
+      (if (< cursor-row (dec (count lines)))
+        (-> state
+            (assoc :clipboard "\n")
+            delete-char-forward)
+        state)))))
+
+(defn yank
+  "Emacs C-y: insert the clipboard text at the cursor."
+  [state]
+  (if (seq (:clipboard state))
+    (insert-string state (:clipboard state))
+    state))
+
+(defn kill-whole-line [state]
+  (if-not (writable? state) (blocked state)
+   (let [{:keys [lines cursor-row]} state]
+    (if (> (count lines) 1)
+      (-> state push-undo
+          (assoc :lines (vec (concat (subvec lines 0 cursor-row) (subvec lines (inc cursor-row)))))
+          (assoc :cursor-col 0)
+          clamp-cursor
+          (assoc :modified? true))
+      (-> state push-undo
+          (assoc :lines [""] :cursor-col 0)
+          (assoc :modified? true))))))
+
+;; --- movement ----------------------------------------------------------
+
+(defn move-left [state]
+  (let [{:keys [cursor-row cursor-col]} state]
+    (cond
+      (> cursor-col 0) (assoc state :cursor-col (dec cursor-col) :goal-col nil)
+      (> cursor-row 0) (assoc state :cursor-row (dec cursor-row)
+                              :cursor-col (line-length state (dec cursor-row))
+                              :goal-col nil)
+      :else state)))
+
+(defn move-right [state]
+  (let [{:keys [cursor-row cursor-col]} state
+        len (line-length state cursor-row)]
+    (cond
+      (< cursor-col len) (assoc state :cursor-col (inc cursor-col) :goal-col nil)
+      (< cursor-row (dec (line-count state))) (assoc state :cursor-row (inc cursor-row) :cursor-col 0 :goal-col nil)
+      :else state)))
+
+(defn- vertical-move [state delta]
+  (let [{:keys [cursor-row cursor-col goal-col]} state
+        col (or goal-col cursor-col)
+        row (clamp (+ cursor-row delta) 0 (dec (line-count state)))]
+    (assoc state :cursor-row row :cursor-col (clamp col 0 (line-length state row)) :goal-col col)))
+
+(defn move-up [state] (vertical-move state -1))
+(defn move-down [state] (vertical-move state 1))
+
+(defn move-line-start [state] (assoc state :cursor-col 0 :goal-col nil))
+(defn move-line-end [state] (assoc state :cursor-col (line-length state (:cursor-row state)) :goal-col nil))
+
+(defn move-buffer-start [state] (assoc state :cursor-row 0 :cursor-col 0 :goal-col nil))
+(defn move-buffer-end [state]
+  (let [row (dec (line-count state))]
+    (assoc state :cursor-row row :cursor-col (line-length state row) :goal-col nil)))
+
+(defn- char-at [state row col]
+  (let [line (nth (:lines state) row "")]
+    (when (< col (count line)) (nth (seq line) col))))
+
+(defn word-char?
+  "True for letters, digits, and underscore -- good enough for M-f/M-b word
+   motion without pulling in a regex engine for a single character class."
+  [ch]
+  (and ch
+       (let [c (int ch)]
+         (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57) (= c 95)))))
+
+(defn- word-char-at? [state row col]
+  (word-char? (char-at state row col)))
+
+(defn- skip-while [state pred]
+  (loop [s state]
+    (if (and (< (:cursor-col s) (line-length s (:cursor-row s)))
+             (pred s (:cursor-row s) (:cursor-col s)))
+      (recur (move-right s))
+      s)))
+
+(defn move-word-forward
+  "Emacs M-f: skip any non-word chars, then skip the word."
+  [state]
+  (-> state
+      (skip-while (fn [s r c] (not (word-char-at? s r c))))
+      (skip-while word-char-at?)))
+
+(defn- skip-while-back [state pred]
+  (loop [s state]
+    (if (and (> (:cursor-col s) 0) (pred s (:cursor-row s) (dec (:cursor-col s))))
+      (recur (move-left s))
+      s)))
+
+(defn move-word-backward
+  "Emacs M-b: skip any non-word chars, then skip the word, landing on its
+   first character."
+  [state]
+  (-> state
+      (skip-while-back (fn [s r c] (not (word-char-at? s r c))))
+      (skip-while-back word-char-at?)))
+
+(defn page-move [state delta page-size]
+  (let [{:keys [cursor-row]} state
+        row (clamp (+ cursor-row (* delta page-size)) 0 (dec (line-count state)))]
+    (assoc state :cursor-row row :cursor-col (clamp (:cursor-col state) 0 (line-length state row)))))
+
+;; --- scrolling -------------------------------------------------------------
+
+(defn ensure-visible
+  "Adjust :scroll-row/:scroll-col so the cursor is within the viewport of
+   `rows` text lines and `cols` columns."
+  [state rows cols]
+  (let [{:keys [cursor-row cursor-col scroll-row scroll-col]} state
+        scroll-row (cond
+                     (< cursor-row scroll-row) cursor-row
+                     (>= cursor-row (+ scroll-row rows)) (- cursor-row rows -1)
+                     :else scroll-row)
+        scroll-col (cond
+                     (< cursor-col scroll-col) cursor-col
+                     (>= cursor-col (+ scroll-col cols)) (- cursor-col cols -1)
+                     :else scroll-col)]
+    (assoc state :scroll-row (max 0 scroll-row) :scroll-col (max 0 scroll-col))))
+
+;; --- whole-buffer text access (for eval, search-the-whole-thing, etc.) -----
+
+(defn buffer-text
+  "The whole buffer joined with newlines -- no trailing newline, unlike
+   join-lines (which is for writing files)."
+  [state]
+  (string/join "\n" (:lines state)))
+
+(defn text-before-cursor
+  "Everything in the buffer up to (not including) the cursor, as one
+   string. Used by legmacs.modes.letgo to find \"the sexp before point\"."
+  [state]
+  (let [{:keys [lines cursor-row cursor-col]} state
+        prior (subvec lines 0 cursor-row)
+        on-cursor-line (subs (nth lines cursor-row) 0 cursor-col)]
+    (str (string/join "" (map #(str % "\n") prior)) on-cursor-line)))
+
+;; --- region (mark to point) -------------------------------------------
+
+(defn region-active? [state] (boolean (:mark state)))
+
+(defn region-bounds
+  "[[start-row start-col] [end-row end-col]], mark and point in whichever
+   order they actually fall in the buffer. nil if no mark is set."
+  [state]
+  (when-let [[mr mc] (:mark state)]
+    (let [pr (:cursor-row state), pc (:cursor-col state)]
+      (if (or (< mr pr) (and (= mr pr) (<= mc pc)))
+        [[mr mc] [pr pc]]
+        [[pr pc] [mr mc]]))))
+
+(defn region-text
+  "The text strictly between mark and point, mark/point order-independent.
+   \"\" if no mark is set."
+  [state]
+  (if-let [[[sr sc] [er ec]] (region-bounds state)]
+    (let [lines (:lines state)]
+      (if (= sr er)
+        (subs (nth lines sr) sc ec)
+        (let [first-part (subs (nth lines sr) sc)
+              middle (subvec lines (inc sr) er)
+              last-part (subs (nth lines er) 0 ec)]
+          (string/join "\n" (concat [first-part] middle [last-part])))))
+    ""))
+
+(defn delete-region
+  "Delete the text between mark and point, leaving point at the start of
+   where it was and clearing the mark. No-op (but still clears the mark)
+   if the region is empty."
+  [state]
+  (if-let [[[sr sc] [er ec]] (region-bounds state)]
+    (let [lines (:lines state)]
+      (if (= sr er)
+        (-> state push-undo
+            (assoc :lines (assoc lines sr (str (subs (nth lines sr) 0 sc) (subs (nth lines sr) ec))))
+            (assoc :cursor-row sr :cursor-col sc :mark nil :modified? true))
+        (let [merged (str (subs (nth lines sr) 0 sc) (subs (nth lines er) ec))
+              lines* (vec (concat (subvec lines 0 sr) [merged] (subvec lines (inc er))))]
+          (-> state push-undo
+              (assoc :lines lines* :cursor-row sr :cursor-col sc :mark nil :modified? true)))))
+    state))
+
+;; --- offset <-> [row col] --------------------------------------------
+;;
+;; legmacs.lisp-syntax scans the buffer as one flat string (buffer-text --
+;; string/join "\n" lines), since bracket-matching/sexp boundaries are
+;; naturally a flat-text problem. These convert between that flat
+;; character offset and the [row col] the rest of the editor speaks.
+
+(defn offset-of
+  "The offset into (buffer-text state) of [row col]. Each line contributes
+   (count line) + 1 for its joining newline."
+  [state row col]
+  (let [lines (:lines state)]
+    (+ (reduce + 0 (map #(inc (count %)) (subvec lines 0 row))) col)))
+
+(defn row-col-of
+  "The inverse of offset-of: the [row col] at flat offset `offset`."
+  [state offset]
+  (loop [row 0, remaining offset, lines (:lines state)]
+    (if (empty? lines)
+      [row remaining]
+      (let [len (count (first lines))]
+        (if (<= remaining len)
+          [row remaining]
+          (recur (inc row) (- remaining len 1) (rest lines)))))))
+
+;; --- symbol at point (word-level expand-region) -----------------------
+
+(defn symbol-bounds-at
+  "[[row start-col] [row end-col]] of the run of word-chars touching the
+   cursor -- the char at point, or failing that the char just before it --
+   extended as far as it goes both ways. nil if point isn't on or right
+   after a word character. Single-line by construction: a \"word\" never
+   crosses a line break."
+  [state]
+  (let [row (:cursor-row state), col (:cursor-col state)
+        line (nth (:lines state) row)
+        len (count line)
+        char-at (fn [c] (when (< -1 c len) (nth (seq line) c)))
+        anchor (cond
+                 (word-char? (char-at col)) col
+                 (word-char? (char-at (dec col))) (dec col)
+                 :else nil)]
+    (when anchor
+      (let [start (loop [c anchor] (if (word-char? (char-at (dec c))) (recur (dec c)) c))
+            end (loop [c (inc anchor)] (if (word-char? (char-at c)) (recur (inc c)) c))]
+        [[row start] [row end]]))))

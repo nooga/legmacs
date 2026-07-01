@@ -1,0 +1,214 @@
+(ns test.commands-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.minibuffer :as mb]
+            [legmacs.completion :as completion]
+            [legmacs.commands :as c]
+            [legmacs.modes.letgo]))
+
+(defn- type-text [state text]
+  (reduce mb/insert-char state (seq text)))
+
+(deftest movement-commands-delegate-to-buffer
+  (testing "forward-char / next-line move the cursor"
+    (let [s (buf/new-state nil ["ab" "cd"])
+          s (c/forward-char s)]
+      (is (= 1 (:cursor-col s)))
+      (let [s (c/next-line s)]
+        (is (= 1 (:cursor-row s)))))))
+
+(deftest search-forward-and-repeat
+  (testing "search-forward jumps to the next match, wrapping; empty input repeats"
+    (let [s (buf/new-state nil ["foo bar baz" "bar again" "and baz too"])
+          s (c/search-forward s)
+          s (type-text s "baz")
+          s (mb/submit s)]
+      (is (not (mb/active? s)))
+      (is (= [0 8] [(:cursor-row s) (:cursor-col s)]))
+      (let [s (c/search-forward s)
+            s (mb/submit s)] ;; empty -> repeat
+        (is (= [2 4] [(:cursor-row s) (:cursor-col s)])))))
+
+  (testing "search-forward wraps around to the top of the buffer"
+    (let [s (buf/new-state nil ["xx" "needle" "xx"])
+          s (assoc s :cursor-row 1 :cursor-col 5)
+          s (c/search-forward s)
+          s (type-text s "needle")
+          s (mb/submit s)]
+      (is (= [1 0] [(:cursor-row s) (:cursor-col s)])))))
+
+(deftest save-and-load-roundtrip
+  (testing "save-buffer with no filename prompts, then write-file roundtrips through find-file"
+    (let [path "/tmp/legmacs-test-roundtrip.txt"
+          s (buf/new-state nil ["line one" "line two"])
+          s (c/save-buffer s)]
+      (is (mb/active? s))
+      (let [s (type-text s path)
+            s (mb/submit s)]
+        (is (not (:modified? s)))
+        (is (= path (:filename s)))
+        (let [s2 (buf/new-state nil [""])
+              s2 (c/find-file s2)
+              s2 (type-text s2 path)
+              s2 (mb/submit s2)]
+          ;; find-file opens a *new* buffer rather than replacing the
+          ;; current one -- it signals that via :buffer-command instead
+          ;; of returning the loaded content directly (see legmacs.buffers).
+          (is (= :open-new (:op (:buffer-command s2))))
+          (is (= ["line one" "line two"] (:lines (:state (:buffer-command s2))))))))))
+
+(deftest find-file-applies-auto-mode-detection
+  (testing "opening a .lg file via find-file (C-x C-f) starts it in let-go-mode, same as the command-line path"
+    (let [path "/tmp/legmacs-test-automode.lg"
+          _ (spit path "(+ 1 1)")
+          s (buf/new-state nil [""])
+          s (c/find-file s)
+          s (type-text s path)
+          s (mb/submit s)]
+      (is (= :let-go (:mode (:state (:buffer-command s))))))))
+
+(deftest find-file-switches-to-an-already-open-buffer-instead-of-reopening
+  (testing "when :buffer-list already has this filename, find-file signals a plain switch, not a fresh load"
+    (let [path "/tmp/legmacs-test-already-open.txt"
+          s (assoc (buf/new-state nil [""])
+                   :buffer-list [{:id 7 :name path :filename path :modified? false :mode nil}])
+          s (c/find-file s)
+          s (type-text s path)
+          s (mb/submit s)]
+      (is (= {:op :switch :id 7} (:buffer-command s))))))
+
+(deftest quit-flow-asks-to-save
+  (testing "save-buffers-kill-terminal quits immediately when unmodified"
+    (let [s (buf/new-state nil ["x"])
+          s (c/save-buffers-kill-terminal s)]
+      (is (:quit? s))
+      (is (not (mb/active? s)))))
+
+  (testing "when modified, it prompts and only quits after an answer"
+    (let [s (assoc (buf/new-state nil ["x"]) :modified? true)
+          s (c/save-buffers-kill-terminal s)]
+      (is (mb/active? s))
+      (is (not (:quit? s)))
+      (let [s (type-text s "n")
+            s (mb/submit s)]
+        (is (:quit? s))
+        (is (:modified? s)))))
+
+  (testing "current buffer clean, but another buffer is modified -> warns before quitting"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :current-buffer-id 0
+                   :buffer-list [{:id 0 :modified? false} {:id 1 :modified? true}])
+          s (c/save-buffers-kill-terminal s)]
+      (is (mb/active? s))
+      (is (string/includes? (:prompt (:minibuffer s)) "1 other modified buffer"))
+      (let [yes (mb/submit (type-text s "y"))
+            no (mb/submit (type-text s "n"))]
+        (is (:quit? yes))
+        (is (not (:quit? no))))))
+
+  (testing "current buffer modified, and another is too -> one prompt mentions both"
+    (let [s (assoc (buf/new-state nil ["x"]) :modified? true
+                   :current-buffer-id 0
+                   :buffer-list [{:id 0 :modified? true} {:id 1 :modified? true} {:id 2 :modified? true}])
+          s (c/save-buffers-kill-terminal s)]
+      (is (string/includes? (:prompt (:minibuffer s)) "2 other buffers won't be saved"))))
+
+  (testing "no other buffers modified -> no warning, quits normally"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :current-buffer-id 0
+                   :buffer-list [{:id 0 :modified? false} {:id 1 :modified? false}])
+          s (c/save-buffers-kill-terminal s)]
+      (is (:quit? s))
+      (is (not (mb/active? s))))))
+
+(deftest keyboard-quit-cancels-in-progress-things
+  (testing "C-g closes an open minibuffer"
+    (let [s (c/search-forward (buf/new-state nil ["x"]))
+          s (c/keyboard-quit s)]
+      (is (not (mb/active? s)))
+      (is (= "Quit" (:message s))))))
+
+(deftest extended-command-by-name
+  (testing "M-x runs a command looked up by its hyphenated name"
+    (let [s (buf/new-state nil ["ab"])
+          s (c/execute-extended-command s)
+          s (type-text s "forward-char")
+          s (mb/submit s)]
+      (is (= 1 (:cursor-col s)))))
+
+  (testing "M-x fuzzy-narrows and RET runs the *highlighted* candidate, not the raw text"
+    (let [s (buf/new-state nil ["ab" "cd"])
+          s (c/execute-extended-command s)
+          s (type-text s "nxtl")               ; fuzzy subsequence of next-line
+          s (mb/submit s)]                       ; submit-selected? -> picks next-line
+      (is (= 1 (:cursor-row s))))))
+
+(deftest find-file-submits-typed-path-not-a-fuzzy-candidate
+  (testing "RET opens exactly the typed path even when a candidate is highlighted (safe new-file create)"
+    (let [s (c/find-file (buf/new-state nil [""]))
+          s (type-text s "legmacs/comp")        ; highlights legmacs/completion.lg
+          s (mb/submit s)]
+      (is (= "legmacs/comp" (:filename (:state (:buffer-command s)))))))
+
+  (testing "TAB first accepts the highlighted candidate into the input, then RET opens that"
+    (let [s (c/find-file (buf/new-state nil [""]))
+          s (type-text s "legmacs/comp")
+          s (mb/accept-selection s)              ; TAB
+          s (mb/submit s)]
+      (is (= "legmacs/completion.lg" (:filename (:state (:buffer-command s))))))))
+
+(def sample-buffer-list
+  [{:id 0 :name "*scratch*" :filename nil :modified? false :mode nil}
+   {:id 1 :name "foo.txt" :filename "foo.txt" :modified? true :mode nil}])
+
+(deftest switch-to-buffer-cases
+  (testing "switching to an existing buffer's name signals a plain switch"
+    (let [s (assoc (buf/new-state nil ["x"]) :buffer-list sample-buffer-list)
+          s (c/switch-to-buffer s)
+          s (type-text s "foo.txt")
+          s (mb/submit s)]
+      (is (= {:op :switch :id 1} (:buffer-command s)))))
+
+  (testing "switching to a name that doesn't exist creates a new named buffer"
+    (let [s (assoc (buf/new-state nil ["x"]) :buffer-list sample-buffer-list)
+          s (c/switch-to-buffer s)
+          s (type-text s "notes")
+          s (mb/submit s)]
+      (is (= :open-new (:op (:buffer-command s))))
+      (is (= "notes" (:buffer-name (:state (:buffer-command s)))))))
+
+  (testing "TAB completes against the injected buffer-list names"
+    (let [s (assoc (buf/new-state nil ["x"]) :buffer-list sample-buffer-list)
+          s (c/switch-to-buffer s)
+          s (type-text s "foo")
+          s (mb/complete s completion/complete-input)]
+      (is (= "foo.txt" (:input (:minibuffer s)))))))
+
+(deftest list-buffers-shows-an-overlay
+  (testing "shows name/modified/mode for every open buffer"
+    (let [s (assoc (buf/new-state nil ["x"]) :buffer-list sample-buffer-list)
+          s (c/list-buffers s)]
+      (is (some? (:overlay s)))
+      (is (string/includes? (str (:lines (:overlay s))) "*scratch*"))
+      (is (string/includes? (str (:lines (:overlay s))) "foo.txt")))))
+
+(deftest kill-buffer-cases
+  (testing "unmodified buffer: kills immediately"
+    (let [s (assoc (buf/new-state nil ["x"]) :current-buffer-id 3)
+          s (c/kill-buffer s)]
+      (is (= {:op :kill :id 3} (select-keys (:buffer-command s) [:op :id])))))
+
+  (testing "modified buffer: asks first"
+    (let [s (assoc (buf/new-state nil ["x"]) :modified? true :current-buffer-id 3)
+          s (c/kill-buffer s)]
+      (is (mb/active? s))
+      (let [yes (mb/submit (type-text s "y"))
+            no (mb/submit (type-text s "n"))]
+        (is (= 3 (:id (:buffer-command yes))))
+        (is (nil? (:buffer-command no)))))))
+
+(deftest next-and-previous-buffer-signal-cycling
+  (testing "next-buffer / previous-buffer just signal the op; legmacs.buffers does the cycling"
+    (is (= {:op :next} (:buffer-command (c/next-buffer (buf/new-state nil ["x"])))))
+    (is (= {:op :prev} (:buffer-command (c/previous-buffer (buf/new-state nil ["x"])))))))

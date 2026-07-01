@@ -1,0 +1,124 @@
+;; legmacs.dispatch — turns one key chord into a state transition. This is
+;; where the keymap, the minibuffer, and self-insert all meet:
+;;
+;;   1. An overlay (e.g. the help screen) swallows the next key to dismiss.
+;;   2. C-g always aborts a pending prefix key, no matter what.
+;;   3. A live minibuffer gets the key for line-editing.
+;;   4. Otherwise, walk the (possibly multi-key) keymap; an unbound single
+;;      printable character falls back to self-insert-command.
+;;
+;; A buffer's active modes (if any) shadow the global keymap key-by-key, not
+;; as a whole-sequence override: at each chord, the mode maps are checked in
+;; priority order (minor modes, then the major mode -- see
+;; legmacs.modes/active-modes), then global; if any resolves to a prefix (a
+;; sub-map), *every* such side's sub-map carries forward as a parallel layer
+;; for the next chord. That way a mode can add a leaf under an existing
+;; global prefix (e.g. bind something new under "C-x") without hiding the
+;; rest of that prefix's global bindings -- see legmacs.modes.letgo binding
+;; "C-x C-e" while "C-x C-s"/"C-x C-c"/etc keep working from the global map.
+;;
+;; A mode may also declare :suppress-self-insert? (modal editing): while it's
+;; active, an unbound printable key does nothing rather than inserting itself
+;; -- so CRUTCH's normal mode can leave the bulk of the keyboard inert
+;; without enumerating every key.
+
+(ns legmacs.dispatch
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keys :as keys]
+            [legmacs.keymap :as km]
+            [legmacs.modes :as modes]
+            [legmacs.minibuffer :as mb]))
+
+(defn- chord-path-str [chords] (string/join " " chords))
+
+(defn- keymaps-for
+  "The ordered keymap layers active for `state`: every active mode's map
+   (in legmacs.modes/active-modes priority order -- minor modes then major),
+   then global last."
+  [state]
+  (conj (vec (remove nil? (map (fn [mode-kw] (modes/resolve-keymap mode-kw state))
+                               (modes/active-modes state))))
+        @km/global-keymap))
+
+(defn- lookup-layers
+  "Look up `chord` across `layers` (a vector of keymaps, highest priority
+   first). The first layer with a :command wins outright. Any layer with a
+   :prefix at this chord contributes its sub-map to the next round, in
+   priority order -- so a prefix started in one layer keeps every layer's
+   bindings reachable under it, not just that layer's own."
+  [layers chord]
+  (loop [ls layers, prefixes []]
+    (if (empty? ls)
+      (if (seq prefixes) [:prefix prefixes] [:unbound nil])
+      (let [[tag v] (km/lookup (first ls) chord)]
+        (case tag
+          :command [:command v]
+          :prefix (recur (rest ls) (conj prefixes v))
+          (recur (rest ls) prefixes))))))
+
+(defn- dispatch-minibuffer [state chord]
+  (cond
+    (= chord "RET") (mb/submit state)
+    (= chord "M-RET") (mb/submit-input state)
+    (or (= chord "C-g") (= chord "ESC")) (mb/cancel state)
+    (or (= chord "down") (= chord "C-n") (= chord "C-s")) (mb/select-next state)
+    (or (= chord "up") (= chord "C-p") (= chord "C-r")) (mb/select-prev state)
+    (= chord "TAB") (mb/accept-selection state)
+    (= chord "DEL") (mb/backward-delete-char state)
+    (or (= chord "left") (= chord "C-b")) (mb/move-left state)
+    (or (= chord "right") (= chord "C-f")) (mb/move-right state)
+    (or (= chord "home") (= chord "C-a")) (mb/move-beginning state)
+    (or (= chord "end") (= chord "C-e")) (mb/move-end state)
+    (keys/printable? chord) (mb/insert-char state chord)
+    :else state))
+
+(defn- dispatch-prefix [state chord]
+  (let [path (conj (:pending-keys state) chord)
+        [tag v] (lookup-layers (:pending-prefix state) chord)
+        state (assoc state :message nil)]
+    (case tag
+      :command (km/run-command (assoc state :pending-prefix nil :pending-keys []) v)
+      :prefix (assoc state :pending-prefix v :pending-keys path)
+      (assoc state :pending-prefix nil :pending-keys []
+             :message (str (chord-path-str path) " is undefined")))))
+
+(defn- dispatch-normal [state chord]
+  (let [[tag v] (lookup-layers (keymaps-for state) chord)
+        state (assoc state :message nil)]
+    (case tag
+      :command (km/run-command state v)
+      :prefix (assoc state :pending-prefix v :pending-keys [chord])
+      (if (keys/printable? chord)
+        (if (modes/suppress-self-insert? state)
+          state
+          (buf/insert-string state chord))
+        (assoc state :message (str chord " is undefined"))))))
+
+(defn- run-after-commands
+  "Thread `state` through every active mode's :after-command hook, in
+   active-modes priority order (minor modes then major). A mode with no
+   :after-command is skipped."
+  [state]
+  (reduce (fn [s mode-kw]
+            (if-let [hook (modes/mode-after-command mode-kw)] (hook s) s))
+          state
+          (modes/active-modes state)))
+
+(defn dispatch
+  "state, one chord (as produced by legmacs.keys/read-chord) -> new state.
+   The just-pressed chord is stamped onto the threaded state as :last-chord
+   (Emacs's last-command-event, for modes that want to see the raw key --
+   e.g. legmacs.modes.keycast), then the state runs through each active
+   mode's :after-command hook (if any) -- see legmacs.modes/register-mode!."
+  [state chord]
+  (let [state* (cond
+                 (:overlay state) (dissoc state :overlay)
+
+                 (and (:pending-prefix state) (= chord "C-g"))
+                 (km/run-command (assoc state :pending-prefix nil :pending-keys []) :keyboard-quit)
+
+                 (mb/active? state) (dispatch-minibuffer state chord)
+                 (:pending-prefix state) (dispatch-prefix state chord)
+                 :else (dispatch-normal state chord))]
+    (run-after-commands (assoc state* :last-chord chord))))

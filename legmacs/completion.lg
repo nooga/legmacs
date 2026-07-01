@@ -1,0 +1,118 @@
+;; legmacs.completion — TAB-completion for the minibuffer: command names
+;; for M-x, filesystem paths for find-file/save-as/write-file. A completer
+;; is just a (fn [input] -> vector-of-candidate-strings); legmacs.minibuffer
+;; only knows how to call one, not what kind it is -- see complete-input for
+;; the shared "extend to common prefix, else show what matched" policy.
+
+(ns legmacs.completion
+  (:require [string]
+            [os]
+            [legmacs.keymap :as km]))
+
+;; --- the policy: input + matching candidates -> what to show -------------
+
+(defn longest-common-prefix [strs]
+  (if (empty? strs)
+    ""
+    (reduce (fn [a b]
+              (let [n (min (count a) (count b))]
+                (loop [i 0]
+                  (if (and (< i n) (= (nth a i) (nth b i)))
+                    (recur (inc i))
+                    (subs a 0 i)))))
+            strs)))
+
+(defn- preview [candidates]
+  (let [shown (take 6 candidates)
+        more (- (count candidates) (count shown))]
+    (str "[" (string/join " " shown) (if (pos? more) (format " ...(+%d)" more) "") "]")))
+
+(defn complete-input
+  "Given the current minibuffer `input` and the candidates its completer
+   returned for it (every candidate already starts with input), decide the
+   next input and an optional note to show. Mirrors Emacs's TAB: extend to
+   the longest common prefix of all matches; if that's no longer than what
+   was already typed, there's nothing to extend, so just report what
+   matched (or that nothing did)."
+  [input candidates]
+  (cond
+    (empty? candidates) {:input input :note "[No match]"}
+    (= 1 (count candidates)) {:input (first candidates) :note nil}
+    :else
+    (let [lcp (longest-common-prefix candidates)]
+      (if (> (count lcp) (count input))
+        {:input lcp :note nil}
+        {:input input :note (preview candidates)}))))
+
+;; --- fuzzy matching (vertical live completion) ----------------------------
+;;
+;; A pattern matches a candidate if its characters appear in order anywhere
+;; in the candidate (a subsequence), case-insensitively -- so "flb" finds
+;; "find-last-buffer" and "cmp" finds "completion.lg". The score ranks an
+;; earlier first hit and a tighter span (fewer skipped chars) ahead of a
+;; late, scattered one, with shorter candidates breaking ties. This is what
+;; the reactive minibuffer (legmacs.minibuffer / legmacs.render) narrows a
+;; vertical candidate list with as you type.
+
+(defn fuzzy-score
+  "A number for how well `pattern` matches `s` as a case-insensitive
+   subsequence -- lower is better -- or nil if it doesn't match at all."
+  [pattern s]
+  (let [p (string/lower-case pattern)
+        t (string/lower-case s)
+        pn (count p)
+        tn (count t)]
+    (loop [pi 0, ti 0, first-hit nil, last-hit 0]
+      (cond
+        (>= pi pn) (+ (* 10000 (or first-hit 0))
+                      (* 100 (- last-hit (or first-hit 0)))
+                      (min 99 tn))
+        (>= ti tn) nil
+        (= (nth p pi) (nth t ti)) (recur (inc pi) (inc ti) (or first-hit ti) ti)
+        :else (recur pi (inc ti) first-hit last-hit)))))
+
+(defn fuzzy-filter
+  "The candidates matching `pattern` as a subsequence, best match first. A
+   blank pattern keeps every candidate (sorted), so an empty prompt still
+   lists everything."
+  [pattern candidates]
+  (if (string/blank? pattern)
+    (sort candidates)
+    (->> candidates
+         (keep (fn [c] (when-let [sc (fuzzy-score pattern c)] [sc c])))
+         (sort-by first)
+         (map second))))
+
+;; --- command-name completion (M-x) ----------------------------------------
+
+(defn command-names []
+  (sort (map name (keys @km/commands))))
+
+(defn command-completer [input]
+  (fuzzy-filter input (command-names)))
+
+;; --- filesystem path completion (find-file, save-as, write-file) ---------
+
+(defn- split-dir-leaf
+  "\"src/fo\" -> [\"src/\" \"fo\"]; \"fo\" -> [\"\" \"fo\"]; \"/etc/pa\" ->
+   [\"/etc/\" \"pa\"]. The dir half (including any trailing slash) is kept
+   verbatim so completions preserve whatever prefix the user already typed
+   -- relative, absolute, or none."
+  [input]
+  (if-let [i (string/last-index-of input "/")]
+    [(subs input 0 (inc i)) (subs input (inc i))]
+    ["" input]))
+
+(defn- dir-entries [dir]
+  (try (os/ls (if (string/blank? dir) "." dir)) (catch e [])))
+
+(defn- dir? [path]
+  (boolean (try (:dir? (os/stat path)) (catch e false))))
+
+(defn path-completer [input]
+  (let [[dir leaf] (split-dir-leaf input)]
+    (->> (dir-entries dir)
+         (fuzzy-filter leaf)
+         (map (fn [entry]
+                (let [full (str dir entry)]
+                  (if (dir? full) (str full "/") full)))))))

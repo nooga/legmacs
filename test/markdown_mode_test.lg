@@ -1,0 +1,86 @@
+(ns test.markdown-mode-test
+  (:require [test :refer :all]
+            [legmacs.modes :as modes]
+            [legmacs.modes.markdown :as md]))
+
+(deftest markdown-mode-is-registered-for-dot-md-files
+  (testing ".md and .markdown are in the auto-mode-alist, pointing at :markdown"
+    (is (= :markdown (modes/mode-for-filename "README.md")))
+    (is (= :markdown (modes/mode-for-filename "notes.markdown")))
+    (is (nil? (modes/mode-for-filename "plain.txt")))))
+
+(deftest header-lines
+  (testing "1-6 leading #s followed by a space (or nothing) is a header, whole line"
+    (is (= [{:style :md-header :start 0 :end 7}] (md/highlight-line "# Title")))
+    (is (= [{:style :md-header :start 0 :end 11}] (md/highlight-line "###### deep")))
+    (is (= [{:style :md-header :start 0 :end 1}] (md/highlight-line "#"))))
+
+  (testing "7+ #s, or no space/end-of-line after them, isn't a header"
+    (is (empty? (md/highlight-line "#######not-a-header")))
+    (is (empty? (md/highlight-line "#no-space")))))
+
+(deftest horizontal-rules
+  (testing "3+ repeated -, *, or _ (optionally spaced) is a rule, whole line"
+    (is (= [{:style :md-hr :start 0 :end 3}] (md/highlight-line "---")))
+    (is (= [{:style :md-hr :start 0 :end 5}] (md/highlight-line "*****")))
+    (is (= [{:style :md-hr :start 0 :end 3}] (md/highlight-line "___"))))
+
+  (testing "fewer than 3 isn't a rule"
+    (is (empty? (md/highlight-line "--")))))
+
+(deftest blockquotes
+  (testing "a leading > (up to 3 spaces of indent) is tagged :md-quote"
+    (is (= {:style :md-quote :start 0 :end 1} (first (md/highlight-line "> quoted text"))))
+    (is (= {:style :md-quote :start 0 :end 3} (first (md/highlight-line "  > indented quote")))))
+
+  (testing "text after the marker is still scanned for inline styles"
+    (is (some #(= :md-italic (:style %)) (md/highlight-line "> a *quoted* emphasis")))))
+
+(deftest list-markers
+  (testing "-, *, +, or a numbered marker followed by a space is tagged :md-list"
+    (is (= {:style :md-list :start 0 :end 1} (first (md/highlight-line "- item"))))
+    (is (= {:style :md-list :start 0 :end 1} (first (md/highlight-line "* item"))))
+    (is (= {:style :md-list :start 0 :end 3} (first (md/highlight-line "12. item")))))
+
+  (testing "no trailing space after the marker -> not a list line"
+    (is (empty? (md/highlight-line "-notalist")))))
+
+(deftest fenced-code-delimiters
+  (testing "a ``` line (with or without a language tag) is tagged :md-code, whole line"
+    (is (= [{:style :md-code :start 0 :end 10}] (md/highlight-line "```clojure")))
+    (is (= [{:style :md-code :start 0 :end 3}] (md/highlight-line "```")))))
+
+(deftest inline-code
+  (testing "backtick-delimited spans are tagged :md-code"
+    (is (= [{:style :md-code :start 7 :end 13}] (md/highlight-line "run in `code` here"))))
+
+  (testing "an unterminated backtick doesn't produce a span"
+    (is (empty? (md/highlight-line "no closing ` backtick")))))
+
+(deftest bold-and-italic
+  (testing "** or __ delimited spans are tagged :md-bold"
+    (is (= [{:style :md-bold :start 0 :end 9}] (md/highlight-line "**bold!**")))
+    (is (= [{:style :md-bold :start 0 :end 9}] (md/highlight-line "__bold!__"))))
+
+  (testing "single * or _ delimited spans are tagged :md-italic"
+    (is (= [{:style :md-italic :start 0 :end 5}] (md/highlight-line "*hi!*x")))
+    (is (= [{:style :md-italic :start 0 :end 7}] (md/highlight-line "_hi ho_"))))
+
+  (testing "an intraword underscore (e.g. an identifier) is not italic"
+    (is (empty? (md/highlight-line "some_var_name is not italic"))))
+
+  (testing "an intraword asterisk still is (markdown's own asymmetry between * and _)"
+    (is (seq (md/highlight-line "so*me*thing")))))
+
+(deftest links-and-images
+  (testing "[text](url) tags the brackets :md-link and the parens :md-url"
+    (let [spans (md/highlight-line "see [docs](http://example.com) now")]
+      (is (= {:style :md-link :start 4 :end 10} (first spans)))
+      (is (= {:style :md-url :start 10 :end 30} (second spans)))))
+
+  (testing "![alt](url) images are tagged the same way, bang included in :md-link"
+    (let [spans (md/highlight-line "![alt](pic.png)")]
+      (is (= {:style :md-link :start 0 :end 6} (first spans)))))
+
+  (testing "an unmatched [ doesn't produce a span"
+    (is (empty? (md/highlight-line "[no closing paren")))))

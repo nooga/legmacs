@@ -1,0 +1,107 @@
+;; legmacs.keys — translate raw terminal input (as returned by term/read-key)
+;; into canonical Emacs-style key-chord names: "C-x", "M-w", "RET", "TAB",
+;; "DEL", "up", "down", plain characters for self-insert, and so on.
+;;
+;; This namespace only depends on `term` for the actual blocking read; the
+;; byte->chord mapping itself (raw->chord) is pure and unit-tested without a
+;; terminal. Control bytes are built with (char code) rather than written as
+;; literal control characters in source -- keeps the file readable in any
+;; editor and sidesteps escape-sequence ambiguity entirely.
+
+(ns legmacs.keys
+  (:require [term]))
+
+(def ^:private ESC (str (char 27)))
+(def ^:private DEL-BYTE (str (char 127)))
+(def ^:private CR (str (char 13)))
+(def ^:private HT (str (char 9)))
+
+(defn- esc-seq [suffix] (str ESC suffix))
+
+(def ^:private escape-sequences
+  (into {}
+        (map (fn [[suffix name]] [(esc-seq suffix) name])
+             [["[A" "up"]    ["OA" "up"]
+              ["[B" "down"]  ["OB" "down"]
+              ["[C" "right"] ["OC" "right"]
+              ["[D" "left"]  ["OD" "left"]
+              ["[H" "home"]  ["OH" "home"] ["[1~" "home"] ["[7~" "home"]
+              ["[F" "end"]   ["OF" "end"]  ["[4~" "end"]  ["[8~" "end"]
+              ["[3~" "delete"]
+              ["[5~" "pageup"]
+              ["[6~" "pagedown"]
+              ["[Z" "S-TAB"]])))
+
+(defn control-chord
+  "Canonical name for a single raw control byte (0-31), or nil if it has a
+   more specific name handled elsewhere (RET/TAB/DEL)."
+  [code]
+  (cond
+    (= code 0) "C-SPC" ;; Ctrl-Space is sent as NUL by every terminal
+    (<= 1 code 26) (str "C-" (char (+ code 96)))
+    (= code 28) "C-\\"
+    (= code 29) "C-]"
+    (= code 30) "C-^"
+    (= code 31) "C-_"
+    :else nil))
+
+(defn raw->chord
+  "Translate one token from term/read-key into a canonical chord name.
+   Plain printable text passes through unchanged so callers can use it
+   directly for self-insert.
+
+   Note: term/read-key also emits a synthetic BEL (byte 7) to wake a
+   blocked read on terminal resize (see term.go) -- and byte 7 is also the
+   literal byte for a genuine Ctrl-G keypress, so the two are indistinguishable
+   here by design (upstream's own doc comment says callers should treat it
+   as effectively unknown/harmless). We map it to \"C-g\" like any other
+   Ctrl-G: real Ctrl-G correctly triggers keyboard-quit, and a resize wake
+   triggers a harmless no-op quit -- either way the main loop re-measures
+   term/size and redraws on its next iteration regardless of which chord
+   fired, so nothing is lost."
+  [k]
+  (cond
+    (= k CR) "RET"
+    (= k HT) "TAB"
+    (= k DEL-BYTE) "DEL"
+    (contains? escape-sequences k) (get escape-sequences k)
+    (= k ESC) "ESC"
+    (and (= (count k) 1) (< (int (first (seq k))) 32)) (control-chord (int (first (seq k))))
+    :else k))
+
+(defn meta-chord
+  "Combine a lone ESC with whatever the *next* key turns out to be into a
+   Meta chord, e.g. \"M-x\", \"M-C-f\". Terminals send Alt-x as ESC followed
+   immediately by 'x' as two separate bytes; term/read-key tokenizes them as
+   two reads, so detecting Meta is a two-step protocol on top of raw->chord."
+  [next-chord]
+  (cond
+    (nil? next-chord) "ESC"
+    (= next-chord "ESC") "ESC"
+    (keyword? next-chord) next-chord
+    :else (str "M-" next-chord)))
+
+(defn read-chord
+  "Block for one key chord. Returns a chord string, or nil at end-of-input.
+   Internally may issue two term/read-key calls to resolve a Meta
+   combination."
+  []
+  (when-let [k (term/read-key)]
+    (let [chord (raw->chord k)]
+      (if (= chord "ESC")
+        (if (term/key-pending?)
+          (meta-chord (when-let [k2 (term/read-key)] (raw->chord k2)))
+          "ESC")
+        chord))))
+
+(defn printable?
+  "True if a chord is plain self-insertable text rather than a key name.
+   Every synthesized chord name (\"C-a\", \"M-x\", \"up\", \"RET\", ...) is at
+   least two characters long; a chord that passed through raw->chord
+   untouched -- the only way to get self-insertable text -- is always
+   exactly one character (term/read-key tokenizes one rune per call), so
+   length alone disambiguates the two without an exclusion list."
+  [chord]
+  (and (string? chord)
+       (= 1 (count chord))
+       (>= (int (first (seq chord))) 32)))

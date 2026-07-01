@@ -1,0 +1,101 @@
+;; legmacs.keymap — the scripting surface: a registry of named commands and
+;; the key bindings that invoke them. This is the same machinery legmacs's
+;; own default bindings are built with (see legmacs.bindings) and what a
+;; user's init.lg uses to customize the editor -- there is no separate
+;; "internal" keymap API.
+;;
+;; A keymap is a plain map from chord-string to either:
+;;   - a keyword naming a registered command, or
+;;   - another keymap (a prefix, e.g. the map living under "C-x")
+;;
+;; Multi-key sequences are just nested keymaps; "C-x C-s" is registered by
+;; splitting on whitespace and walking/creating nested maps.
+
+(ns legmacs.keymap
+  (:require [string]))
+
+(def commands
+  "name (keyword) -> {:fn fn :doc string}"
+  (atom {}))
+
+(def global-keymap (atom {}))
+
+(defn defcommand!
+  "Register a command under `name` (a keyword). `f` takes the editor state
+   and returns the new editor state."
+  [name doc f]
+  (swap! commands assoc name {:fn f :doc doc})
+  name)
+
+(defmacro defcommand
+  "(defcommand find-file \"Open a file.\" [state] ...) -- defines a normal
+   function AND registers it as a command under the matching keyword, so it
+   can be bound with bind-key! or invoked by name from M-x."
+  [name doc args & body]
+  `(do
+     (defn ~name ~doc ~args ~@body)
+     (defcommand! ~(keyword name) ~doc ~name)))
+
+(defn command-fn [name]
+  (:fn (get @commands name)))
+
+(defn- command-name-str [kw] (if (keyword? kw) (name kw) (str kw)))
+
+(defn run-command
+  "Look up a command by keyword and run it against state. Unknown commands
+   leave state untouched but set :message."
+  [state command-name]
+  (if-let [f (command-fn command-name)]
+    (f state)
+    (assoc state :message (str "No such command: " (command-name-str command-name)))))
+
+(defn split-chord-sequence [keyseq]
+  (vec (remove string/blank? (string/split keyseq " "))))
+
+(defn- assoc-in-keymap [km chords command]
+  (if (= 1 (count chords))
+    (assoc km (first chords) command)
+    (let [k (first chords)
+          sub (get km k)
+          sub (if (map? sub) sub {})]
+      (assoc km k (assoc-in-keymap sub (rest chords) command)))))
+
+(defn bind-key!
+  "Bind a key sequence (e.g. \"C-x C-s\" or \"C-a\") to a command keyword,
+   in `keymap-atom` (defaults to the global keymap). Intermediate keys
+   become prefix keymaps automatically."
+  ([keyseq command] (bind-key! global-keymap keyseq command))
+  ([keymap-atom keyseq command]
+   (let [chords (split-chord-sequence keyseq)]
+     (when (empty? chords)
+       (throw (str "bind-key!: empty key sequence " (pr-str keyseq))))
+     (swap! keymap-atom (fn [km] (assoc-in-keymap km chords command))))))
+
+(defn unbind-key!
+  ([keyseq] (unbind-key! global-keymap keyseq))
+  ([keymap-atom keyseq]
+   (swap! keymap-atom dissoc (first (split-chord-sequence keyseq)))))
+
+(defn lookup
+  "Look up `chord` in `keymap`. Returns one of:
+     [:command kw]   -- a leaf binding, ready to run
+     [:prefix sub]   -- chord is a prefix; sub is the nested keymap to
+                        continue matching against
+     [:unbound nil]  -- no binding at all"
+  [keymap chord]
+  (let [v (get keymap chord)]
+    (cond
+      (keyword? v) [:command v]
+      (map? v) [:prefix v]
+      (fn? v) [:command v]
+      :else [:unbound nil])))
+
+(defn describe-keymap
+  "Flatten a keymap into [[chord-path command] ...] pairs, depth-first, for
+   help screens. chord-path is a vector of chords, e.g. [\"C-x\" \"C-s\"]."
+  [keymap]
+  (mapcat (fn [[chord v]]
+            (if (map? v)
+              (map (fn [[path cmd]] [(into [chord] path) cmd]) (describe-keymap v))
+              [[[chord] v]]))
+          keymap))

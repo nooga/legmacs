@@ -1,0 +1,178 @@
+;; legmacs.modes — the mode system. A mode is a keymap (plus optional hooks)
+;; that layers over the global keymap while it's active, registered under a
+;; keyword. There are two flavours, distinguished by *where the buffer holds
+;; them*, not by any second registry:
+;;
+;;   - a major mode lives in the buffer's :mode slot (a scalar), so a buffer
+;;     has at most one -- it's the content-defining mode (let-go-mode,
+;;     markdown-mode). switch-to-mode sets it; auto-mode-alist picks it.
+;;   - minor modes live in the buffer's :minor-modes slot (an ordered
+;;     vector), any number active at once, toggled with
+;;     enable-/disable-/toggle-minor-mode. They layer *over* the major mode,
+;;     so a minor mode's bindings shadow the major mode's, which shadow
+;;     global -- exactly the precedence evil-style modal editing needs (see
+;;     legmacs.modes.crutch). This is the only place the two differ; the
+;;     registry entry is identical.
+;;
+;; A mode's :keymap may be an atom (static bindings, as bind-key! builds) OR
+;; a (fn [state] -> keymap-atom-or-map), so a mode whose active bindings
+;; depend on buffer-local state -- CRUTCH swapping between normal/insert/
+;; visual keymaps off :crutch-state -- expresses that without needing three
+;; separate registered modes fighting over one slot. legmacs.dispatch resolves
+;; it per keystroke via resolve-keymap.
+
+(ns legmacs.modes
+  (:require [string]))
+
+(def registry
+  "mode-kw -> {:keymap (atom | (fn [state] -> atom-or-map)), :doc string,
+               :on-enter (fn [state] -> state)   -- entering the mode
+               :on-exit  (fn [state] -> state)   -- leaving a minor mode
+               :highlighter (fn [line-text] -> [{:start :end :style} ...])
+               :after-command (fn [state] -> state)
+               :status (fn [state] -> string)    -- left mode-line lighter
+               :status-right (fn [state] -> string) -- right-aligned lighter
+               :suppress-self-insert? (bool | (fn [state] -> bool))
+                 -- when truthy, an unbound printable key does nothing
+                    instead of self-inserting (modal editing)}"
+  (atom {}))
+
+(def auto-mode-alist
+  "[[filename-suffix mode-kw] ...], checked in order. legmacs.modes.letgo
+   pushes [\".lg\" :let-go] onto this."
+  (atom []))
+
+(defn register-mode!
+  "Register `mode-kw`, backed by `keymap` (an atom, as created by
+   legmacs.keymap's bind-key!). opts (all optional):
+     :on-enter       (fn [state] -> state), runs once on switching in
+                      (e.g. to print a banner)
+     :highlighter    (fn [line-text] -> [{:start :end :style} ...]),
+                      per-line syntax spans in that line's own column
+                      space; legmacs.render calls this fresh per frame,
+                      only for visible lines
+     :after-command  (fn [state] -> state), runs after every dispatched
+                      command while this mode is active (paren-matching,
+                      anything else that needs recomputing after an edit)"
+  ([mode-kw keymap doc] (register-mode! mode-kw keymap doc {}))
+  ([mode-kw keymap doc opts]
+   (swap! registry assoc mode-kw (merge {:on-enter nil :on-exit nil :highlighter nil
+                                         :after-command nil :status nil :status-right nil
+                                         :suppress-self-insert? nil}
+                                         opts
+                                         {:keymap keymap :doc doc}))
+   mode-kw))
+
+(defn register-minor-mode!
+  "Register a minor mode. Identical to register-mode! -- the entry is the
+   same shape; \"minor\" only means the buffer will hold it in :minor-modes
+   (via enable-minor-mode) rather than the :mode slot. Kept as its own name
+   so a mode file reads as declaring its intent."
+  ([mode-kw keymap doc] (register-mode! mode-kw keymap doc {}))
+  ([mode-kw keymap doc opts] (register-mode! mode-kw keymap doc opts)))
+
+(defn register-auto-mode!
+  "Files whose name ends in `suffix` default to `mode-kw` (see
+   legmacs.main's load-file-or-scratch)."
+  [suffix mode-kw]
+  (swap! auto-mode-alist conj [suffix mode-kw]))
+
+(defn mode-for-filename
+  "The mode auto-mode-alist says `filename` should start in, or nil."
+  [filename]
+  (when filename
+    (some (fn [[suffix mode-kw]] (when (string/ends-with? filename suffix) mode-kw))
+          @auto-mode-alist)))
+
+(defn mode-keymap [mode-kw]
+  (:keymap (get @registry mode-kw)))
+
+(defn mode-highlighter [mode-kw]
+  (:highlighter (get @registry mode-kw)))
+
+(defn mode-after-command [mode-kw]
+  (:after-command (get @registry mode-kw)))
+
+(defn mode-status [mode-kw]
+  (:status (get @registry mode-kw)))
+
+(defn mode-status-right [mode-kw]
+  (:status-right (get @registry mode-kw)))
+
+(defn describe-mode [mode-kw]
+  (:doc (get @registry mode-kw)))
+
+(defn registered-modes
+  "Every registered mode keyword -- both major and minor, since the registry
+   doesn't distinguish them (the buffer does)."
+  []
+  (keys @registry))
+
+(defn resolve-keymap
+  "The keymap *map* a mode contributes for `state`: deref a static atom, or
+   call a (fn [state] -> atom-or-map) and then deref/return that. nil if the
+   mode has no keymap. This is what lets a mode's active bindings depend on
+   buffer-local state (see the namespace docstring)."
+  [mode-kw state]
+  (when-let [km (:keymap (get @registry mode-kw))]
+    (let [km (if (fn? km) (km state) km)]
+      (cond
+        (nil? km) nil
+        (map? km) km
+        :else @km))))
+
+(defn active-modes
+  "Every mode active in `state`, highest priority first: the minor modes (in
+   :minor-modes order) then the major :mode. legmacs.dispatch layers keymaps
+   and runs :after-command hooks in this order; legmacs.render paints
+   highlighters in the reverse (so a minor mode's colors win)."
+  [state]
+  (concat (or (:minor-modes state) [])
+          (when (:mode state) [(:mode state)])))
+
+(defn suppress-self-insert?
+  "True if any active mode declares it captures self-insertion for `state`
+   (its :suppress-self-insert? is truthy, or a fn of state returning truthy)."
+  [state]
+  (boolean
+   (some (fn [mode-kw]
+           (let [v (:suppress-self-insert? (get @registry mode-kw))]
+             (if (fn? v) (v state) v)))
+         (active-modes state))))
+
+(defn switch-to-mode
+  "Switch `state` into `mode-kw` as its major mode, running its :on-enter
+   hook if any. This is the content-mode slot -- at most one at a time."
+  [state mode-kw]
+  (if-let [mode (get @registry mode-kw)]
+    (let [state (assoc state :mode mode-kw)]
+      (if-let [on-enter (:on-enter mode)] (on-enter state) state))
+    (assoc state :message (str "No such mode: " (name mode-kw)))))
+
+(defn minor-mode-active? [state mode-kw]
+  (boolean (some #(= % mode-kw) (:minor-modes state))))
+
+(defn enable-minor-mode
+  "Add `mode-kw` to `state`'s active minor modes (idempotent), running its
+   :on-enter hook. New minor modes go on at lowest priority (end of the
+   vector); the earliest-enabled shadows later ones."
+  [state mode-kw]
+  (cond
+    (nil? (get @registry mode-kw)) (assoc state :message (str "No such mode: " (name mode-kw)))
+    (minor-mode-active? state mode-kw) state
+    :else (let [state (update state :minor-modes (fn [ms] (conj (or ms []) mode-kw)))]
+            (if-let [on-enter (:on-enter (get @registry mode-kw))] (on-enter state) state))))
+
+(defn disable-minor-mode
+  "Remove `mode-kw` from `state`'s active minor modes, running its :on-exit
+   hook (so a modal mode can tidy up its buffer-local state)."
+  [state mode-kw]
+  (if (minor-mode-active? state mode-kw)
+    (let [state (update state :minor-modes (fn [ms] (vec (remove #(= % mode-kw) ms))))]
+      (if-let [on-exit (:on-exit (get @registry mode-kw))] (on-exit state) state))
+    state))
+
+(defn toggle-minor-mode [state mode-kw]
+  (if (minor-mode-active? state mode-kw)
+    (disable-minor-mode state mode-kw)
+    (enable-minor-mode state mode-kw)))

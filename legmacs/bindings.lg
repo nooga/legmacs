@@ -1,0 +1,69 @@
+;; legmacs.bindings — the default keymap. Built with exactly the same
+;; bind-key! a user's init.lg uses, so reading this file alongside the
+;; scripting section of the README is a complete tour of how to customize
+;; legmacs.
+;;
+;; (require 'legmacs.commands) at the bottom of this file's requires ensures
+;; the commands are registered before we try to bind keys to them.
+
+(ns legmacs.bindings
+  (:require [legmacs.keymap :as km]
+            [legmacs.commands]))
+
+(def default-bindings
+  {;; movement
+   "C-f" :forward-char        "right" :forward-char
+   "C-b" :backward-char       "left" :backward-char
+   "C-n" :next-line           "down" :next-line
+   "C-p" :previous-line       "up" :previous-line
+   "C-a" :move-beginning-of-line "home" :move-beginning-of-line
+   "C-e" :move-end-of-line       "end" :move-end-of-line
+   "M-f" :forward-word
+   "M-b" :backward-word
+   "M-<" :beginning-of-buffer
+   "M->" :end-of-buffer
+   "C-v" :scroll-up-command      "pagedown" :scroll-up-command
+   "M-v" :scroll-down-command    "pageup" :scroll-down-command
+
+   ;; editing
+   "RET" :newline
+   "C-d" :delete-char            "delete" :delete-char
+   "DEL" :delete-backward-char
+   "C-k" :kill-line
+   "M-k" :kill-whole-line
+   "C-y" :yank
+   "C-_" :undo                   "C-x u" :undo
+   "M-_" :redo
+   "TAB" :tab-insert
+
+   ;; region
+   "C-SPC" :set-mark-command
+   "C-w" :kill-region
+   "M-w" :copy-region-as-kill
+   "C-x C-x" :exchange-point-and-mark
+
+   ;; search
+   "C-s" :swiper
+
+   ;; files
+   "C-x C-s" :save-buffer
+   "C-x C-w" :write-file
+   "C-x C-f" :find-file
+   "C-x C-q" :toggle-read-only
+   "C-x C-c" :save-buffers-kill-terminal
+
+   ;; buffers
+   "C-x b" :switch-to-buffer
+   "C-x C-b" :list-buffers
+   "C-x k" :kill-buffer
+   "C-x right" :next-buffer
+   "C-x left" :previous-buffer
+
+   ;; help / misc
+   "C-g" :keyboard-quit
+   "M-x" :execute-extended-command
+   "C-h" :describe-bindings})
+
+(defn install! []
+  (doseq [[chord command] default-bindings]
+    (km/bind-key! chord command)))

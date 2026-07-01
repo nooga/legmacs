@@ -1,0 +1,47 @@
+;; legmacs.modes.help — the major mode for read-only *Help* buffers (see
+;; commands/describe-bindings). Like markdown-mode it's read-mostly: no eval,
+;; no editing (the buffer itself carries :read-only?, enforced in
+;; legmacs.buffer), just a per-line highlighter that colors a two-column
+;; "key -> command" listing plus section headers.
+;;
+;; The buffer is a real buffer, not the one-shot :overlay the help used to
+;; be, so it scrolls, searches (C-s swiper), and switches like any other --
+;; that's the whole reason to prefer it. describe-bindings formats each entry
+;; as "  <keys>  <command>" (two leading spaces, then a two-space gap before
+;; the command); a header line starts in column 0.
+
+(ns legmacs.modes.help
+  (:require [string]
+            [legmacs.modes :as modes]))
+
+(def keymap (atom {}))
+
+(defn- entry-spans
+  "Color an entry line: the key chord (after the 2-space indent, up to the
+   gap) and the command name (after it). The boundary is found from the
+   first run of two spaces past the indent, so it's right regardless of how
+   long the key chord is -- not a hard-coded column."
+  [line]
+  (let [n (count line)
+        gap (loop [i 2]
+              (cond
+                (>= (inc i) n) nil
+                (and (= \space (nth line i)) (= \space (nth line (inc i)))) i
+                :else (recur (inc i))))
+        cmd-start (when gap
+                    (loop [i gap] (if (and (< i n) (= \space (nth line i))) (recur (inc i)) i)))]
+    (if cmd-start
+      [{:style :help-key :start 2 :end gap}
+       {:style :help-command :start cmd-start :end n}]
+      [{:style :help-key :start 2 :end n}])))
+
+(defn highlight-line [line]
+  (cond
+    (string/blank? line) []
+    (string/starts-with? line "  ") (entry-spans line)
+    :else [{:style :help-header :start 0 :end (count line)}]))
+
+(modes/register-mode! :help keymap
+                       "help-mode: read-only, syntax-highlighted help buffers"
+                       {:highlighter highlight-line
+                        :status-right (fn [_] "read-only")})

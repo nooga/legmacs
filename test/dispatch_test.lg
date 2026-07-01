@@ -1,0 +1,96 @@
+(ns test.dispatch-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.minibuffer :as mb]
+            [legmacs.keymap :as km]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as d]))
+
+(bindings/install!)
+
+(deftest self-insert-for-unbound-printable-chars
+  (testing "a plain letter with no binding inserts itself"
+    (let [s (buf/new-state nil [""])
+          s (d/dispatch s "a")]
+      (is (= ["a"] (:lines s)))
+      (is (= 1 (:cursor-col s))))))
+
+(deftest bound-single-keys-run-their-command
+  (testing "C-f runs forward-char instead of inserting"
+    (let [s (buf/new-state nil ["ab"])
+          s (d/dispatch s "C-f")]
+      (is (= ["ab"] (:lines s)))
+      (is (= 1 (:cursor-col s))))))
+
+(deftest multi-key-sequences-accumulate-a-prefix
+  (testing "C-x sets :pending-prefix; the next key completes the command"
+    (let [s (buf/new-state "x.txt" ["hi"])
+          s (d/dispatch s "C-x")]
+      (is (some? (:pending-prefix s)))
+      (is (= ["C-x"] (:pending-keys s)))
+      (let [s (d/dispatch s "C-c")] ;; C-x C-c -> save-buffers-kill-terminal
+        (is (nil? (:pending-prefix s)))
+        (is (:quit? s))))))
+
+(deftest unbound-prefix-continuation-reports-itself
+  (testing "C-x followed by an unbound key clears the prefix and explains"
+    (let [s (buf/new-state nil ["hi"])
+          s (d/dispatch s "C-x")
+          s (d/dispatch s "Q")]
+      (is (nil? (:pending-prefix s)))
+      (is (= "C-x Q is undefined" (:message s))))))
+
+(deftest keyboard-quit-aborts-a-pending-prefix-from-anywhere
+  (testing "C-g always cancels a pending prefix, even though C-x has no C-g binding"
+    (let [s (buf/new-state nil ["hi"])
+          s (d/dispatch s "C-x")
+          s (d/dispatch s "C-g")]
+      (is (nil? (:pending-prefix s)))
+      (is (= "Quit" (:message s))))))
+
+(deftest unbound-meta-chord-does-not-self-insert
+  (testing "an unbound chord name like M-z is reported, never typed literally"
+    (let [s (buf/new-state nil [""])
+          s (d/dispatch s "M-z")]
+      (is (= [""] (:lines s)))
+      (is (= "M-z is undefined" (:message s))))))
+
+(deftest minibuffer-keys-edit-the-prompt-not-the-buffer
+  (testing "typing while the minibuffer is open edits the prompt input"
+    (let [s (buf/new-state nil ["original"])
+          s (mb/open s "Prompt: " (fn [state input] (assoc state :got input)))
+          s (d/dispatch s "h")
+          s (d/dispatch s "i")]
+      (is (= ["original"] (:lines s)))
+      (is (= "hi" (:input (:minibuffer s))))
+      (let [s (d/dispatch s "RET")]
+        (is (= "hi" (:got s)))
+        (is (not (mb/active? s)))))))
+
+(deftest overlay-is-dismissed-by-any-key
+  (testing "an open overlay swallows the next keypress to close itself"
+    (let [s (assoc (buf/new-state nil ["x"]) :overlay {:title "t" :lines []})
+          s (d/dispatch s "q")]
+      (is (nil? (:overlay s)))
+      (is (= ["x"] (:lines s))))))
+
+(deftest tab-accepts-the-highlighted-candidate-into-the-input
+  (testing "TAB pulls the selected live-completion candidate up into the input line"
+    (let [candidates (fn [input] (filter #(string/starts-with? % input) ["forward-char" "forward-word"]))
+          s (mb/open (buf/new-state nil ["x"]) "Cmd: " (fn [state input] (assoc state :got input)) {:completer candidates})
+          s (d/dispatch s "f")            ; candidates: forward-char, forward-word; forward-char highlighted
+          s (d/dispatch s "TAB")]
+      (is (= "forward-char" (:input (:minibuffer s))))))
+
+  (testing "C-n then TAB accepts the *next* candidate instead"
+    (let [candidates (fn [input] (filter #(string/starts-with? % input) ["forward-char" "forward-word"]))
+          s (mb/open (buf/new-state nil ["x"]) "Cmd: " (fn [state input] (assoc state :got input)) {:completer candidates})
+          s (-> s (d/dispatch "f") (d/dispatch "C-n") (d/dispatch "TAB"))]
+      (is (= "forward-word" (:input (:minibuffer s))))))
+
+  (testing "TAB is a no-op when the minibuffer has no candidates"
+    (let [s (mb/open (buf/new-state nil ["x"]) "Prompt: " (fn [state input] (assoc state :got input)))
+          s (d/dispatch s "TAB")]
+      (is (= "" (:input (:minibuffer s)))))))
+

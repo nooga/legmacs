@@ -1,0 +1,201 @@
+(ns test.modes-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km]
+            [legmacs.bindings :as bindings]
+            [legmacs.modes :as modes]
+            [legmacs.dispatch :as d]))
+
+(bindings/install!)
+
+(deftest register-and-switch
+  (testing "registering a mode and switching into it sets :mode and runs :on-enter"
+    (let [km (atom {})
+          entered (atom false)]
+      (modes/register-mode! :test-mode-a km "a test mode"
+                             {:on-enter (fn [state] (reset! entered true) (assoc state :greeted true))})
+      (let [s (modes/switch-to-mode (buf/new-state nil ["x"]) :test-mode-a)]
+        (is (= :test-mode-a (:mode s)))
+        (is (:greeted s))
+        (is @entered))))
+
+  (testing "switching to an unregistered mode reports itself instead of crashing"
+    (let [s (modes/switch-to-mode (buf/new-state nil ["x"]) :no-such-mode)]
+      (is (nil? (:mode s)))
+      (is (string/includes? (:message s) "no-such-mode")))))
+
+(deftest auto-mode-alist-matches-by-suffix
+  (testing "a registered suffix maps to its mode"
+    (modes/register-auto-mode! ".testsuffix" :test-mode-b)
+    (is (= :test-mode-b (modes/mode-for-filename "foo.testsuffix")))
+    (is (nil? (modes/mode-for-filename "foo.txt")))
+    (is (nil? (modes/mode-for-filename nil)))))
+
+(deftest mode-keymap-shadows-a-single-key
+  (testing "a mode binding the same key as global wins while that mode is active"
+    (km/bind-key! km/global-keymap "C-c C-c" :keyboard-quit) ;; arbitrary global baseline
+    (let [mode-km (atom {})]
+      (km/bind-key! mode-km "C-j" :test-mode-leaf)
+      (km/defcommand! :test-mode-leaf "test" (fn [state] (assoc state :leaf-ran true)))
+      (modes/register-mode! :test-mode-c mode-km "c")
+      (let [s (-> (buf/new-state nil ["x"])
+                  (modes/switch-to-mode :test-mode-c)
+                  (d/dispatch "C-j"))]
+        (is (:leaf-ran s))))))
+
+(deftest mode-prefix-merges-with-global-prefix
+  (testing "a mode adding a leaf under C-x doesn't hide the rest of the global C-x map"
+    (let [mode-km (atom {})]
+      (km/bind-key! mode-km "C-x C-z" :test-mode-prefix-leaf)
+      (km/defcommand! :test-mode-prefix-leaf "test" (fn [state] (assoc state :prefix-leaf-ran true)))
+      (modes/register-mode! :test-mode-d mode-km "d")
+      (let [base (-> (buf/new-state "x.txt" ["hi"])
+                      (modes/switch-to-mode :test-mode-d))
+            ;; the mode-only leaf works
+            s1 (-> base (d/dispatch "C-x") (d/dispatch "C-z"))
+            ;; a global-only leaf under the same prefix still works too
+            s2 (-> base (d/dispatch "C-x") (d/dispatch "C-c"))]
+        (is (:prefix-leaf-ran s1))
+        (is (:quit? s2))))))
+
+(deftest mode-command-takes-priority-over-global-for-the-same-key
+  (testing "when both layers bind the same single key, the mode's command wins"
+    (km/bind-key! km/global-keymap "C-c C-v" :keyboard-quit)
+    (let [mode-km (atom {})]
+      (km/bind-key! mode-km "C-c C-v" :test-mode-override)
+      (km/defcommand! :test-mode-override "test" (fn [state] (assoc state :override-ran true)))
+      (modes/register-mode! :test-mode-e mode-km "e")
+      (let [s (-> (buf/new-state nil ["x"])
+                  (modes/switch-to-mode :test-mode-e)
+                  (d/dispatch "C-c")
+                  (d/dispatch "C-v"))]
+        (is (:override-ran s))
+        (is (not (:quit? s)))))))
+
+(deftest after-command-hook-runs-on-every-dispatch-while-active
+  (testing "a mode's :after-command sees the state every command dispatch produces"
+    (let [mode-km (atom {})]
+      (modes/register-mode! :test-mode-f mode-km "f"
+                             {:after-command (fn [state] (update state :after-count (fnil inc 0)))})
+      (let [s (-> (buf/new-state nil ["ab"])
+                  (modes/switch-to-mode :test-mode-f)
+                  (d/dispatch "f")
+                  (d/dispatch "f"))]
+        (is (= 2 (:after-count s)))
+        (is (= ["ffab"] (:lines s))))))
+
+  (testing "a mode with no :after-command is simply a no-op, not an error"
+    (let [mode-km (atom {})]
+      (modes/register-mode! :test-mode-g mode-km "g")
+      (let [s (-> (buf/new-state nil ["x"])
+                  (modes/switch-to-mode :test-mode-g)
+                  (d/dispatch "y"))]
+        (is (= ["yx"] (:lines s)))))))
+
+(deftest highlighter-and-after-command-accessors
+  (testing "mode-highlighter and mode-after-command return what was registered, or nil"
+    (let [mode-km (atom {})
+          hl (fn [line] [])
+          ac (fn [state] state)]
+      (modes/register-mode! :test-mode-h mode-km "h" {:highlighter hl :after-command ac})
+      (is (= hl (modes/mode-highlighter :test-mode-h)))
+      (is (= ac (modes/mode-after-command :test-mode-h)))
+      (is (nil? (modes/mode-highlighter :test-mode-a)))
+      (is (nil? (modes/mode-after-command :no-such-mode))))))
+
+;; --- minor modes ---------------------------------------------------------
+
+(deftest enable-disable-toggle-minor-mode
+  (testing "enable adds a minor mode (idempotently) and runs :on-enter; disable removes it and runs :on-exit"
+    (let [entered (atom 0), exited (atom 0)]
+      (modes/register-minor-mode! :test-minor-a (atom {}) "a"
+                                   {:on-enter (fn [s] (swap! entered inc) (assoc s :a-on true))
+                                    :on-exit (fn [s] (swap! exited inc) (assoc s :a-on false))})
+      (let [s (buf/new-state nil ["x"])
+            s1 (modes/enable-minor-mode s :test-minor-a)]
+        (is (= [:test-minor-a] (:minor-modes s1)))
+        (is (:a-on s1))
+        (is (modes/minor-mode-active? s1 :test-minor-a))
+        ;; enabling again is a no-op (no second :on-enter, no dup)
+        (let [s2 (modes/enable-minor-mode s1 :test-minor-a)]
+          (is (= [:test-minor-a] (:minor-modes s2)))
+          (is (= 1 @entered)))
+        ;; disable removes it and runs :on-exit
+        (let [s3 (modes/disable-minor-mode s1 :test-minor-a)]
+          (is (= [] (:minor-modes s3)))
+          (is (not (:a-on s3)))
+          (is (= 1 @exited))))))
+
+  (testing "toggle flips it on and back off"
+    (modes/register-minor-mode! :test-minor-t (atom {}) "t")
+    (let [s (modes/toggle-minor-mode (buf/new-state nil ["x"]) :test-minor-t)]
+      (is (modes/minor-mode-active? s :test-minor-t))
+      (is (not (modes/minor-mode-active? (modes/toggle-minor-mode s :test-minor-t) :test-minor-t)))))
+
+  (testing "enabling an unregistered mode reports itself, doesn't crash"
+    (let [s (modes/enable-minor-mode (buf/new-state nil ["x"]) :no-such-minor)]
+      (is (= [] (:minor-modes s)))
+      (is (string/includes? (:message s) "no-such-minor")))))
+
+(deftest minor-mode-keymap-shadows-major-and-global
+  (testing "a minor mode's binding wins over both the major mode's and global's for the same key"
+    (km/bind-key! km/global-keymap "C-c C-m" :keyboard-quit)
+    (let [major-km (atom {}), minor-km (atom {})]
+      (km/bind-key! major-km "C-c C-m" :test-major-cm)
+      (km/bind-key! minor-km "C-c C-m" :test-minor-cm)
+      (km/defcommand! :test-major-cm "maj" (fn [s] (assoc s :who :major)))
+      (km/defcommand! :test-minor-cm "min" (fn [s] (assoc s :who :minor)))
+      (modes/register-mode! :test-major-m major-km "maj")
+      (modes/register-minor-mode! :test-minor-m minor-km "min")
+      (let [s (-> (buf/new-state nil ["x"])
+                  (modes/switch-to-mode :test-major-m)
+                  (modes/enable-minor-mode :test-minor-m)
+                  (d/dispatch "C-c") (d/dispatch "C-m"))]
+        (is (= :minor (:who s)))))))
+
+(deftest fn-of-state-keymap-selects-bindings-dynamically
+  (testing "a mode whose :keymap is (fn [state] -> keymap) dispatches per current buffer state"
+    (let [km-a (atom {}), km-b (atom {})]
+      (km/bind-key! km-a "space" :test-picked-a) ;; arbitrary; we test resolve, not dispatch
+      (km/bind-key! km-b "space" :test-picked-b)
+      (modes/register-minor-mode! :test-dyn (fn [state] (if (:flip state) km-b km-a)) "dyn")
+      (is (= @km-a (modes/resolve-keymap :test-dyn {:flip false})))
+      (is (= @km-b (modes/resolve-keymap :test-dyn {:flip true}))))))
+
+(deftest suppress-self-insert-blocks-unbound-printables
+  (testing "while a mode suppresses self-insert, an unbound printable key is inert"
+    (modes/register-minor-mode! :test-suppress (atom {}) "s" {:suppress-self-insert? true})
+    (let [s (-> (buf/new-state nil [""])
+                (modes/enable-minor-mode :test-suppress)
+                (d/dispatch "z"))]
+      (is (= [""] (:lines s)))))
+
+  (testing "a fn-of-state :suppress-self-insert? is consulted per state"
+    (modes/register-minor-mode! :test-suppress-fn (atom {}) "sf"
+                                 {:suppress-self-insert? (fn [state] (:lock state))})
+    (let [base (modes/enable-minor-mode (buf/new-state nil [""]) :test-suppress-fn)]
+      (is (= [""] (:lines (d/dispatch (assoc base :lock true) "z"))))
+      (is (= ["z"] (:lines (d/dispatch (assoc base :lock false) "z")))))))
+
+(deftest after-command-runs-for-minor-and-major-together
+  (testing "every active mode's :after-command runs on each dispatch"
+    (modes/register-mode! :test-ac-major (atom {}) "maj"
+                           {:after-command (fn [s] (update s :maj-count (fnil inc 0)))})
+    (modes/register-minor-mode! :test-ac-minor (atom {}) "min"
+                                 {:after-command (fn [s] (update s :min-count (fnil inc 0)))})
+    (let [s (-> (buf/new-state nil ["ab"])
+                (modes/switch-to-mode :test-ac-major)
+                (modes/enable-minor-mode :test-ac-minor)
+                (d/dispatch "C-f") (d/dispatch "C-f"))]
+      (is (= 2 (:maj-count s)))
+      (is (= 2 (:min-count s))))))
+
+(deftest active-modes-orders-minors-before-major
+  (testing "active-modes lists minor modes (highest priority) before the major mode"
+    (modes/register-mode! :test-order-major (atom {}) "maj")
+    (modes/register-minor-mode! :test-order-minor (atom {}) "min")
+    (let [s (-> (buf/new-state nil ["x"])
+                (modes/switch-to-mode :test-order-major)
+                (modes/enable-minor-mode :test-order-minor))]
+      (is (= [:test-order-minor :test-order-major] (vec (modes/active-modes s)))))))

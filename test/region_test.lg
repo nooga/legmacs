@@ -1,0 +1,51 @@
+(ns test.region-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]))
+
+(defn- with-region [lines mark point]
+  (let [[mr mc] mark, [pr pc] point]
+    (assoc (buf/new-state nil lines) :mark [mr mc] :cursor-row pr :cursor-col pc)))
+
+(deftest region-bounds-orders-mark-and-point
+  (testing "point after mark"
+    (let [s (with-region ["hello world"] [0 0] [0 5])]
+      (is (= [[0 0] [0 5]] (buf/region-bounds s)))))
+
+  (testing "point before mark -- bounds still come out start < end"
+    (let [s (with-region ["hello world"] [0 5] [0 0])]
+      (is (= [[0 0] [0 5]] (buf/region-bounds s)))))
+
+  (testing "no mark -> no bounds"
+    (is (nil? (buf/region-bounds (buf/new-state nil ["x"]))))))
+
+(deftest region-text-cases
+  (testing "single line"
+    (is (= "hello" (buf/region-text (with-region ["hello world"] [0 0] [0 5])))))
+
+  (testing "spanning multiple lines"
+    (is (= "world\nsecond" (buf/region-text (with-region ["hello world" "second line" "third"] [0 6] [1 6])))))
+
+  (testing "no mark set -> empty string"
+    (is (= "" (buf/region-text (buf/new-state nil ["x"]))))))
+
+(deftest delete-region-cases
+  (testing "single line: removes the span, clears the mark, leaves point at the start"
+    (let [s (buf/delete-region (with-region ["hello world"] [0 0] [0 6]))]
+      (is (= ["world"] (:lines s)))
+      (is (= [0 0] [(:cursor-row s) (:cursor-col s)]))
+      (is (nil? (:mark s)))
+      (is (:modified? s))))
+
+  (testing "multi-line: joins the boundary lines, drops the ones fully inside"
+    (let [s (buf/delete-region (with-region ["hello world" "second line" "third"] [0 6] [1 6]))]
+      (is (= ["hello  line" "third"] (:lines s)))
+      (is (= [0 6] [(:cursor-row s) (:cursor-col s)]))))
+
+  (testing "works regardless of which of mark/point comes first in the buffer"
+    (let [forward (buf/delete-region (with-region ["abcdef"] [0 1] [0 4]))
+          backward (buf/delete-region (with-region ["abcdef"] [0 4] [0 1]))]
+      (is (= (:lines forward) (:lines backward)))))
+
+  (testing "no mark set -> no-op"
+    (let [s (buf/new-state nil ["x"])]
+      (is (= s (buf/delete-region s))))))

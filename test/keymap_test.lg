@@ -1,0 +1,49 @@
+(ns test.keymap-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.keymap :as km]))
+
+(km/defcommand test-noop "does nothing, just tags state" [state]
+  (assoc state :touched true))
+
+(deftest defcommand-registers-and-runs
+  (testing "defcommand both defines a fn and registers it under a keyword"
+    (is (fn? test-noop))
+    (is (= {:touched true} (km/run-command {} :test-noop)))
+    (is (= test-noop (km/command-fn :test-noop)))))
+
+(deftest unknown-command
+  (testing "running an unbound command leaves state alone and explains why"
+    (let [s (km/run-command {:a 1} :no-such-command)]
+      (is (= 1 (:a s)))
+      (is (string/includes? (:message s) "no-such-command")))))
+
+(deftest binding-and-lookup
+  (testing "single-key bindings resolve directly"
+    (let [keymap (atom {})]
+      (km/bind-key! keymap "C-a" :move-beginning-of-line)
+      (is (= [:command :move-beginning-of-line] (km/lookup @keymap "C-a")))
+      (is (= [:unbound nil] (km/lookup @keymap "C-z")))))
+
+  (testing "multi-key sequences build nested prefix maps"
+    (let [keymap (atom {})]
+      (km/bind-key! keymap "C-x C-s" :save-buffer)
+      (km/bind-key! keymap "C-x C-c" :quit)
+      (let [[tag sub] (km/lookup @keymap "C-x")]
+        (is (= :prefix tag))
+        (is (= [:command :save-buffer] (km/lookup sub "C-s")))
+        (is (= [:command :quit] (km/lookup sub "C-c"))))))
+
+  (testing "unbind-key! removes a top-level binding"
+    (let [keymap (atom {})]
+      (km/bind-key! keymap "C-a" :foo)
+      (km/unbind-key! keymap "C-a")
+      (is (= [:unbound nil] (km/lookup @keymap "C-a"))))))
+
+(deftest describing-a-keymap
+  (testing "describe-keymap flattens nested prefixes into chord-path pairs"
+    (let [keymap (atom {})]
+      (km/bind-key! keymap "C-x C-s" :save-buffer)
+      (km/bind-key! keymap "C-a" :move-beginning-of-line)
+      (is (= #{[["C-x" "C-s"] :save-buffer] [["C-a"] :move-beginning-of-line]}
+             (set (km/describe-keymap @keymap)))))))

@@ -1,0 +1,408 @@
+;; legmacs.commands — the built-in command set. Each command is just a
+;; (fn [state] -> state), registered with defcommand so it can be bound to
+;; keys (legmacs.bindings) or invoked by name from M-x
+;; (execute-extended-command, below). A user's init.lg can define more
+;; commands the exact same way.
+
+(ns legmacs.commands
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.minibuffer :as mb]
+            [legmacs.completion :as completion]
+            [legmacs.modes :as modes]))
+
+(defn set-message [state msg] (assoc state :message msg))
+
+;; --- movement ---------------------------------------------------------
+
+(defcommand forward-char "Move point right." [state] (buf/move-right state))
+(defcommand backward-char "Move point left." [state] (buf/move-left state))
+(defcommand next-line "Move point down one line." [state] (buf/move-down state))
+(defcommand previous-line "Move point up one line." [state] (buf/move-up state))
+(defcommand move-beginning-of-line "Move point to the start of the line." [state] (buf/move-line-start state))
+(defcommand move-end-of-line "Move point to the end of the line." [state] (buf/move-line-end state))
+(defcommand forward-word "Move point forward one word." [state] (buf/move-word-forward state))
+(defcommand backward-word "Move point backward one word." [state] (buf/move-word-backward state))
+(defcommand beginning-of-buffer "Move point to the start of the buffer." [state] (buf/move-buffer-start state))
+(defcommand end-of-buffer "Move point to the end of the buffer." [state] (buf/move-buffer-end state))
+
+(def page-size (atom 20))
+
+(defcommand scroll-up-command "Scroll forward (page down)." [state] (buf/page-move state 1 @page-size))
+(defcommand scroll-down-command "Scroll backward (page up)." [state] (buf/page-move state -1 @page-size))
+
+;; --- editing -----------------------------------------------------------
+
+(defcommand newline "Insert a newline, splitting the current line." [state] (buf/insert-newline state))
+(defcommand delete-char "Delete the character under point." [state] (buf/delete-char-forward state))
+(defcommand delete-backward-char "Delete the character before point." [state] (buf/delete-char-backward state))
+(defcommand kill-line "Kill text from point to end of line." [state] (buf/kill-line state))
+(defcommand kill-whole-line "Kill the entire current line." [state] (buf/kill-whole-line state))
+(defcommand yank "Insert the most recently killed text." [state] (buf/yank state))
+(defcommand undo "Undo the last change." [state] (buf/undo state))
+(defcommand redo "Redo the last undone change." [state] (buf/redo state))
+(defcommand tab-insert "Insert spaces for a tab stop." [state] (buf/insert-string state "    "))
+
+;; --- region (mark to point) ---------------------------------------------
+
+(defcommand set-mark-command
+  "Set the mark at point. Kill/copy-region then act on the span between
+   the mark and wherever point ends up next."
+  [state]
+  (-> state (assoc :mark [(:cursor-row state) (:cursor-col state)]) (set-message "Mark set")))
+
+(defcommand kill-region
+  "Kill (cut) the text between point and mark."
+  [state]
+  (if (buf/region-active? state)
+    (let [text (buf/region-text state)]
+      (-> state buf/delete-region (assoc :clipboard text)))
+    (set-message state "No region (C-SPC sets the mark)")))
+
+(defcommand copy-region-as-kill
+  "Copy the text between point and mark, without deleting it."
+  [state]
+  (if (buf/region-active? state)
+    (-> state (assoc :clipboard (buf/region-text state) :mark nil) (set-message "Region copied"))
+    (set-message state "No region (C-SPC sets the mark)")))
+
+(defcommand exchange-point-and-mark
+  "Swap point and mark -- handy for checking the other end of a region, or
+   extending it from the far side."
+  [state]
+  (if-let [[mr mc] (:mark state)]
+    (assoc state :mark [(:cursor-row state) (:cursor-col state)] :cursor-row mr :cursor-col mc)
+    (set-message state "No mark set")))
+
+;; --- search --------------------------------------------------------------
+
+(defn- find-from
+  "Search forward for `needle` starting at [row col], wrapping around the
+   buffer once. Returns [row col] of the match or nil."
+  [lines needle row col]
+  (let [n (count lines)]
+    (loop [r row, c col, wrapped false]
+      (cond
+        (and wrapped (> r row)) nil
+        (and wrapped (= r row) (> c col)) nil
+        (>= r n) (recur 0 0 true)
+        :else
+        (let [line (nth lines r)
+              idx (string/index-of line needle c)]
+          (if idx
+            [r idx]
+            (recur (inc r) 0 wrapped)))))))
+
+(defcommand search-forward
+  "Prompt for a string and jump to its next occurrence (wrapping). An empty
+   entry repeats the previous search."
+  [state]
+  (mb/open state "Search: "
+           (fn [state input]
+             (let [needle (if (string/blank? input) (:last-search state "") input)]
+               (if (string/blank? needle)
+                 (set-message state "")
+                 (let [start-col (inc (:cursor-col state))
+                       hit (find-from (:lines state) needle (:cursor-row state) start-col)
+                       hit (or hit (find-from (:lines state) needle 0 0))]
+                   (-> (assoc state :last-search needle)
+                       (#(if hit
+                           (-> %
+                               (assoc :cursor-row (first hit) :cursor-col (second hit))
+                               (set-message (str "Found \"" needle "\"")))
+                           (set-message % (str "\"" needle "\" not found")))))))))))
+
+;; --- swiper (incremental regexp search) ----------------------------------
+;;
+;; An ivy/swiper-style live search: the minibuffer becomes a reactive picker
+;; (see legmacs.minibuffer's :on-change/:on-select) whose candidates are the
+;; matching lines. Point previews the selected match as you type or move
+;; through the list; RET stays there, C-g returns to where you started.
+
+(defn- compile-search
+  "Compile `input` as a regexp, or nil if it's blank or not yet valid (so a
+   half-typed pattern like \"[0-9\" simply shows no matches rather than
+   erroring)."
+  [input]
+  (when-not (string/blank? input)
+    (try (re-pattern input) (catch e nil))))
+
+(defn- line-match-cols
+  "All [col end] match spans of compiled regex `re` in `line`, left to right.
+   let-go's re-find hands back the matched *text*, not its position, so each
+   match is relocated by searching forward from the previous match's end --
+   correct for RE2 (no lookaround). Empty matches stop the scan so a pattern
+   like \"a*\" can't loop forever."
+  [re line]
+  (loop [start 0, out []]
+    (if (> start (count line))
+      out
+      (let [m (re-find re (subs line start))
+            ms (cond (nil? m) nil (vector? m) (first m) :else m)]
+        (if (or (nil? ms) (= "" ms))
+          out
+          (let [col (string/index-of line ms start)]
+            (if (nil? col)
+              out
+              (recur (+ col (count ms)) (conj out [col (+ col (count ms))])))))))))
+
+(defn- swiper-candidates
+  "Every match of `re` across `lines`, as reactive-minibuffer candidates
+   {:row :col :end :label}, up to `limit` (a large buffer with a loose
+   pattern could otherwise build a list far taller than the screen)."
+  [lines re limit]
+  (loop [r 0, out []]
+    (if (or (>= r (count lines)) (>= (count out) limit))
+      out
+      (let [line (nth lines r)
+            cands (map (fn [[c e]] {:row r :col c :end e :label (format "%d: %s" (inc r) line)})
+                       (line-match-cols re line))]
+        (recur (inc r) (into out cands))))))
+
+(defcommand swiper
+  "Incremental regexp search, ivy/swiper-style: type a pattern and every
+   matching line appears in a live list below, with point following the
+   selected match. C-s/C-n (and C-r/C-p) step through matches, RET stays
+   put, C-g returns to where you started."
+  [state]
+  (let [origin (select-keys state [:cursor-row :cursor-col :scroll-row :scroll-col])]
+    (mb/open state "swiper: "
+             (fn [state _input] (set-message state ""))
+             {:list-kind :swiper
+              :on-cancel (fn [state] (merge state origin))
+              :on-change (fn [state input]
+                           (let [re (compile-search input)]
+                             (assoc-in state [:minibuffer :candidates]
+                                       (if re (swiper-candidates (:lines state) re 500) []))))
+              :on-select (fn [state idx]
+                           (if-let [c (nth (get-in state [:minibuffer :candidates]) idx nil)]
+                             (assoc state :cursor-row (:row c) :cursor-col (:col c))
+                             state))})))
+
+;; --- minibuffer y-or-n ----------------------------------------------------
+
+(defn- yes? [s] (contains? #{"y" "Y" "yes" "Yes" "YES"} (string/trim s)))
+
+(defn ask-yes-or-no [state prompt on-yes on-no]
+  (mb/open state prompt
+           (fn [state input] (if (yes? input) (on-yes state) (on-no state)))
+           {:on-cancel on-no}))
+
+;; --- files -----------------------------------------------------------------
+
+(defn write-buffer-to [state path]
+  (spit path (buf/join-lines (:lines state)))
+  (-> state
+      (assoc :filename path :modified? false)
+      (set-message (str "Wrote " path))))
+
+(defcommand save-buffer
+  "Write the buffer to its file, prompting for a filename if it doesn't
+   have one yet."
+  [state]
+  (if (:filename state)
+    (write-buffer-to state (:filename state))
+    (mb/open state "Save as: "
+             (fn [state path]
+               (if (string/blank? path)
+                 (set-message state "Save cancelled")
+                 (write-buffer-to state path)))
+             {:on-cancel (fn [state] (set-message state "Save cancelled"))
+              :completer completion/path-completer})))
+
+(defcommand write-file
+  "Write the buffer to a new file (always prompts)."
+  [state]
+  (mb/open state (str "Write file: ")
+           (fn [state path]
+             (if (string/blank? path)
+               (set-message state "Save cancelled")
+               (write-buffer-to state path)))
+           {:on-cancel (fn [state] (set-message state "Save cancelled"))
+            :completer completion/path-completer}))
+
+(defn- with-auto-mode
+  "Switch into whatever mode legmacs.modes/auto-mode-alist says `path`
+   should start in, if any -- the *only* place that decides this, so a
+   .lg file gets let-go-mode the same way whether it's opened from the
+   command line (main.lg) or with C-x C-f (find-file, below)."
+  [state path]
+  (if-let [mode-kw (modes/mode-for-filename path)]
+    (modes/switch-to-mode state mode-kw)
+    state))
+
+(defn new-file-state
+  "A fresh buffer-state for `path`: its contents if it exists, an empty
+   buffer otherwise, either way with auto-mode-detection applied. What
+   both main.lg (the initial file argument) and find-file (below) load a
+   file with. [state message] -- message says whether it was loaded or
+   is a new file, for callers that want to show it."
+  [path]
+  (if-let [content (try (slurp path) (catch e nil))]
+    [(with-auto-mode (buf/new-state path (buf/split-lines content)) path) (str "Loaded " path)]
+    [(with-auto-mode (buf/new-state path [""]) path) (str "New file " path)]))
+
+(defcommand find-file
+  "Open a file in a new buffer, or switch to it if it's already open --
+   never touches the current buffer's own content."
+  [state]
+  (mb/open state "Find file: "
+           (fn [state path]
+             (if (string/blank? path)
+               state
+               (if-let [existing (some #(when (= (:filename %) path) %) (:buffer-list state))]
+                 (assoc state :buffer-command {:op :switch :id (:id existing)}
+                        :message (str "Switched to " path))
+                 (let [[fresh msg] (new-file-state path)]
+                   (assoc state :buffer-command {:op :open-new :state fresh} :message msg)))))
+           {:completer completion/path-completer}))
+
+(defn- other-modified-buffers [state]
+  (filter #(and (:modified? %) (not= (:id %) (:current-buffer-id state))) (:buffer-list state)))
+
+(defn- plural [n word] (str n " " word (if (= 1 n) "" "s")))
+
+(defcommand save-buffers-kill-terminal
+  "Quit legmacs, prompting to save unsaved changes in the *current* buffer
+   first. Doesn't save other modified buffers -- just warns about them,
+   since doing that from a signal-based command would need reading their
+   full content back out of the workspace, not just this buffer's view of
+   it (see legmacs.buffers). Switch to them and save individually first if
+   you want to keep those changes too."
+  [state]
+  (let [others (other-modified-buffers state)
+        warning (when (seq others) (str " (" (plural (count others) "other buffer") " won't be saved)"))]
+    (cond
+      (:modified? state)
+      (ask-yes-or-no state (str "Save changes before exiting?" warning " (y/n) ")
+                     (fn [state] (assoc (save-buffer state) :quit? true))
+                     (fn [state] (assoc state :quit? true)))
+
+      (seq others)
+      (ask-yes-or-no state (str (plural (count others) "other modified buffer") " won't be saved. Quit anyway? (y/n) ")
+                     (fn [state] (assoc state :quit? true))
+                     (fn [state] (set-message state "")))
+
+      :else (assoc state :quit? true))))
+
+;; --- buffers ---------------------------------------------------------------
+;;
+;; A buffer can't switch itself -- from its own point of view there is no
+;; other buffer to switch to, just the one it is. These commands say what
+;; they want done via :buffer-command instead (see legmacs.buffers); the
+;; main loop is what actually has a workspace to apply it to.
+
+(defcommand switch-to-buffer
+  "Prompt for a buffer by name (TAB-completes against open buffers).
+   Typing a name that doesn't match any open buffer creates a fresh one
+   with that name, same as Emacs."
+  [state]
+  (mb/open state "Switch to buffer: "
+           (fn [state name]
+             (if (string/blank? name)
+               state
+               (if-let [existing (some #(when (= (:name %) name) %) (:buffer-list state))]
+                 (assoc state :buffer-command {:op :switch :id (:id existing)})
+                 (assoc state :buffer-command
+                        {:op :open-new :state (assoc (buf/new-state nil [""]) :buffer-name name)}))))
+           {:submit-selected? true
+            :completer (fn [input]
+                         (completion/fuzzy-filter input (map :name (:buffer-list state))))}))
+
+(defcommand list-buffers
+  "Show every open buffer: name, modified flag, mode."
+  [state]
+  (let [lines (map (fn [b] (format "%-24s %s  %s" (:name b) (if (:modified? b) "*" "-") (or (:mode b) "")))
+                    (:buffer-list state))]
+    (assoc state :overlay {:title "Buffers (any key closes)" :lines (vec lines)})))
+
+(defcommand kill-buffer
+  "Close the current buffer, asking first if it has unsaved changes.
+   Falls back to a fresh scratch buffer if this was the only one open."
+  [state]
+  (let [do-kill (fn [state]
+                  (assoc state :buffer-command
+                         {:op :kill :id (:current-buffer-id state) :fallback (buf/new-state nil [""])}))]
+    (if (:modified? state)
+      (ask-yes-or-no state "Buffer modified; kill anyway? (y/n) " do-kill (fn [state] (set-message state "")))
+      (do-kill state))))
+
+(defcommand next-buffer
+  "Cycle to the next buffer, wrapping around."
+  [state]
+  (assoc state :buffer-command {:op :next}))
+
+(defcommand previous-buffer
+  "Cycle to the previous buffer, wrapping around."
+  [state]
+  (assoc state :buffer-command {:op :prev}))
+
+;; --- misc ------------------------------------------------------------------
+
+(defcommand keyboard-quit
+  "C-g: cancel whatever's in progress -- a minibuffer prompt, a pending
+   prefix key, or an active region, in that order."
+  [state]
+  (cond
+    (mb/active? state) (mb/cancel state)
+    (:pending-prefix state) (assoc state :pending-prefix nil :pending-keys [] :message "Quit")
+    (buf/region-active? state) (-> state (assoc :mark nil) (set-message "Quit"))
+    :else (set-message state "Quit")))
+
+(defcommand execute-extended-command
+  "M-x: run a command by name."
+  [state]
+  (mb/open state "M-x "
+           (fn [state input]
+             (let [cmd-name (string/trim input)]
+               (if (string/blank? cmd-name)
+                 state
+                 (km/run-command state (keyword cmd-name)))))
+           {:submit-selected? true
+            :completer completion/command-completer}))
+
+(defcommand toggle-minor-mode
+  "Prompt for a registered mode by name and toggle it as a minor mode in
+   the current buffer (TAB-completes against registered modes). This is the
+   generic on/off switch; a mode can also ship its own dedicated toggle
+   command (e.g. crutch-mode)."
+  [state]
+  (mb/open state "Toggle minor mode: "
+           (fn [state input]
+             (let [name (string/trim input)]
+               (if (string/blank? name)
+                 state
+                 (modes/toggle-minor-mode state (keyword name)))))
+           {:submit-selected? true
+            :completer (fn [input]
+                         (completion/fuzzy-filter input (map name (modes/registered-modes))))}))
+
+(defcommand toggle-read-only
+  "Toggle whether the current buffer accepts edits (Emacs C-x C-q). Read-only
+   buffers still move, scroll, and search -- only the mutation primitives
+   (see legmacs.buffer) refuse."
+  [state]
+  (let [ro (not (:read-only? state))]
+    (-> state
+        (assoc :read-only? ro)
+        (set-message (if ro "Buffer is now read-only" "Buffer is now writable")))))
+
+(defn pop-to-help
+  "Open -- or refresh and switch to -- a read-only, help-mode buffer named
+   `name` showing `lines`. The named-singleton :help op (see legmacs.buffers)
+   reuses the one buffer across calls instead of piling up copies."
+  [state name lines]
+  (let [buf (-> (buf/new-state nil (vec lines))
+                (modes/switch-to-mode :help)
+                (assoc :buffer-name name :read-only? true))]
+    (assoc state :buffer-command {:op :help :name name :state buf})))
+
+(defcommand describe-bindings
+  "Show the current key bindings in a read-only, syntax-highlighted *Help*
+   buffer -- scroll it, search it (C-s), switch away and back like any other
+   buffer, rather than a one-shot overlay."
+  [state]
+  (let [pairs (sort-by (fn [[path _]] (string/join " " path)) (km/describe-keymap @km/global-keymap))
+        entries (map (fn [[path cmd]] (format "  %-18s  %s" (string/join " " path) (name cmd))) pairs)]
+    (pop-to-help state "*Help*" (into ["Key bindings" ""] entries))))

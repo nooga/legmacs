@@ -1,0 +1,150 @@
+;; legmacs.lisp-syntax — a single-pass scanner over flat buffer text (see
+;; legmacs.buffer/buffer-text) that everything Lisp-aware in let-go-mode is
+;; built on: paren matching, syntax highlighting, auto-indent, and
+;; expand-region all just need "where are the brackets and strings," and
+;; this answers that once per scan instead of every feature re-deriving it.
+;;
+;; Not a full reader -- it doesn't need to be. It tracks just enough to
+;; skip strings, line comments, and character literals (\( \" \\ \newline
+;; etc) so brackets *inside* those don't get mistaken for real structure --
+;; and, like strings/comments, reports character literals as their own
+;; :spans entry so callers (syntax highlighting) can style them without
+;; re-deriving the boundary rule.
+
+(ns legmacs.lisp-syntax
+  (:require [string]))
+
+(def ^:private open->close {\( \) \[ \] \{ \}})
+(def ^:private close->open {\) \( \] \[ \} \{})
+
+(defn open-bracket? [ch] (contains? open->close ch))
+(defn close-bracket? [ch] (contains? close->open ch))
+
+;; What ends a character-literal token, mirroring pkg/compiler/reader.go's
+;; readToken/isTerminatingMacro: whitespace/comma, or any reader-macro
+;; character other than # and ' (those two stay non-terminating there, but
+;; that only matters for the pathological `\a#b`/`\a'b`-style inputs real
+;; code never writes, so we don't bother distinguishing them here).
+(def ^:private char-literal-stop?
+  #{\( \) \[ \] \{ \} \" \\ \@ \` \~ \; \^ \space \tab \newline \return \,})
+
+(defn scan
+  "One pass over `text` (flat, newlines and all), stopping at `upto` (the
+   whole string by default). Returns:
+     :pairs  {offset matching-offset, ...} for every bracket matched
+              *before* upto, both directions
+     :stack  ([open-char open-offset] ...), innermost last, for brackets
+              opened before upto that are still unclosed *at* upto -- this
+              is the thing a completed :pairs map can't tell you, and
+              what auto-indent/expand-region actually want when the point
+              they care about is mid-form
+     :spans  [{:type :string|:comment|:char :start :end} ...] (:end exclusive),
+              in scan order, truncated to upto
+     :in-string?  true iff upto itself falls inside a still-open (not yet
+              closed) string -- what a caller checking \"is *point*, not
+              some already-typed character, inside string content\" wants;
+              :spans alone can't answer this because a string closed
+              exactly at upto and a string still open at upto both end up
+              with an identical trailing {:end upto} span"
+  ([text] (scan text (count text)))
+  ([text upto]
+   (let [chars (vec (seq text))
+         len (min upto (count chars))]
+     (loop [i 0, stack (), pairs {}, spans [], str-start nil]
+       (cond
+         (>= i len)
+         {:pairs pairs
+          :stack stack
+          :in-string? (boolean str-start)
+          :spans (if str-start (conj spans {:type :string :start str-start :end len}) spans)}
+
+         str-start
+         (let [ch (nth chars i)]
+           (cond
+             (and (= ch \\) (< (inc i) len)) (recur (+ i 2) stack pairs spans str-start)
+             (= ch \") (recur (inc i) stack pairs (conj spans {:type :string :start str-start :end (inc i)}) nil)
+             :else (recur (inc i) stack pairs spans str-start)))
+
+         :else
+         (let [ch (nth chars i)]
+           (cond
+             (= ch \;)
+             (let [nl (string/index-of text "\n" i)
+                   end (min len (or nl len))]
+               (recur end stack pairs (conj spans {:type :comment :start i :end end}) nil))
+
+             (= ch \")
+             (recur (inc i) stack pairs spans i)
+
+             (and (= ch \\) (< (inc i) len))
+             ;; Character literal: the char right after \ is always part of
+             ;; it (even if it's itself normally bracket/quote-ish, e.g.
+             ;; \( or \" ), then it extends through any further
+             ;; non-terminating chars so named literals (\newline) and
+             ;; \uXXXX/\oNNN read as one span, matching readChar/readToken.
+             (let [tok-start (inc i)
+                   end (loop [j (inc tok-start)]
+                         (if (and (< j len) (not (char-literal-stop? (nth chars j))))
+                           (recur (inc j))
+                           j))]
+               (recur end stack pairs (conj spans {:type :char :start i :end end}) nil))
+
+             (open-bracket? ch)
+             (recur (inc i) (cons [ch i] stack) pairs spans nil)
+
+             (close-bracket? ch)
+             (if (empty? stack)
+               (recur (inc i) stack pairs spans nil)
+               (let [[open-ch open-i] (first stack)]
+                 (if (= ch (get open->close open-ch))
+                   (recur (inc i) (rest stack) (assoc pairs open-i i i open-i) spans nil)
+                   (recur (inc i) (rest stack) pairs spans nil))))
+
+             :else
+             (recur (inc i) stack pairs spans nil))))))))
+
+(defn matching
+  "Given a full scan (scan text, no upto) and an offset, the matching
+   bracket's offset, or nil if `offset` isn't on a matched bracket."
+  [scanned offset]
+  (get (:pairs scanned) offset))
+
+(defn in-string-or-comment?
+  "True if `offset` falls inside one of scanned's :spans."
+  [scanned offset]
+  (boolean (some (fn [{:keys [start end]}] (and (<= start offset) (< offset end))) (:spans scanned))))
+
+(defn depth-at
+  "How many brackets opened before `offset` (in text) are still open at
+   that point -- what auto-indent multiplies by an indent width."
+  [text offset]
+  (count (:stack (scan text offset))))
+
+(defn innermost-open-before
+  "[open-char open-offset] of the nearest bracket still open at `offset`,
+   or nil at top level. What auto-indent would use for column-aligned (as
+   opposed to depth*width) indentation, and what expand-region's first
+   step (from point, no region yet) grows into."
+  [text offset]
+  (first (:stack (scan text offset))))
+
+(defn- matched-pairs [scanned]
+  (filter (fn [[k v]] (< k v)) (:pairs scanned)))
+
+(defn innermost-pair-containing
+  "The tightest matched [open close] pair with open <= point <= close, or
+   nil if point isn't inside any bracket pair."
+  [scanned point]
+  (let [candidates (filter (fn [[o c]] (and (<= o point) (<= point c))) (matched-pairs scanned))]
+    (when (seq candidates) (apply max-key first candidates))))
+
+(defn enclosing-pair
+  "The next matched [open close] pair strictly containing the region
+   [region-start region-end) (region-end exclusive, so a bracket pair's
+   own inclusive span [open, close] is [open, (inc close))) -- or nil at
+   top level. Works the same whether the current selection came from a
+   previous expand-region step (a bracket pair's own span) or a plain
+   word select, which is what lets expand-region use it for both."
+  [scanned region-start region-end]
+  (let [candidates (filter (fn [[o c]] (and (< o region-start) (>= (inc c) region-end))) (matched-pairs scanned))]
+    (when (seq candidates) (apply max-key first candidates))))

@@ -1,0 +1,50 @@
+(ns test.keycast-mode-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as d]
+            [legmacs.render :as r]
+            [legmacs.modes.keycast :as keycast]))
+
+(bindings/install!)
+
+(defn- press [state & chords] (reduce d/dispatch state chords))
+
+(deftest dispatch-stamps-last-chord
+  (testing "every dispatch records the chord it just handled as :last-chord"
+    (is (= "C-f" (:last-chord (d/dispatch (buf/new-state nil ["ab"]) "C-f"))))
+    (is (= "z" (:last-chord (d/dispatch (buf/new-state nil [""]) "z"))))))
+
+(defn- keycast-buf [lines]
+  (modes/enable-minor-mode (buf/new-state nil lines) :keycast))
+
+(deftest keycast-logs-recent-chords
+  (testing "with keycast on, dispatched chords accumulate in :keycast-log"
+    (let [s (press (keycast-buf ["hello"]) "C-f" "C-f" "M-w")]
+      (is (= ["C-f" "C-f" "M-w"] (:keycast-log s))))))
+
+(deftest keycast-log-is-bounded
+  (testing "the log keeps only the most recent max-keys chords"
+    (let [s (apply press (keycast-buf ["x"]) (repeat (+ keycast/max-keys 5) "C-f"))]
+      (is (= keycast/max-keys (count (:keycast-log s)))))))
+
+(deftest keycast-shows-in-the-mode-line
+  (testing "recent chords render on the status line"
+    (let [s (-> (keycast-buf ["hello"]) (press "C-a" "M-w"))
+          s (buf/ensure-visible s 20 40)
+          out (r/frame s 40 24)]
+      (is (string/includes? out "C-a M-w")))))
+
+(deftest keycast-empty-when-idle-or-off
+  (testing "a buffer with no keycast renders a normal status line, no stray keys"
+    (let [s (buf/ensure-visible (buf/new-state nil ["x"]) 20 40)
+          out (r/frame s 40 24)]
+      (is (string/includes? out "Ln 1, Col 1"))))
+
+  (testing "toggling keycast off clears its log"
+    (let [s (-> (keycast-buf ["x"]) (press "C-f"))
+          s (keycast/keycast-mode s)]
+      (is (not (modes/minor-mode-active? s :keycast)))
+      (is (nil? (:keycast-log s))))))

@@ -1,0 +1,131 @@
+;; legmacs.modes.markdown — a read-mostly mode: no eval, no paren-matching,
+;; just a per-line syntax highlighter (see legmacs.modes/register-mode!)
+;; registered for .md files.
+;;
+;; Same simplification legmacs.modes.letgo's highlighter accepts (see its
+;; comment, and the README): scanned one line at a time, with no state
+;; carried across lines. That's cheap for everything here except fenced
+;; code blocks, which are inherently multi-line -- only the ``` delimiter
+;; lines themselves are recognized, the code inside isn't (and neither are
+;; indented -- 4-space/tab -- code blocks, which need the same cross-line
+;; context). Getting that right needs the kind of continuation state Emacs
+;; tracks via syntax-table text properties; not worth it for a lightweight
+;; highlighter.
+
+(ns legmacs.modes.markdown
+  (:require [string]
+            [legmacs.modes :as modes]))
+
+(def keymap (atom {}))
+
+;; --- line-level constructs (headers, rules, quotes, lists, fences) ------
+;;
+;; Each of these only cares about the line as a whole (or its leading
+;; whitespace), so -- unlike the inline scanner below -- no cross-position
+;; bookkeeping is needed.
+
+(defn- fence-line? [line]
+  (boolean (re-find #"^[ \t]*```" line)))
+
+(defn- header-span [line]
+  (when (re-find #"^#{1,6}(?:\s|$)" line)
+    [{:style :md-header :start 0 :end (count line)}]))
+
+(defn- hr-line? [line]
+  (boolean (re-matches #"[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*" line)))
+
+(defn- blockquote-span [line]
+  (when-let [m (re-find #"^[ \t]{0,3}>" line)]
+    [{:style :md-quote :start 0 :end (count m)}]))
+
+(defn- list-marker-span [line]
+  (when-let [m (re-find #"^[ \t]*(?:[-*+]|\d+\.)[ \t]" line)]
+    [{:style :md-list :start 0 :end (dec (count m))}]))
+
+;; --- inline scanner (code, bold, italic, links) -------------------------
+;;
+;; One left-to-right pass, same shape as legmacs.lisp-syntax/scan: at each
+;; position, try each marker in turn; an unmatched opening marker (no
+;; closing delimiter later on the line) is just skipped over rather than
+;; treated as structure -- markdown has no escape analysis here, so a lone
+;; "*" or "`" in running prose is common and shouldn't force a span.
+
+(defn- at?
+  "True if `line` has the literal substring `s` starting at index `i`."
+  [line i s]
+  (and (<= (+ i (count s)) (count line))
+       (= s (subs line i (+ i (count s))))))
+
+(defn- word-char-at? [line i]
+  (and (< -1 i (count line))
+       (let [c (int (nth (seq line) i))]
+         (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)))))
+
+(defn- scan-link
+  "At index `i` (on a `[` or a `!` immediately before one): if it's a
+   well-formed `[text](url)` or `![alt](url)`, [spans next-index] --
+   otherwise nil so the caller falls through to treating it as plain text."
+  [line i]
+  (let [bang? (at? line i "!")
+        bracket (if bang? (inc i) i)]
+    (when (at? line bracket "[")
+      (when-let [close-bracket (string/index-of line "]" (inc bracket))]
+        (when (at? line (inc close-bracket) "(")
+          (when-let [close-paren (string/index-of line ")" (+ close-bracket 2))]
+            [[{:style :md-link :start i :end (inc close-bracket)}
+              {:style :md-url :start (inc close-bracket) :end (inc close-paren)}]
+             (inc close-paren)]))))))
+
+(defn- scan-inline [line]
+  (let [n (count line)]
+    (loop [i 0, spans []]
+      (if (>= i n)
+        spans
+        (cond
+          (at? line i "`")
+          (if-let [end (string/index-of line "`" (inc i))]
+            (recur (inc end) (conj spans {:style :md-code :start i :end (inc end)}))
+            (recur (inc i) spans))
+
+          (or (at? line i "[") (at? line i "!"))
+          (if-let [[link-spans next-i] (scan-link line i)]
+            (recur next-i (into spans link-spans))
+            (recur (inc i) spans))
+
+          (or (at? line i "**") (at? line i "__"))
+          (let [marker (subs line i (+ i 2))]
+            (if-let [end (string/index-of line marker (+ i 2))]
+              (recur (+ end 2) (conj spans {:style :md-bold :start i :end (+ end 2)}))
+              (recur (inc i) spans)))
+
+          (at? line i "*")
+          (if-let [end (string/index-of line "*" (inc i))]
+            (recur (inc end) (conj spans {:style :md-italic :start i :end (inc end)}))
+            (recur (inc i) spans))
+
+          ;; "_" only opens/closes emphasis at a word boundary -- otherwise
+          ;; an ordinary identifier like "some_var_name" would light up.
+          (at? line i "_")
+          (if-let [end (string/index-of line "_" (inc i))]
+            (if (and (not (word-char-at? line (dec i))) (not (word-char-at? line (inc end))))
+              (recur (inc end) (conj spans {:style :md-italic :start i :end (inc end)}))
+              (recur (inc i) spans))
+            (recur (inc i) spans))
+
+          :else (recur (inc i) spans))))))
+
+(defn highlight-line [line]
+  (cond
+    (fence-line? line) [{:style :md-code :start 0 :end (count line)}]
+    (header-span line) (header-span line)
+    (hr-line? line) [{:style :md-hr :start 0 :end (count line)}]
+    :else (concat (or (blockquote-span line) [])
+                  (or (list-marker-span line) [])
+                  (scan-inline line))))
+
+(modes/register-mode! :markdown keymap
+                       (str "markdown-mode: syntax highlighting for headers, emphasis, "
+                            "inline code, links, blockquotes, lists, and code fences")
+                       {:highlighter highlight-line})
+(modes/register-auto-mode! ".md" :markdown)
+(modes/register-auto-mode! ".markdown" :markdown)

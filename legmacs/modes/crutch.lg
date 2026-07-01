@@ -1,0 +1,235 @@
+;; legmacs.modes.crutch — CRUTCH: Could Really Use The Cool Hotkeys.
+;; vi/evil-style modal editing, built entirely as a *minor* mode on top of
+;; the same public API a user's init.lg has. Nothing here is privileged: it
+;; layers over whatever major mode a buffer already has (so a .lg file keeps
+;; let-go-mode's highlighting and paren-matching while you drive it vi-style),
+;; and it's toggled per buffer with `M-x crutch-mode`.
+;;
+;; The three vi states -- normal, insert, visual -- are NOT three registered
+;; modes fighting over a slot; they're one minor mode carrying a buffer-local
+;; :crutch-state, whose :keymap is a (fn [state] -> keymap) that picks the
+;; right keymap for the current state (legmacs.modes/resolve-keymap calls it
+;; each keystroke). Insert state's keymap is nearly empty -- just ESC -- so
+;; every other key falls straight through to the major mode / global
+;; self-insert, i.e. insert mode *is* the normal editor. Normal and visual
+;; state set :suppress-self-insert? so unbound printable keys stay inert
+;; without CRUTCH having to enumerate the whole keyboard.
+;;
+;; Counts (3j, 2dd) accumulate in :crutch-count; motions consume it. The
+;; :after-command hook clears a stale count once a non-count command runs
+;; (but keeps it alive across a pending operator prefix, so 2dd works).
+
+(ns legmacs.modes.crutch
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]
+            [legmacs.minibuffer :as mb]))
+
+;; A keymap per vi state. crutch-keymap-for (below) picks between them off
+;; :crutch-state; resolve-keymap in legmacs.dispatch consults the result.
+(def normal-keymap (atom {}))
+(def visual-keymap (atom {}))
+(def insert-keymap (atom {}))
+
+;; --- counts -------------------------------------------------------------
+
+(defn- repeatn [state n f]
+  (loop [i 0, s state] (if (< i n) (recur (inc i) (f s)) s)))
+
+(defn- count-value [state] (max 1 (or (:crutch-count state) 1)))
+
+(defn- consume-count
+  "Run motion/edit `f` (count) times, then clear the pending count."
+  [state f]
+  (-> (repeatn state (count-value state) f)
+      (dissoc :crutch-count :crutch-count-touched)))
+
+(defn- crutch-digit
+  "Accumulate a decimal count digit. A bare `0` with no count in progress is
+   the start-of-line motion instead (vi's rule)."
+  [state d]
+  (if (and (= d 0) (nil? (:crutch-count state)))
+    (buf/move-line-start state)
+    (assoc state :crutch-count (+ (* 10 (or (:crutch-count state) 0)) d)
+                 :crutch-count-touched true)))
+
+(defn- at-line-end? [state]
+  (>= (:cursor-col state) (buf/line-length state (:cursor-row state))))
+
+;; --- state transitions ---------------------------------------------------
+
+(defcommand crutch-normal-mode
+  "Return to normal state: drop any region and pending count."
+  [state]
+  (-> state
+      (assoc :crutch-state :normal :mark nil)
+      (dissoc :crutch-count :crutch-count-touched)))
+
+(defcommand crutch-insert-mode "Insert before the cursor (vi i)." [state]
+  (assoc state :crutch-state :insert))
+
+(defcommand crutch-insert-bol "Insert at start of line (vi I)." [state]
+  (-> state buf/move-line-start (assoc :crutch-state :insert)))
+
+(defcommand crutch-append "Insert after the cursor (vi a)." [state]
+  (-> (if (at-line-end? state) state (buf/move-right state))
+      (assoc :crutch-state :insert)))
+
+(defcommand crutch-append-eol "Insert at end of line (vi A)." [state]
+  (-> state buf/move-line-end (assoc :crutch-state :insert)))
+
+(defcommand crutch-open-below "Open a line below and insert (vi o)." [state]
+  (-> state buf/move-line-end (buf/insert-string "\n") (assoc :crutch-state :insert)))
+
+(defcommand crutch-open-above "Open a line above and insert (vi O)." [state]
+  (-> state buf/move-line-start (buf/insert-string "\n") buf/move-up (assoc :crutch-state :insert)))
+
+(defcommand crutch-visual-mode "Start a characterwise selection (vi v)." [state]
+  (assoc state :crutch-state :visual :mark [(:cursor-row state) (:cursor-col state)]))
+
+;; --- motions (shared by normal and visual) -------------------------------
+
+(defcommand crutch-backward-char "Move left (vi h)."        [state] (consume-count state buf/move-left))
+(defcommand crutch-forward-char  "Move right (vi l)."       [state] (consume-count state buf/move-right))
+(defcommand crutch-next-line     "Move down (vi j)."        [state] (consume-count state buf/move-down))
+(defcommand crutch-previous-line "Move up (vi k)."          [state] (consume-count state buf/move-up))
+(defcommand crutch-word-forward  "Forward a word (vi w)."   [state] (consume-count state buf/move-word-forward))
+(defcommand crutch-word-backward "Back a word (vi b)."      [state] (consume-count state buf/move-word-backward))
+(defcommand crutch-line-start    "Start of line (vi 0)."    [state] (buf/move-line-start state))
+(defcommand crutch-line-end      "End of line (vi $)."      [state] (buf/move-line-end state))
+(defcommand crutch-buffer-end    "End of buffer (vi G)."    [state] (buf/move-buffer-end state))
+(defcommand crutch-goto-top      "Start of buffer (vi gg)." [state] (buf/move-buffer-start state))
+
+;; --- normal-mode edits ----------------------------------------------------
+
+(defcommand crutch-delete-char "Delete the char(s) under the cursor (vi x)." [state]
+  (consume-count state buf/delete-char-forward))
+
+(defcommand crutch-kill-line "Delete whole line(s) into the clipboard (vi dd)." [state]
+  (consume-count state (fn [s]
+                         (let [line (buf/current-line s)]
+                           (-> s buf/kill-whole-line (assoc :clipboard (str line "\n")))))))
+
+(defcommand crutch-delete-word "Delete to the next word into the clipboard (vi dw)." [state]
+  (consume-count state (fn [s]
+                         (let [s (assoc s :mark [(:cursor-row s) (:cursor-col s)])
+                               s (buf/move-word-forward s)
+                               text (buf/region-text s)]
+                           (-> s buf/delete-region (assoc :clipboard text))))))
+
+(defcommand crutch-paste "Paste the clipboard (vi p)." [state] (buf/yank state))
+(defcommand crutch-undo "Undo (vi u)." [state] (buf/undo state))
+(defcommand crutch-redo "Redo (vi C-r)." [state] (buf/redo state))
+
+(defcommand crutch-ex-command
+  "The `:` ex line -- a minimal subset: w[rite], q[uit], wq, q!."
+  [state]
+  (mb/open state ":"
+           (fn [state input]
+             (let [cmd (string/trim input)]
+               (cond
+                 (string/blank? cmd) state
+                 (or (= cmd "w") (= cmd "write")) (km/run-command state :save-buffer)
+                 (or (= cmd "q") (= cmd "quit")) (assoc state :quit? true)
+                 (= cmd "wq") (assoc (km/run-command state :save-buffer) :quit? true)
+                 (= cmd "q!") (assoc state :quit? true)
+                 :else (assoc state :message (str "Not an editor command: " cmd)))))))
+
+;; --- visual-mode edits ----------------------------------------------------
+
+(defcommand crutch-visual-delete "Delete the selection into the clipboard (visual d/x)." [state]
+  (if (buf/region-active? state)
+    (let [text (buf/region-text state)]
+      (-> state buf/delete-region (assoc :clipboard text :crutch-state :normal)))
+    (assoc state :crutch-state :normal :mark nil)))
+
+(defcommand crutch-visual-yank "Copy the selection into the clipboard (visual y)." [state]
+  (if (buf/region-active? state)
+    (assoc state :clipboard (buf/region-text state) :mark nil :crutch-state :normal)
+    (assoc state :crutch-state :normal :mark nil)))
+
+;; Ten count-digit commands, one per digit, so a single (fn [state]) can know
+;; which digit fired (dispatch hands commands only the state, never the key).
+(doseq [d (range 10)]
+  (km/defcommand! (keyword (str "crutch-digit-" d)) "CRUTCH count digit"
+    (fn [state] (crutch-digit state d))))
+
+;; --- keymap selection + count housekeeping -------------------------------
+
+(defn- crutch-keymap-for [state]
+  (case (:crutch-state state)
+    :insert insert-keymap
+    :visual visual-keymap
+    normal-keymap))
+
+(defn- crutch-after-command
+  "Clear a stale pending count once a non-count command has run -- but keep
+   it alive right after a digit (so the next key sees it) and across a
+   pending operator prefix (so 2dd reaches dd with the count intact)."
+  [state]
+  (cond
+    (:crutch-count-touched state) (dissoc state :crutch-count-touched)
+    (:pending-prefix state) state
+    :else (dissoc state :crutch-count :crutch-count-touched)))
+
+;; --- bindings -------------------------------------------------------------
+
+(def ^:private normal-motions
+  {"h" :crutch-backward-char  "l" :crutch-forward-char
+   "j" :crutch-next-line      "k" :crutch-previous-line
+   "w" :crutch-word-forward   "b" :crutch-word-backward
+   "$" :crutch-line-end       "G" :crutch-buffer-end
+   "g g" :crutch-goto-top})
+
+(doseq [[chord cmd] normal-motions]
+  (km/bind-key! normal-keymap chord cmd)
+  (km/bind-key! visual-keymap chord cmd))
+
+;; digits (count) in both normal and visual; "0" is start-of-line when idle
+(doseq [d (range 10)]
+  (let [kw (keyword (str "crutch-digit-" d)), ch (str d)]
+    (km/bind-key! normal-keymap ch kw)
+    (km/bind-key! visual-keymap ch kw)))
+
+;; normal-only: enter insert/visual, edits, ex, search
+(doseq [[chord cmd] {"i" :crutch-insert-mode  "I" :crutch-insert-bol
+                     "a" :crutch-append       "A" :crutch-append-eol
+                     "o" :crutch-open-below   "O" :crutch-open-above
+                     "v" :crutch-visual-mode
+                     "x" :crutch-delete-char
+                     "d d" :crutch-kill-line  "d w" :crutch-delete-word
+                     "p" :crutch-paste
+                     "u" :crutch-undo         "C-r" :crutch-redo
+                     ":" :crutch-ex-command   "/" :search-forward
+                     "ESC" :crutch-normal-mode}]
+  (km/bind-key! normal-keymap chord cmd))
+
+;; visual-only: operate on the selection, or bail out
+(doseq [[chord cmd] {"d" :crutch-visual-delete  "x" :crutch-visual-delete
+                     "y" :crutch-visual-yank
+                     "ESC" :crutch-normal-mode}]
+  (km/bind-key! visual-keymap chord cmd))
+
+;; insert: the only modal key is ESC; everything else self-inserts via the
+;; major mode / global fallthrough (suppress-self-insert? is off in insert).
+(km/bind-key! insert-keymap "ESC" :crutch-normal-mode)
+
+(defcommand crutch-mode
+  "Toggle CRUTCH modal (vi-style) editing in the current buffer."
+  [state]
+  (modes/toggle-minor-mode state :crutch))
+
+(modes/register-minor-mode! :crutch crutch-keymap-for
+  (str "CRUTCH modal editing (Could Really Use The Cool Hotkeys). "
+       "ESC -> normal; i/I/a/A/o/O insert; v visual; hjkl/w/b/0/$/G/gg motion; "
+       "x/dd/dw delete; p paste; u undo; C-r redo; : ex (w/q/wq); / search.")
+  {:on-enter (fn [state] (assoc state :crutch-state :normal))
+   :on-exit (fn [state] (-> state (assoc :mark nil)
+                            (dissoc :crutch-state :crutch-count :crutch-count-touched)))
+   :after-command crutch-after-command
+   :status (fn [state] (case (:crutch-state state)
+                         :insert "INSERT"
+                         :visual "VISUAL"
+                         "NORMAL"))
+   :suppress-self-insert? (fn [state] (not= (:crutch-state state) :insert))})

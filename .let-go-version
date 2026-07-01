@@ -1,0 +1,8 @@
+# let-go source ref used to build legmacs -- single source of truth.
+# Both CI workflows (.github/workflows/{test,release}.yml) clone nooga/let-go
+# at this ref next to the repo, then build.sh compiles against it.
+#
+# May be a commit SHA (reproducible) or a branch name like `main` (tracks tip).
+# legmacs's AOT build needs the gogen lowering + scripts/lg-compile tooling,
+# which live on main; bump this SHA when you want newer let-go fixes.
+c879db7631fa578ab55a7a4365820c87345be445

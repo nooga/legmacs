@@ -1,0 +1,207 @@
+;; legmacs.minibuffer — the one-line prompt at the bottom of the screen used
+;; for commands that need text from the user (find-file, save-as, search,
+;; M-x). Modeled as a value living at (:minibuffer state):
+;;
+;;   {:prompt "Find file: " :input "foo" :cursor-col 3 :note nil
+;;    :on-submit (fn [state text] -> state)
+;;    :on-cancel (fn [state] -> state)
+;;    :completer (fn [input] -> [candidate ...])}
+;;
+;; on-submit/on-cancel are ordinary closures, so any command can drive the
+;; minibuffer -- there is no separate "built-in prompt" mechanism a script
+;; can't also use. :completer is likewise just a function; the actual
+;; completion *policy* (extend to common prefix, etc.) lives in
+;; legmacs.completion and is passed in by the caller (see `complete` below)
+;; rather than required here, so this namespace stays just "a text field."
+;;
+;; A minibuffer session can also be *reactive*: two more optional closures
+;; turn the plain text field into an ivy/swiper-style live picker without
+;; this namespace knowing what's being picked --
+;;
+;;   :on-change  (fn [state input] -> state)  recompute :candidates on each
+;;               edit; store them under [:minibuffer :candidates] as a vector
+;;               of maps (at least {:label} for display; swiper adds :row/:col)
+;;   :on-select  (fn [state idx] -> state)    react to which candidate is
+;;               highlighted (swiper moves point to it, previewing the match)
+;;
+;; :selection is the highlighted index; select-next/select-prev move it and
+;; re-fire :on-select. legmacs.render grows the echo area to show the list.
+
+(ns legmacs.minibuffer)
+
+(defn active? [state] (boolean (:minibuffer state)))
+
+(defn- fire-select
+  "Fire :on-select for the current selection, if this minibuffer has one and
+   any candidates. Lets a live session (swiper) react to which candidate is
+   highlighted -- moving point, previewing, etc. -- without submitting."
+  [state]
+  (let [{:keys [on-select candidates selection]} (:minibuffer state)]
+    (if (and on-select (seq candidates))
+      (on-select state (or selection 0))
+      state)))
+
+(defn- react
+  "After the input text changed: recompute candidates via :on-change (if
+   any), reset the selection to the top, and fire :on-select so the session
+   previews the first candidate. A minibuffer with no :on-change is a plain
+   text field and passes through untouched."
+  [state]
+  (if (get-in state [:minibuffer :on-change])
+    (let [mb (:minibuffer state)
+          state ((:on-change mb) state (:input mb))]
+      (fire-select (update state :minibuffer assoc :selection 0)))
+    state))
+
+(defn- completer->on-change
+  "Turn a plain :completer (input -> [candidate-string ...]) into the reactive
+   :on-change a live vertical list needs: run it on each edit and stash the
+   results as candidate maps. Pure plumbing -- what the completer *matches*
+   (prefix, fuzzy, paths) is entirely the completer's business."
+  [completer]
+  (fn [state input]
+    (assoc-in state [:minibuffer :candidates]
+              (vec (map (fn [s] {:label s :value s}) (completer input))))))
+
+(defn open
+  "Switch into minibuffer-reading mode.
+   opts (all optional):
+     :on-cancel  (fn [state] -> state), defaults to just closing with \"Quit\"
+     :completer  (fn [input] -> [candidate ...]); drives a live vertical list
+                 (TAB accepts the highlighted one, re-filtering as you go)
+     :submit-selected?  if true, RET submits the highlighted candidate rather
+                 than the typed text (M-x, buffer/mode pickers); file prompts
+                 leave it off so RET opens exactly the path you typed
+     :on-change  (fn [state input] -> state), reactive recompute (swiper);
+                 overrides the completer-derived one
+     :on-select  (fn [state idx] -> state), reacts to the highlighted candidate
+     :list-kind  a keyword tagging the session for the renderer (e.g. :swiper)
+     :initial    starting input text"
+  ([state prompt on-submit] (open state prompt on-submit {}))
+  ([state prompt on-submit opts]
+   (let [initial (or (:initial opts) "")
+         completer (:completer opts)]
+     (react
+      (assoc state :minibuffer {:prompt prompt
+                                :input initial
+                                :cursor-col (count initial)
+                                :note nil
+                                :on-submit on-submit
+                                :on-cancel (:on-cancel opts)
+                                :completer completer
+                                :submit-selected? (:submit-selected? opts)
+                                :on-change (or (:on-change opts)
+                                               (when completer (completer->on-change completer)))
+                                :on-select (:on-select opts)
+                                :list-kind (or (:list-kind opts) (when completer :complete))
+                                :candidates []
+                                :selection 0})))))
+
+(defn- clear-note [state] (update state :minibuffer assoc :note nil))
+
+(defn insert-char [state ch]
+  (-> state
+      (update :minibuffer
+              (fn [mb]
+                (let [{:keys [input cursor-col]} mb]
+                  (-> mb
+                      (assoc :input (str (subs input 0 cursor-col) ch (subs input cursor-col)))
+                      (assoc :cursor-col (inc cursor-col))))))
+      clear-note
+      react))
+
+(defn backward-delete-char [state]
+  (-> state
+      (update :minibuffer
+              (fn [mb]
+                (let [{:keys [input cursor-col]} mb]
+                  (if (pos? cursor-col)
+                    (-> mb
+                        (assoc :input (str (subs input 0 (dec cursor-col)) (subs input cursor-col)))
+                        (assoc :cursor-col (dec cursor-col)))
+                    mb))))
+      clear-note
+      react))
+
+(defn select-next
+  "Move the live-list selection down one (clamped), re-previewing via
+   :on-select. No-op when there are no candidates."
+  [state]
+  (let [n (count (get-in state [:minibuffer :candidates]))]
+    (if (pos? n)
+      (fire-select (update state :minibuffer update :selection
+                           (fn [s] (min (dec n) (inc (or s 0))))))
+      state)))
+
+(defn select-prev
+  "Move the live-list selection up one (clamped), re-previewing via
+   :on-select. No-op when there are no candidates."
+  [state]
+  (if (pos? (count (get-in state [:minibuffer :candidates])))
+    (fire-select (update state :minibuffer update :selection
+                         (fn [s] (max 0 (dec (or s 0))))))
+    state))
+
+(defn move-left [state]
+  (update state :minibuffer #(update % :cursor-col (fn [c] (max 0 (dec c))))))
+
+(defn move-right [state]
+  (update state :minibuffer (fn [mb] (update mb :cursor-col (fn [c] (min (count (:input mb)) (inc c)))))))
+
+(defn move-beginning [state]
+  (update state :minibuffer #(assoc % :cursor-col 0)))
+
+(defn move-end [state]
+  (update state :minibuffer (fn [mb] (assoc mb :cursor-col (count (:input mb))))))
+
+(defn complete
+  "Run the minibuffer's :completer (if any) against its current input and
+   apply `policy` (e.g. legmacs.completion/complete-input) to decide the
+   next input and note. No-op if this minibuffer has no completer."
+  [state policy]
+  (let [{:keys [input completer]} (:minibuffer state)]
+    (if completer
+      (let [{:keys [input note]} (policy input (completer input))]
+        (update state :minibuffer assoc :input input :cursor-col (count input) :note note))
+      state)))
+
+(defn- selected-value
+  "The :value of the currently-highlighted candidate, or nil."
+  [state]
+  (let [{:keys [candidates selection]} (:minibuffer state)]
+    (when (seq candidates)
+      (:value (nth candidates (min (or selection 0) (dec (count candidates))) nil)))))
+
+(defn accept-selection
+  "TAB: pull the highlighted candidate up into the input line and re-filter,
+   so you can complete to it and keep going (e.g. descend into a directory).
+   No-op when there's nothing to accept, or for lists whose candidates carry
+   no :value (swiper) -- so TAB never blows away a live search."
+  [state]
+  (if-let [v (selected-value state)]
+    (react (update state :minibuffer assoc :input v :cursor-col (count v)))
+    state))
+
+(defn submit
+  "RET: close the minibuffer and run its :on-submit. Submits the highlighted
+   candidate's value when this session opted into :submit-selected? and has
+   one; otherwise the text exactly as typed."
+  [state]
+  (let [{:keys [input on-submit submit-selected?]} (:minibuffer state)
+        chosen (or (when submit-selected? (selected-value state)) input)
+        state (assoc state :minibuffer nil)]
+    (if on-submit (on-submit state chosen) state)))
+
+(defn submit-input
+  "M-RET: submit exactly what was typed, ignoring the candidate list -- the
+   escape hatch for creating a new file/buffer whose name happens to match
+   existing candidates in a :submit-selected? picker."
+  [state]
+  (let [{:keys [input on-submit]} (:minibuffer state)
+        state (assoc state :minibuffer nil)]
+    (if on-submit (on-submit state input) state)))
+
+(defn cancel [state]
+  (let [{:keys [on-cancel]} (:minibuffer state)
+        state (assoc state :minibuffer nil :message "Quit")]
+    (if on-cancel (on-cancel state) state)))
