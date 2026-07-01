@@ -1,12 +1,14 @@
 # legmacs
 
 A little Emacs-flavored terminal editor written in
-[let-go](https://github.com/nooga/let-go), my Clojure dialect running on a Go
+[let-go](https://github.com/nooga/let-go), almost-Clojure running on a Go
 bytecode VM. Here's the fun part: the language you'd script it in is the same
 language it's written in. There's no plugin API bolted on the side. Every
 built-in command and key binding is defined with the exact same
 `defcommand`/`bind-key!` your own config uses, so hacking on legmacs and
 configuring legmacs are the same activity.
+
+![legmacs](legmacs.gif)
 
 It's small. `scc` counts about 2,700 lines of Lisp for the whole editor. For
 that, it does a lot more than I expected it would when I started:
