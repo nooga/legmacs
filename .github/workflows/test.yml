@@ -31,6 +31,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: build/go.mod
+          cache-dependency-path: build/go.sum
 
       - name: Build lg from the pinned let-go
         run: |
