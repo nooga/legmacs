@@ -6,6 +6,7 @@
 
 (ns legmacs.commands
   (:require [string]
+            [os]
             [legmacs.buffer :as buf]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.minibuffer :as mb]
@@ -26,11 +27,33 @@
 (defcommand backward-word "Move point backward one word." [state] (buf/move-word-backward state))
 (defcommand beginning-of-buffer "Move point to the start of the buffer." [state] (buf/move-buffer-start state))
 (defcommand end-of-buffer "Move point to the end of the buffer." [state] (buf/move-buffer-end state))
+(defcommand forward-paragraph "Move point past the current paragraph." [state] (buf/move-paragraph-forward state))
+(defcommand backward-paragraph "Move point to before the current paragraph." [state] (buf/move-paragraph-backward state))
 
 (def page-size (atom 20))
 
 (defcommand scroll-up-command "Scroll forward (page down)." [state] (buf/page-move state 1 @page-size))
 (defcommand scroll-down-command "Scroll backward (page up)." [state] (buf/page-move state -1 @page-size))
+
+(defcommand recenter
+  "Scroll so point sits in the middle of the window (C-l). Commands don't
+   know the window height -- the :recenter flag is consumed by
+   legmacs.render/scroll-to-fit, which does."
+  [state]
+  (assoc state :recenter true))
+
+(defcommand goto-line
+  "Prompt for a line number and move point there (M-g g)."
+  [state]
+  (mb/open state "Goto line: "
+           (fn [state input]
+             (let [n (try (parse-long (string/trim input)) (catch e nil))]
+               (if n
+                 (-> state
+                     (assoc :cursor-row (buf/clamp (dec n) 0 (dec (buf/line-count state)))
+                            :goal-col nil)
+                     buf/clamp-cursor)
+                 (set-message state (str "Not a line number: " input)))))))
 
 ;; --- editing -----------------------------------------------------------
 
@@ -39,6 +62,8 @@
 (defcommand delete-backward-char "Delete the character before point." [state] (buf/delete-char-backward state))
 (defcommand kill-line "Kill text from point to end of line." [state] (buf/kill-line state))
 (defcommand kill-whole-line "Kill the entire current line." [state] (buf/kill-whole-line state))
+(defcommand kill-word "Kill from point to the end of the next word." [state] (buf/kill-word state))
+(defcommand backward-kill-word "Kill from the start of the previous word to point." [state] (buf/backward-kill-word state))
 (defcommand yank "Insert the most recently killed text." [state] (buf/yank state))
 (defcommand undo "Undo the last change." [state] (buf/undo state))
 (defcommand redo "Redo the last undone change." [state] (buf/redo state))
@@ -179,6 +204,67 @@
                            (if-let [c (nth (get-in state [:minibuffer :candidates]) idx nil)]
                              (assoc state :cursor-row (:row c) :cursor-col (:col c))
                              state))})))
+
+;; --- replace ---------------------------------------------------------------
+
+(defn- count-occurrences [s needle]
+  (loop [i 0, n 0]
+    (let [j (string/index-of s needle i)]
+      (if j
+        (recur (+ j (count needle)) (inc n))
+        n))))
+
+(defcommand replace-string
+  "Replace every occurrence of a string from point to the end of the
+   buffer, prompting for the string and its replacement (M-%). Replaces
+   unconditionally -- there is no per-match querying (yet), which is why
+   the echo message counts what it did."
+  [state]
+  (if-not (buf/writable? state)
+    (set-message state "Buffer is read-only")
+    (mb/open state "Replace string: "
+             (fn [state from]
+               (if (string/blank? from)
+                 state
+                 (mb/open state (str "Replace \"" from "\" with: ")
+                          (fn [state to]
+                            (let [{:keys [lines cursor-row cursor-col]} state
+                                  cur (nth lines cursor-row)
+                                  head (subs cur 0 cursor-col)
+                                  tail (subs cur cursor-col)
+                                  rest-lines (subvec lines (inc cursor-row))
+                                  total (+ (count-occurrences tail from)
+                                           (reduce + 0 (map #(count-occurrences % from) rest-lines)))]
+                              (if (zero? total)
+                                (set-message state (str "No occurrences of \"" from "\""))
+                                (let [lines* (vec (concat (subvec lines 0 cursor-row)
+                                                          [(str head (string/replace tail from to))]
+                                                          (map #(string/replace % from to) rest-lines)))]
+                                  (-> (buf/push-undo state)
+                                      (assoc :lines lines* :modified? true)
+                                      buf/clamp-cursor
+                                      (set-message (format "Replaced %d occurrence%s"
+                                                           total (if (= 1 total) "" "s"))))))))))))))
+
+;; --- shell -----------------------------------------------------------------
+
+(defcommand shell-command
+  "Prompt for a shell command, run it (blocking -- the editor waits), and
+   show its output in the echo area (M-!). stdout wins; stderr shows only
+   when there is no stdout."
+  [state]
+  (mb/open state "Shell command: "
+           (fn [state input]
+             (if (string/blank? input)
+               state
+               (let [res (os/sh "sh" "-c" input)
+                     out (:out res)
+                     err (:err res)
+                     text (cond
+                            (not (string/blank? out)) out
+                            (not (string/blank? err)) err
+                            :else (str "(Shell command exited " (:exit res) " with no output)"))]
+                 (set-message state (string/trim text)))))))
 
 ;; --- minibuffer y-or-n ----------------------------------------------------
 

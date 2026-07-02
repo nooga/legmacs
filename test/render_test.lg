@@ -209,3 +209,17 @@
           out (r/frame s 40 12)]
       (is (string/includes? out (get r/fg-color-for :paren-match)))
       (is (string/includes? out (get r/bg-color-for :paren-match))))))
+
+(deftest recenter-centers-point
+  (testing "the :recenter flag centers point in the window and is consumed"
+    (let [s (-> (buf/new-state nil (vec (map str (range 100))))
+                (assoc :cursor-row 50 :recenter true)
+                (fit 80 24))]
+      (is (= 39 (:scroll-row s)))                         ; 50 - (22/2)
+      (is (nil? (:recenter s)))))
+
+  (testing "recentering near the top clamps at zero"
+    (let [s (-> (buf/new-state nil (vec (map str (range 100))))
+                (assoc :cursor-row 3 :recenter true)
+                (fit 80 24))]
+      (is (= 0 (:scroll-row s))))))

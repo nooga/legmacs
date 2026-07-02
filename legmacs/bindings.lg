@@ -18,10 +18,12 @@
    "C-p" :previous-line       "up" :previous-line
    "C-a" :move-beginning-of-line "home" :move-beginning-of-line
    "C-e" :move-end-of-line       "end" :move-end-of-line
-   "M-f" :forward-word
-   "M-b" :backward-word
-   "M-<" :beginning-of-buffer
-   "M->" :end-of-buffer
+   "M-f" :forward-word           "C-right" :forward-word    "M-right" :forward-word
+   "M-b" :backward-word          "C-left" :backward-word    "M-left" :backward-word
+   "M-<" :beginning-of-buffer    "C-home" :beginning-of-buffer
+   "M->" :end-of-buffer          "C-end" :end-of-buffer
+   "M-}" :forward-paragraph      "C-down" :forward-paragraph
+   "M-{" :backward-paragraph     "C-up" :backward-paragraph
    "C-v" :scroll-up-command      "pagedown" :scroll-up-command
    "M-v" :scroll-down-command    "pageup" :scroll-down-command
 
@@ -31,6 +33,8 @@
    "DEL" :delete-backward-char
    "C-k" :kill-line
    "M-k" :kill-whole-line
+   "M-d" :kill-word              "C-delete" :kill-word
+   "M-DEL" :backward-kill-word
    "C-y" :yank
    "C-_" :undo                   "C-x u" :undo
    "M-_" :redo
@@ -42,8 +46,14 @@
    "M-w" :copy-region-as-kill
    "C-x C-x" :exchange-point-and-mark
 
-   ;; search
+   ;; search / replace / jump
    "C-s" :swiper
+   "M-%" :replace-string
+   "M-g g" :goto-line             "M-g M-g" :goto-line
+   "C-l" :recenter
+
+   ;; shell
+   "M-!" :shell-command
 
    ;; files
    "C-x C-s" :save-buffer

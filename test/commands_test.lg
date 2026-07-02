@@ -212,3 +212,63 @@
   (testing "next-buffer / previous-buffer just signal the op; legmacs.buffers does the cycling"
     (is (= {:op :next} (:buffer-command (c/next-buffer (buf/new-state nil ["x"])))))
     (is (= {:op :prev} (:buffer-command (c/previous-buffer (buf/new-state nil ["x"])))))))
+
+(deftest goto-line-jumps-and-clamps
+  (testing "goto-line moves point to the requested line, clamped to the buffer"
+    (let [s (buf/new-state nil ["a" "b" "c" "d"])
+          s (mb/submit (type-text (c/goto-line s) "3"))]
+      (is (not (mb/active? s)))
+      (is (= 2 (:cursor-row s))))
+    (let [s (buf/new-state nil ["a" "b"])
+          s (mb/submit (type-text (c/goto-line s) "99"))]
+      (is (= 1 (:cursor-row s)))))
+
+  (testing "garbage input leaves point alone, with a message"
+    (let [s (buf/new-state nil ["a" "b"])
+          s (mb/submit (type-text (c/goto-line s) "wat"))]
+      (is (= 0 (:cursor-row s)))
+      (is (string/includes? (:message s) "Not a line number")))))
+
+(deftest replace-string-replaces-from-point
+  (testing "all occurrences from point forward are replaced, count reported, undoable"
+    (let [s (buf/new-state nil ["aaa bbb" "bbb ccc bbb"])
+          s (mb/submit (type-text (c/replace-string s) "bbb"))
+          s (mb/submit (type-text s "XY"))]
+      (is (= ["aaa XY" "XY ccc XY"] (:lines s)))
+      (is (= "Replaced 3 occurrences" (:message s)))
+      (is (:modified? s))
+      (is (= ["aaa bbb" "bbb ccc bbb"] (:lines (buf/undo s))))))
+
+  (testing "occurrences before point are left alone"
+    (let [s (assoc (buf/new-state nil ["bbb bbb"]) :cursor-col 4)
+          s (mb/submit (type-text (c/replace-string s) "bbb"))
+          s (mb/submit (type-text s "X"))]
+      (is (= ["bbb X"] (:lines s)))))
+
+  (testing "no occurrences -> just a message"
+    (let [s (buf/new-state nil ["aaa"])
+          s (mb/submit (type-text (c/replace-string s) "zzz"))
+          s (mb/submit (type-text s "X"))]
+      (is (= ["aaa"] (:lines s)))
+      (is (string/includes? (:message s) "No occurrences"))))
+
+  (testing "read-only buffers refuse before prompting"
+    (let [s (assoc (buf/new-state nil ["aaa"]) :read-only? true)
+          s (c/replace-string s)]
+      (is (not (mb/active? s)))
+      (is (= "Buffer is read-only" (:message s))))))
+
+(deftest shell-command-shows-output
+  (testing "stdout lands in the echo area"
+    (let [s (buf/new-state nil [""])
+          s (mb/submit (type-text (c/shell-command s) "echo hello"))]
+      (is (= "hello" (:message s)))))
+
+  (testing "stderr shows when there is no stdout"
+    (let [s (buf/new-state nil [""])
+          s (mb/submit (type-text (c/shell-command s) "echo oops 1>&2"))]
+      (is (= "oops" (:message s))))))
+
+(deftest recenter-sets-the-flag
+  (testing "recenter marks the state; legmacs.render/scroll-to-fit consumes it"
+    (is (:recenter (c/recenter (buf/new-state nil ["x"]))))))
