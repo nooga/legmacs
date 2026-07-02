@@ -137,6 +137,34 @@ When folding shared fields back, `put-current` must `get` each one
 explicitly rather than `select-keys` + `merge` — a command that `dissoc`s a
 shared key (instead of `assoc`-ing it to nil) would otherwise silently fail
 to clear it on the workspace (this was a real, previously-shipped bug).
+The same trap applies to the per-window view slice: `legmacs.windows/
+view-of` uses explicit `get` for the same reason (`scroll-to-fit`
+*dissoc*es `:recenter`/`:scroll-anchor`).
+
+**Windows (splits) are the same wrapping trick one level up.** The
+workspace holds a window tree (`legmacs.windows` — pure data + layout
+geometry, knows nothing of buffer contents or rendering): leaves show a
+buffer through a per-window `:view` (cursor/scroll — Emacs window-point,
+so two windows on one buffer diverge), split nodes stack `:below` or sit
+`:beside` with proportional integer weights (a terminal resize re-flows
+the same shape). `bufs/current` flattens the *active window's*
+buffer+view; window commands are just more `:buffer-command` ops
+(`:split`, `:other-window`, `:delete-window`, `:delete-other-windows`),
+the buffer-switching ops retarget the active window, and `:kill`
+re-points any window showing the dead buffer. `:current` (the active
+buffer id) is re-derived from the active window after every fold — never
+edited independently (`main.lg`'s `build-workspace` focuses buffer 0 via
+a real `:switch` op for exactly this reason). Rendering is the one layer
+that sees all windows per frame: `render/prepare-workspace` runs the
+scroll pass per window (full scroll-to-fit only for the active one;
+inactive views are just clamped — a window you're not in mustn't scroll
+on its own), then `render/workspace-frame` draws each rectangle with its
+own mode line (dimmed when inactive) and fills `│` divider columns
+between side-by-side windows. `windows/layout` partitions its area
+*exactly* (children plus dividers = full width/height), preserving the
+every-cell-written-no-clear frame invariant. The flat single-state
+`render/frame` still exists and must stay byte-identical to a one-window
+workspace frame — there's a test asserting exactly that.
 
 Full per-file breakdown and the complete default keymap are in
 [README.md](README.md); read it before making structural changes.
@@ -179,6 +207,24 @@ Full per-file breakdown and the complete default keymap are in
   control-byte strings with `(char code)` at runtime rather than writing
   the escape literally in source; follow that pattern rather than typing
   a unicode string escape for a control character directly into a file.
+- **Reducing over an empty `(map f (concat ...))` calls the reducing fn
+  once with nil.** let-go laziness bug: `(reduce f init (map g (concat
+  [] [])))` invokes `f` with a nil element even though `seq`/`count`/`vec`
+  all agree the sequence is empty — `(map g [])` and `(concat [] [])` on
+  their own reduce fine; it's specifically map-over-concat. Materialize
+  with `mapv`/`vec` before reducing (see the span conversion in
+  `legmacs.render`'s text-row, which hit this in production shape:
+  `style-array` reduces over converted span lists that are usually empty).
+- **Buffer text must never reach the frame raw.** A literal tab byte
+  written to the terminal doesn't paint cells — it *jumps* the cursor to
+  the next tab stop, so whatever the previous frame had there shows
+  through (looks like a refresh/scrolling bug; really a broken
+  every-cell-painted invariant). Other control bytes are worse (a raw ESC
+  in a file would execute as ANSI mid-frame). `legmacs.render/line-display`
+  is the chokepoint: it expands tabs to tab stops and control bytes to
+  caret notation *with a char-index → display-column map*, and everything
+  positional (highlight spans, cursor placement, `:scroll-col` — which is
+  a display column) must go through that mapping, not raw char indices.
 - Ctrl-Space is sent as a NUL byte (0x00) by terminals, and BEL (0x07,
   also literally Ctrl-G) doubles as `term/read-key`'s SIGWINCH wake-up —
   `legmacs.keys` has to special-case both; see its docstrings before

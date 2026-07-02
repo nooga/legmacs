@@ -1,0 +1,226 @@
+;; legmacs.windows — the window tree: how one terminal frame is divided
+;; into split panes ("windows" in the Emacs sense), each showing some
+;; buffer through its own view (cursor + scroll position).
+;;
+;; Pure data and geometry only: nothing here knows what a buffer contains,
+;; how anything renders, or that a workspace exists. legmacs.buffers owns
+;; which buffer ids exist and folds window commands into this tree;
+;; legmacs.render asks `layout` where each window lands on screen and
+;; draws the dividers.
+;;
+;; A node is either a leaf --
+;;   {:win-id N :buffer buffer-id :view {...}}
+;; or a split --
+;;   {:split :below|:beside :children [node ...] :sizes [weight ...]}
+;;
+;; :below stacks its children top-to-bottom (C-x 2); :beside places them
+;; side by side (C-x 3). :sizes are integer *weights*, not cell counts:
+;; `layout` re-apportions them into whatever space the terminal has this
+;; frame, so resizing the terminal just re-flows the same proportions.
+;;
+;; A leaf's :view is the per-window slice of editor state (see view-keys):
+;; two windows showing the same buffer each keep their own cursor and
+;; scroll, the way Emacs's window-point works.
+
+(ns legmacs.windows)
+
+(def view-keys
+  "The per-window slice of the flat editor state: everything about
+   *looking at* a buffer rather than the buffer itself. :scroll-anchor and
+   :recenter belong here because they are scroll bookkeeping consumed by
+   legmacs.render/scroll-to-fit."
+  [:cursor-row :cursor-col :goal-col :scroll-row :scroll-col :scroll-anchor :recenter])
+
+(defn view-of
+  "Extract the per-window view fields from a flat or buffer state.
+   Explicit get per key, not select-keys: scroll-to-fit *dissoc*es
+   :recenter/:scroll-anchor rather than assoc-ing them to nil, and a view
+   built with select-keys would silently keep the stale values on merge
+   (the same trap legmacs.buffers/put-current documents for shared keys)."
+  [state]
+  (reduce (fn [m k] (assoc m k (get state k))) {} view-keys))
+
+(defn leaf? [node] (contains? node :win-id))
+
+(defn single
+  "A tree of one window, `win-id`, showing `buffer-id` through `view`."
+  [win-id buffer-id view]
+  {:win-id win-id :buffer buffer-id :view view})
+
+(defn leaf-ids
+  "Every window id in the tree, depth-first -- top-to-bottom,
+   left-to-right visual order, which is also the C-x o cycling order."
+  [node]
+  (if (leaf? node)
+    [(:win-id node)]
+    (vec (mapcat leaf-ids (:children node)))))
+
+(defn find-leaf
+  "The leaf with :win-id `wid`, or nil."
+  [node wid]
+  (if (leaf? node)
+    (when (= wid (:win-id node)) node)
+    (some #(find-leaf % wid) (:children node))))
+
+(defn update-leaf
+  "Replace the leaf with :win-id `wid` by (f leaf). Everything else is
+   structurally shared."
+  [node wid f]
+  (if (leaf? node)
+    (if (= wid (:win-id node)) (f node) node)
+    (assoc node :children (mapv #(update-leaf % wid f) (:children node)))))
+
+(defn- index-of [coll x]
+  (loop [i 0, xs (seq coll)]
+    (cond (empty? xs) nil
+          (= (first xs) x) i
+          :else (recur (inc i) (rest xs)))))
+
+(defn next-leaf-id
+  "The window `delta` steps from `wid` in cycling order, wrapping."
+  [tree wid delta]
+  (let [ids (leaf-ids tree)
+        n (count ids)
+        idx (or (index-of ids wid) 0)]
+    (nth ids (mod (+ idx delta) n))))
+
+(defn- new-sibling
+  "The fresh window a split creates: same buffer, same view -- splitting
+   shows the same spot twice, then the two views diverge."
+  [leaf new-id]
+  (assoc leaf :win-id new-id))
+
+(defn- direct-child-index
+  "The position of leaf `wid` among `node`'s immediate children, or nil
+   if it isn't one (it may still live deeper in the tree)."
+  [node wid]
+  (loop [i 0]
+    (if (>= i (count (:children node)))
+      nil
+      (let [c (nth (:children node) i)]
+        (if (and (leaf? c) (= wid (:win-id c)))
+          i
+          (recur (inc i)))))))
+
+(defn split-leaf
+  "Split window `wid` along `dir` (:below or :beside), the new window
+   (id `new-id`) taking the second half. When `wid`'s parent already
+   splits the same way the new window joins it as a sibling instead of
+   nesting -- C-x 2 C-x 2 gives three stacked windows, not a lopsided
+   tree. Weights double on the way so halving stays integral."
+  [node wid dir new-id]
+  (cond
+    (leaf? node)
+    (if (= wid (:win-id node))
+      {:split dir :children [node (new-sibling node new-id)] :sizes [1 1]}
+      node)
+
+    :else
+    (let [idx (direct-child-index node wid)]
+      (if (and idx (= dir (:split node)))
+        (let [sizes (mapv #(* 2 %) (:sizes node))
+              s (nth sizes idx)
+              half (quot s 2)
+              c (nth (:children node) idx)]
+          (assoc node
+                 :children (vec (concat (subvec (:children node) 0 idx)
+                                        [c (new-sibling c new-id)]
+                                        (subvec (:children node) (inc idx))))
+                 :sizes (vec (concat (subvec sizes 0 idx)
+                                     [(- s half) half]
+                                     (subvec sizes (inc idx))))))
+        (assoc node :children (mapv #(split-leaf % wid dir new-id) (:children node)))))))
+
+(defn delete-leaf
+  "Remove window `wid`, its space going to its siblings. A split left
+   with a single child is spliced out (the child takes its place), so the
+   tree never accumulates degenerate one-child splits. Returns nil if
+   `wid` was the tree's only window -- callers refuse that case."
+  [node wid]
+  (if (leaf? node)
+    (when (not= wid (:win-id node)) node)
+    (let [kept (vec (keep (fn [[c s]] (when-let [c* (delete-leaf c wid)] [c* s]))
+                          (map vector (:children node) (:sizes node))))]
+      (cond
+        (empty? kept) nil
+        (= 1 (count kept)) (ffirst kept)
+        :else (assoc node
+                     :children (mapv first kept)
+                     :sizes (mapv second kept))))))
+
+(defn remap-buffer
+  "Point every window showing buffer `old-id` at `new-id` instead, with
+   `new-view` as its view -- what keeps windows valid when a buffer is
+   killed out from under them."
+  [node old-id new-id new-view]
+  (if (leaf? node)
+    (if (= old-id (:buffer node))
+      (assoc node :buffer new-id :view new-view)
+      node)
+    (assoc node :children (mapv #(remap-buffer % old-id new-id new-view) (:children node)))))
+
+;; --- geometry ----------------------------------------------------------
+
+(defn- apportion
+  "Split `total` cells across `weights` proportionally, exactly (the
+   pieces always sum to `total` -- layout must partition the screen with
+   no gap and no overlap). When `total` has room, every piece gets at
+   least `min-size`, taken from the largest pieces; on a terminal too
+   small even for that, proportionality wins and rendering just gets
+   cramped rather than anything crashing."
+  [total weights min-size]
+  (let [k (count weights)
+        sum (reduce + weights)
+        raw (vec (map #(quot (* total %) sum) weights))
+        extra (- total (reduce + raw))
+        sized (vec (map-indexed (fn [i v] (+ v (if (< i extra) 1 0))) raw))]
+    (if (> (* min-size k) total)
+      sized
+      (loop [v sized]
+        (let [small (some (fn [i] (when (< (nth v i) min-size) i)) (range k))]
+          (if (nil? small)
+            v
+            (let [big (reduce (fn [a b] (if (> (nth v b) (nth v a)) b a)) 0 (range k))]
+              (recur (-> v (update small inc) (update big dec))))))))))
+
+(def min-window-rows 2)  ;; one text row plus the window's own mode line
+(def min-window-cols 5)  ;; room for the gutter plus a sliver of text
+
+(defn layout
+  "Where every window lands on a `w` x `h` cell region anchored at `x`,`y`
+   (0-based): {:windows [{:win-id :x :y :w :h} ...] :dividers [...]}.
+   :below children stack with no separator row of their own -- each
+   window's mode line is the separator, like Emacs. :beside children get
+   a one-column gap between them, reported in :dividers as {:x :y :h} for
+   legmacs.render to fill with │. Children widths plus dividers always
+   partition `w` exactly (same for heights and `h`), preserving render's
+   every-cell-written-every-frame invariant."
+  [node x y w h]
+  (cond
+    (leaf? node)
+    {:windows [{:win-id (:win-id node) :x x :y y :w w :h h}] :dividers []}
+
+    (= :below (:split node))
+    (let [hs (apportion h (:sizes node) min-window-rows)]
+      (loop [cs (:children node), hs hs, cy y, acc {:windows [] :dividers []}]
+        (if (empty? cs)
+          acc
+          (let [sub (layout (first cs) x cy w (first hs))]
+            (recur (rest cs) (rest hs) (+ cy (first hs))
+                   {:windows (into (:windows acc) (:windows sub))
+                    :dividers (into (:dividers acc) (:dividers sub))})))))
+
+    :else ;; :beside
+    (let [k (count (:children node))
+          ws (apportion (- w (dec k)) (:sizes node) min-window-cols)]
+      (loop [cs (:children node), ws ws, cx x, i 0, acc {:windows [] :dividers []}]
+        (if (empty? cs)
+          acc
+          (let [cw (first ws)
+                sub (layout (first cs) cx y cw h)
+                acc {:windows (into (:windows acc) (:windows sub))
+                     :dividers (into (:dividers acc) (:dividers sub))}
+                acc (if (< i (dec k))
+                      (assoc acc :dividers (conj (:dividers acc) {:x (+ cx cw) :y y :h h}))
+                      acc)]
+            (recur (rest cs) (rest ws) (+ cx cw 1) (inc i) acc)))))))

@@ -118,6 +118,85 @@
           ws (bufs/put-current ws (assoc (bufs/current ws) :quit? true))]
       (is (:quit? ws)))))
 
+;; --- windows through the same put-current fold --------------------------
+
+(defn- send [ws cmd] (bufs/put-current ws (assoc (bufs/current ws) :buffer-command cmd)))
+
+(deftest split-adds-a-window-on-the-same-buffer
+  (testing "C-x 2's op leaves focus in the original window, both showing the buffer"
+    (let [ws (bufs/new-workspace (buf/new-state "a.txt" ["one" "two"]))
+          ws (send ws {:op :split :dir :below})]
+      (is (= 2 (:window-count (bufs/current ws))))
+      (is (= 0 (:active-window ws)))
+      (is (= ["one" "two"] (:lines (bufs/flat-for-window ws 1)))))))
+
+(deftest window-views-diverge-after-a-split
+  (testing "moving point in one window doesn't move it in the other"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a" "b" "c"]))
+          ws (send ws {:op :split :dir :beside})
+          ws (bufs/put-current ws (assoc (bufs/current ws) :cursor-row 2))]
+      (is (= 2 (:cursor-row (bufs/current ws))))
+      (let [ws (send ws {:op :other-window})]
+        (is (= 1 (:active-window ws)))
+        (is (= 0 (:cursor-row (bufs/current ws))))
+        ;; ...and the first window still remembers row 2
+        (is (= 2 (:cursor-row (bufs/flat-for-window ws 0))))))))
+
+(deftest other-window-cycles-and-tracks-current-buffer
+  (testing "switching windows retargets :current at that window's buffer"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+          ws (send ws {:op :split :dir :below})
+          ws (send ws {:op :other-window})
+          ws (send ws {:op :switch :id 0})  ;; no-op switch, still buffer 0
+          ws (send ws {:op :open-new :state (buf/new-state nil ["b"])})]
+      ;; window 1 (active) now shows the new buffer; window 0 kept buffer 0
+      (is (= ["b"] (:lines (bufs/current ws))))
+      (is (= ["a"] (:lines (bufs/flat-for-window ws 0))))
+      (let [ws (send ws {:op :other-window})]
+        (is (= 0 (:active-window ws)))
+        (is (= 0 (:current ws)))
+        (is (= ["a"] (:lines (bufs/current ws))))))))
+
+(deftest delete-window-gives-way-to-the-next-one
+  (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+        ws (send ws {:op :split :dir :below})
+        ws (send ws {:op :delete-window})]
+    (is (= 1 (:window-count (bufs/current ws))))
+    (is (= 1 (:active-window ws)))
+    (is (= ["a"] (:lines (bufs/current ws))))))
+
+(deftest delete-window-refuses-to-remove-the-sole-window
+  (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+        ws (send ws {:op :delete-window})]
+    (is (= 1 (:window-count (bufs/current ws))))))
+
+(deftest delete-other-windows-keeps-only-the-active-one
+  (let [ws (bufs/new-workspace (buf/new-state nil ["a"]))
+        ws (send ws {:op :split :dir :below})
+        ws (send ws {:op :split :dir :beside})
+        ws (send ws {:op :other-window})
+        ws (send ws {:op :delete-other-windows})]
+    (is (= 1 (:window-count (bufs/current ws))))
+    (is (= ["a"] (:lines (bufs/current ws))))))
+
+(deftest killing-a-buffer-repoints-every-window-showing-it
+  (testing "two windows on the killed buffer both land on the replacement"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["keep"]))
+          ws (send ws {:op :open-new :state (buf/new-state nil ["doomed"])})
+          ws (send ws {:op :split :dir :below})   ;; both windows show buffer 1
+          ws (send ws {:op :kill :id 1 :fallback (buf/new-state nil ["fresh"])})]
+      (is (= 2 (:window-count (bufs/current ws))))
+      (is (= ["keep"] (:lines (bufs/current ws))))
+      (is (= ["keep"] (:lines (bufs/flat-for-window ws 1)))))))
+
+(deftest switching-a-window-adopts-the-buffers-remembered-view
+  (testing "a buffer re-shown in a window resumes at its stored cursor"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["a" "b" "c"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :cursor-row 2))
+          ws (send ws {:op :open-new :state (buf/new-state nil ["other"])})
+          ws (send ws {:op :switch :id 0})]
+      (is (= 2 (:cursor-row (bufs/current ws)))))))
+
 (deftest clearing-a-shared-field-by-dissoc-actually-clears-it
   (testing "dissoc-ing a shared key (not just assoc-ing it to nil) still clears it on the workspace
             -- this is exactly what dispatch does to dismiss an overlay"

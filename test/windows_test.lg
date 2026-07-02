@@ -1,0 +1,113 @@
+(ns test.windows-test
+  (:require [test :refer :all]
+            [legmacs.windows :as win]))
+
+(defn- tree-2-beside []
+  (win/split-leaf (win/single 0 0 {:cursor-row 0}) 0 :beside 1))
+
+(deftest split-makes-a-two-leaf-split
+  (testing "splitting the sole window yields a split with the original and a clone"
+    (let [t (win/split-leaf (win/single 0 7 {:cursor-row 3}) 0 :below 1)]
+      (is (= :below (:split t)))
+      (is (= [0 1] (win/leaf-ids t)))
+      ;; the new window shows the same buffer from the same view
+      (is (= 7 (:buffer (win/find-leaf t 1))))
+      (is (= {:cursor-row 3} (:view (win/find-leaf t 1)))))))
+
+(deftest same-direction-split-flattens-instead-of-nesting
+  (testing "C-x 2 C-x 2 gives three stacked siblings, not a nested tree"
+    (let [t (win/split-leaf (win/single 0 0 {}) 0 :below 1)
+          t (win/split-leaf t 0 :below 2)]
+      (is (= 3 (count (:children t))))
+      (is (= [0 2 1] (win/leaf-ids t)))
+      (is (every? win/leaf? (:children t))))))
+
+(deftest cross-direction-split-nests
+  (testing "splitting a stacked window sideways nests a :beside split inside the :below one"
+    (let [t (win/split-leaf (win/single 0 0 {}) 0 :below 1)
+          t (win/split-leaf t 0 :beside 2)]
+      (is (= :below (:split t)))
+      (is (= :beside (:split (first (:children t)))))
+      (is (= [0 2 1] (win/leaf-ids t))))))
+
+(deftest delete-splices-single-child-splits-away
+  (testing "deleting one of two windows collapses the split back to a plain leaf"
+    (let [t (win/delete-leaf (tree-2-beside) 1)]
+      (is (win/leaf? t))
+      (is (= 0 (:win-id t)))))
+
+  (testing "deleting the middle of three siblings keeps the split with two"
+    (let [t (win/split-leaf (win/single 0 0 {}) 0 :below 1)
+          t (win/split-leaf t 0 :below 2)
+          t (win/delete-leaf t 2)]
+      (is (= [0 1] (win/leaf-ids t)))
+      (is (= 2 (count (:sizes t))))))
+
+  (testing "deleting the only window returns nil (callers refuse this case)"
+    (is (nil? (win/delete-leaf (win/single 0 0 {}) 0)))))
+
+(deftest next-leaf-id-cycles-in-visual-order
+  (let [t (win/split-leaf (tree-2-beside) 1 :below 2)]
+    ;; layout order: 0 | (1 above 2)
+    (is (= [0 1 2] (win/leaf-ids t)))
+    (is (= 1 (win/next-leaf-id t 0 1)))
+    (is (= 2 (win/next-leaf-id t 1 1)))
+    (is (= 0 (win/next-leaf-id t 2 1)))
+    (is (= 2 (win/next-leaf-id t 0 -1)))))
+
+(deftest remap-buffer-repoints-every-affected-leaf
+  (testing "all windows on the dead buffer move to the replacement, others untouched"
+    (let [t (win/split-leaf (tree-2-beside) 1 :below 2)
+          t (win/update-leaf t 2 #(assoc % :buffer 9))
+          t (win/remap-buffer t 0 5 {:cursor-row 0})]
+      (is (= 5 (:buffer (win/find-leaf t 0))))
+      (is (= 5 (:buffer (win/find-leaf t 1))))
+      (is (= 9 (:buffer (win/find-leaf t 2)))))))
+
+(deftest layout-partitions-the-region-exactly
+  (testing "beside: children widths plus one divider column tile the full width"
+    (let [{:keys [windows dividers]} (win/layout (tree-2-beside) 0 0 81 24)
+          [a b] windows]
+      (is (= 1 (count dividers)))
+      (is (= (:x (first dividers)) (+ (:x a) (:w a))))
+      (is (= (:x b) (inc (:x (first dividers)))))
+      (is (= 81 (+ (:w a) 1 (:w b))))
+      (is (= 24 (:h a) (:h b)))))
+
+  (testing "below: children heights tile the full height with no divider rows"
+    (let [t (win/split-leaf (win/single 0 0 {}) 0 :below 1)
+          {:keys [windows dividers]} (win/layout t 0 0 80 23)
+          [a b] windows]
+      (is (= [] dividers))
+      (is (= 0 (:y a)))
+      (is (= (:y b) (+ (:y a) (:h a))))
+      (is (= 23 (+ (:h a) (:h b)))))))
+
+(deftest layout-respects-nested-splits
+  (testing "a window split sideways inside a stack gets the stack row's height"
+    (let [t (win/split-leaf (win/single 0 0 {}) 0 :below 1)
+          t (win/split-leaf t 0 :beside 2)
+          {:keys [windows dividers]} (win/layout t 0 0 80 24)
+          by-id (into {} (map (fn [r] [(:win-id r) r]) windows))]
+      (is (= 3 (count windows)))
+      ;; 0 and 2 share the top band; 1 spans the bottom full-width
+      (is (= (:h (get by-id 0)) (:h (get by-id 2))))
+      (is (= 80 (:w (get by-id 1))))
+      (is (= 1 (count dividers)))
+      (is (= (:h (get by-id 0)) (:h (first dividers)))))))
+
+(deftest layout-enforces-minimum-sizes-when-there-is-room
+  (testing "lopsided weights still leave every window at least the minimum"
+    (let [t {:split :below
+             :children [(win/single 0 0 {}) (win/single 1 0 {})]
+             :sizes [100 1]}
+          {:keys [windows]} (win/layout t 0 0 80 24)]
+      (is (every? #(>= (:h %) win/min-window-rows) windows))
+      (is (= 24 (reduce + (map :h windows)))))))
+
+(deftest view-of-clears-keys-the-state-dissoced
+  (testing "a state that dissoc-ed :recenter still yields nil for it (not a stale leftover)"
+    (let [v (win/view-of {:cursor-row 2 :cursor-col 1})]
+      (is (= 2 (:cursor-row v)))
+      (is (nil? (:recenter v)))
+      (is (contains? v :recenter)))))

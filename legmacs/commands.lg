@@ -424,6 +424,48 @@
   [state]
   (assoc state :buffer-command {:op :prev}))
 
+;; --- windows -----------------------------------------------------------
+;;
+;; Same signalling pattern as the buffer commands above: a command only
+;; sees the flat current-window view, so reshaping the window tree is a
+;; :buffer-command that the workspace fold (legmacs.buffers) applies. The
+;; read-only :window-count on the flat state exists so these can report
+;; the degenerate cases themselves instead of emitting an op that would
+;; be silently refused.
+
+(defcommand split-window-below
+  "Split the current window in two, one above the other (C-x 2). Both
+   halves show this buffer, starting from the same spot; their cursors
+   and scrolling diverge from there."
+  [state]
+  (assoc state :buffer-command {:op :split :dir :below}))
+
+(defcommand split-window-right
+  "Split the current window in two, side by side (C-x 3)."
+  [state]
+  (assoc state :buffer-command {:op :split :dir :beside}))
+
+(defcommand other-window
+  "Move to the next window (C-x o), cycling top-to-bottom, left-to-right."
+  [state]
+  (if (> (:window-count state 1) 1)
+    (assoc state :buffer-command {:op :other-window})
+    (set-message state "No other window")))
+
+(defcommand delete-window
+  "Close the current window (C-x 0), its space going to a sibling. The
+   buffer stays open -- this is the opposite end of the leash from
+   kill-buffer."
+  [state]
+  (if (> (:window-count state 1) 1)
+    (assoc state :buffer-command {:op :delete-window})
+    (set-message state "Attempt to delete sole window")))
+
+(defcommand delete-other-windows
+  "Make the current window the only one (C-x 1)."
+  [state]
+  (assoc state :buffer-command {:op :delete-other-windows}))
+
 ;; --- misc ------------------------------------------------------------------
 
 (defcommand keyboard-quit

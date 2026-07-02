@@ -14,6 +14,8 @@ It's small. `scc` counts about 2,700 lines of Lisp for the whole editor. For
 that, it does a lot more than I expected it would when I started:
 
 - Emacs chords, kill ring, region, undo/redo, multiple buffers
+- window splits (`C-x 2` / `C-x 3`, mix and nest them), each window with
+  its own cursor and scroll, side-by-side ones separated by `│` dividers
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
 - syntax highlighting for let-go and Markdown, plus a spec-driven language

@@ -62,6 +62,13 @@
    "C-x C-q" :toggle-read-only
    "C-x C-c" :save-buffers-kill-terminal
 
+   ;; windows
+   "C-x 2" :split-window-below
+   "C-x 3" :split-window-right
+   "C-x o" :other-window
+   "C-x 0" :delete-window
+   "C-x 1" :delete-other-windows
+
    ;; buffers
    "C-x b" :switch-to-buffer
    "C-x C-b" :list-buffers

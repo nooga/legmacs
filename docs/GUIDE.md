@@ -74,11 +74,23 @@ not held together.
 | `C-x C-b` | list open buffers |
 | `C-x k` | kill (close) the current buffer |
 | `C-x <right>` / `C-x <left>` | cycle to the next / previous buffer |
+| `C-x 2` | split the current window in two, one above the other |
+| `C-x 3` | split the current window in two, side by side |
+| `C-x o` | move to the next window (cycles top-to-bottom, left-to-right) |
+| `C-x 0` | close the current window (the buffer stays open) |
+| `C-x 1` | make the current window the only one |
 | `C-x C-c` | quit (prompts if the current buffer has unsaved changes) |
 | `C-g` | cancel / quit-out-of-here |
 | `M-x` | run a command by name (`TAB` completes) |
 | `C-x C-q` | toggle the current buffer read-only |
 | `C-h` | show all key bindings (in a read-only `*Help*` buffer) |
+
+Files indented with real tabs (Go, Makefiles) display with each tab
+expanded to the next 4-column stop — `(reset! legmacs.render/tab-width 8)`
+in your init changes that — and any other control character in a file
+shows as caret notation (`^[`, `^M`, ...) rather than reaching the
+terminal raw. TAB the key still inserts spaces (`tab-insert`); this is
+about displaying what's already in the file.
 
 Completing prompts (`M-x`, `C-x C-f`, `C-x C-s`, `C-x C-w`, `C-x b`) show a
 live, vertico-style vertical list that narrows as you type. Matching is
@@ -110,15 +122,30 @@ buffer); the buffer mutation primitives in
 command (built-in or from your config) can modify a read-only buffer, while
 movement, scrolling, and search keep working.
 
-Multiple buffers, but still one window, no splits. `lg main.lg a.txt b.txt`
-opens both (the first one focused); `C-x C-f` on a new path opens another
-without touching whatever you were already editing, and on a path that's
-already open just switches to it rather than loading it twice. Buffer names
-are basenames (`a.txt`, not the full path), deduplicated like Emacs's if two
-open files share one (`a.txt`, `a.txt<2>`). Undo history, the mark, and
-paren-match are all per-buffer; the echo-area message, minibuffer, and the
-one shared clipboard are not, so they're exactly as visible switching buffers
-as they would be switching windows in something that had windows.
+Multiple buffers: `lg main.lg a.txt b.txt` opens both (the first one
+focused); `C-x C-f` on a new path opens another without touching whatever
+you were already editing, and on a path that's already open just switches
+to it rather than loading it twice. Buffer names are basenames (`a.txt`,
+not the full path), deduplicated like Emacs's if two open files share one
+(`a.txt`, `a.txt<2>`). Undo history, the mark, and paren-match are all
+per-buffer; the echo-area message, minibuffer, and the one shared
+clipboard are not, so they're exactly as visible switching buffers as they
+are switching windows.
+
+And multiple windows: `C-x 2` splits the current window into two stacked
+ones, `C-x 3` into two side-by-side ones (separated by a `│` divider), in
+any combination, resplit as deep as you like. `C-x o` cycles focus through
+them (only the active window's mode line renders bright; the terminal
+cursor is always in the active window), `C-x 0` closes the current one,
+`C-x 1` goes back to a single window. Splitting shows the same buffer
+twice; each window then keeps its own cursor and scroll position, Emacs
+window-point style, so you can hold two places in one file — or use
+`C-x b`/`C-x C-f` in one window to look at something else entirely.
+Windows are viewports, not owners: `C-x 0` never closes a buffer, and
+`C-x k` never closes a window (a window whose buffer was killed just
+shows another one). Sizes are proportional, so resizing the terminal
+re-flows the same split shape. Buffer switching (`C-x b`, `C-x <right>`,
+find-file) always acts on the active window and leaves the others alone.
 
 `C-SPC` sets the mark, then move point anywhere and the region between the
 two is highlighted. `C-w` cuts it, `M-w` copies it (either way it shares
@@ -422,8 +449,9 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (see `C-h`/`describe-bindings`). Highlight-only, like markdown-mode. |
 | [`legmacs/dispatch.lg`](../legmacs/dispatch.lg) | One key chord → a new editor state. Layers every active mode's keymap (minor modes, then major) over the global one; runs their `:after-command` hooks on the way out. |
 | [`legmacs/modeline.lg`](../legmacs/modeline.lg) | The mode-line's registry: named, ordered, independently-colorable segments plus a theme (bg/fg + separator), all plain data. `register-modeline-segment!`/`set-modeline-theme!` are the scripting surface; the built-in segments (buffer name, mode, position, ...) are registered the same way. |
-| [`legmacs/render.lg`](../legmacs/render.lg) | Editor state → one ANSI string per frame. A per-column fg/bg span compositor, so region highlight/paren-match/syntax colors can all coexist on one line; the mode line is a block compositor over `legmacs.modeline`'s segments instead. |
-| [`legmacs/buffers.lg`](../legmacs/buffers.lg) | Wraps a collection of buffers behind the exact same flat state shape everything above expects. See below. |
+| [`legmacs/render.lg`](../legmacs/render.lg) | Editor state → one ANSI string per frame. A per-column fg/bg span compositor, so region highlight/paren-match/syntax colors can all coexist on one line; the mode line is a block compositor over `legmacs.modeline`'s segments instead. Draws each window of the workspace into its own rectangle (per-window mode line, `│` dividers), the echo area under all of them. |
+| [`legmacs/windows.lg`](../legmacs/windows.lg) | The window tree: split panes as pure data (leaves show a buffer through a per-window view; splits stack `:below` or sit `:beside` with proportional weights) plus the layout geometry that turns the tree into screen rectangles and divider positions. |
+| [`legmacs/buffers.lg`](../legmacs/buffers.lg) | Wraps a collection of buffers — and the window tree showing them — behind the exact same flat state shape everything above expects. See below. |
 | [`main.lg`](../main.lg) | Wires it all up; the only place that touches the terminal. |
 
 The editor state is one plain map, threaded through a `loop`/`recur` in
@@ -447,8 +475,7 @@ exactly what dispatch already expects; `bufs/put-current` splits whatever
 comes back apart again. `main.lg`'s loop is just:
 
 ```clojure
-(let [flat (render! (bufs/current workspace))
-      workspace (bufs/put-current workspace flat)]
+(let [workspace (render! workspace)]
   ...
   (recur (bufs/put-current workspace (dispatch/dispatch (bufs/current workspace) chord))))
 ```
@@ -462,6 +489,36 @@ say so by setting `:buffer-command` on the state they return (e.g.
 workspace, and clears it. It's ordinary state, not a side channel, and
 it's the only new concept multiple buffers needed.
 
+### ...and windows are the same trick, one level up
+
+Splits reuse both halves of that design. The workspace holds one *window
+tree* ([`legmacs/windows.lg`](../legmacs/windows.lg)): each leaf is a
+window showing some buffer through its own `:view` — the cursor, scroll
+position, and scroll bookkeeping, i.e. everything about *looking at* a
+buffer rather than the buffer itself. That per-window view is what lets
+two windows show one buffer at two different spots (Emacs's window-point).
+`bufs/current` now flattens the *active window's* buffer-plus-view;
+`put-current` folds the view slice back into that window the same way it
+folds shared fields back onto the workspace. And the window commands are
+just more `:buffer-command` ops — `{:op :split :dir :below}`,
+`{:op :other-window}`, `{:op :delete-window}` — while the existing buffer
+ops (`:switch`, `:open-new`, ...) now mean "in the active window", and
+`:kill` re-points any window that showed the killed buffer. Dispatch and
+the whole command set still see one flat state and never learned windows
+exist.
+
+Rendering is the one layer that genuinely sees more than one window per
+frame: `render/prepare-workspace` runs the scroll-to-fit pass per window
+(full treatment for the active window, clamping for the rest — an
+inactive window shouldn't scroll on its own), and
+`render/workspace-frame` lays the tree out into rectangles
+(`windows/layout` — proportional weights, so a terminal resize re-flows
+the same shape), draws each window with its own mode line (dimmed when
+inactive), fills the `│` divider columns between side-by-side windows,
+and keeps the echo/minibuffer area global across the bottom. Every cell
+of every rectangle is still written every frame, so the no-clear,
+no-flicker invariant survives splits unchanged.
+
 ## Testing
 
 ```sh
@@ -470,8 +527,9 @@ lg test/run.lg
 
 ## Known limitations
 
-- One window: multiple buffers, but no splits, so you're always looking at
-  exactly one of them at a time.
+- Windows split and cycle, but there's no interactive *resizing* of an
+  existing split yet (`C-x ^`/`C-x {` style) — proportions are set by the
+  splits themselves.
 - `C-x C-c` only *saves* the current buffer. Other modified buffers get a
   warning (how many, not which ones) before it lets you quit anyway, but
   it won't save them for you, so switch to them and save individually first

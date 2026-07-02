@@ -3,7 +3,8 @@
             [string]
             [legmacs.buffer :as buf]
             [legmacs.modes :as modes]
-            [legmacs.render :as r]))
+            [legmacs.render :as r]
+            [legmacs.buffers :as bufs]))
 
 (deftest pad-right-behavior
   (testing "pads short strings, truncates long ones, leaves exact-width alone"
@@ -223,3 +224,103 @@
                 (assoc :cursor-row 3 :recenter true)
                 (fit 80 24))]
       (is (= 0 (:scroll-row s))))))
+
+;; --- multi-window frames ------------------------------------------------
+
+(deftest workspace-frame-draws-side-by-side-windows-with-a-divider
+  (testing "a :beside split shows both windows' text and a │ divider column"
+    (let [ws (bufs/new-workspace (buf/new-state "left.txt" ["left text here"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :split :dir :beside}))
+          ws (r/prepare-workspace ws 80 24)
+          out (r/workspace-frame ws 80 24)]
+      (is (string/includes? out "left text here"))
+      (is (string/includes? out "│"))
+      ;; both windows carry their own mode line naming the buffer
+      (is (<= 3 (count (string/split out "left.txt")))))))
+
+(deftest workspace-frame-stacked-windows-show-different-buffers
+  (testing "each window of a :below split renders its own buffer"
+    (let [ws (bufs/new-workspace (buf/new-state "one.txt" ["first buffer"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :split :dir :below}))
+          ws (bufs/put-current ws (assoc (bufs/current ws)
+                                          :buffer-command {:op :open-new :state (buf/new-state "two.txt" ["second buffer"])}))
+          ws (r/prepare-workspace ws 80 24)
+          out (r/workspace-frame ws 80 24)]
+      (is (string/includes? out "first buffer"))
+      (is (string/includes? out "second buffer"))
+      ;; no divider rows between stacked windows -- mode lines separate them
+      (is (not (string/includes? out "│"))))))
+
+(deftest single-window-workspace-frame-matches-flat-frame
+  (testing "with one window, the workspace path and the flat path agree exactly"
+    (let [ws (bufs/new-workspace (buf/new-state "a.txt" ["hello" "world"]))
+          ws (r/prepare-workspace ws 60 18)
+          flat (bufs/current ws)]
+      (is (= (r/frame flat 60 18) (r/workspace-frame ws 60 18))))))
+
+(deftest prepare-workspace-clamps-an-inactive-windows-view
+  (testing "an inactive window whose buffer shrank gets its cursor/scroll pulled back in"
+    (let [ws (bufs/new-workspace (buf/new-state nil (vec (map str (range 50)))))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :cursor-row 45 :scroll-row 40))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :split :dir :below}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :other-window}))
+          ;; shrink the buffer from the now-active window 1
+          ws (bufs/put-current ws (assoc (bufs/current ws) :lines ["a" "b"] :cursor-row 0 :scroll-row 0))
+          ws (r/prepare-workspace ws 80 24)
+          w0 (bufs/flat-for-window ws 0)]
+      (is (<= (:cursor-row w0) 1))
+      (is (<= (:scroll-row w0) 1)))))
+
+(deftest workspace-frame-cursor-lands-in-the-active-window
+  (testing "the cursor escape targets the active window's rectangle, not the screen origin"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["abc" "def"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :split :dir :below}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command {:op :other-window}))
+          ws (r/prepare-workspace ws 80 24)
+          out (r/workspace-frame ws 80 24)]
+      ;; window 0 holds screen rows 1-12 (11 text rows + its mode line),
+      ;; so window 1's first text row is 13; cursor at buffer 0,0 lands
+      ;; there, in col 5 (just past the 4-column gutter)
+      (is (string/ends-with? out (str (char 27) "[13;5H" (char 27) "[?25h"))))))
+
+;; --- tabs and control characters in buffer text --------------------------
+;;
+;; (char 9) instead of a literal escape, per the CLAUDE.md gotcha about
+;; writing control characters into .lg sources.
+
+(deftest tabs-are-expanded-for-display
+  (testing "line-display expands a leading tab to the next tab stop, with a column map"
+    (let [d (r/line-display (str (char 9) "ab") 4)]
+      (is (= "    ab" (:text d)))
+      (is (= [0 4 5 6] (:cols d)))))
+
+  (testing "a tab mid-line pads only to the next stop, not a fixed width"
+    (is (= "ab  c" (:text (r/line-display (str "ab" (char 9) "c") 4)))))
+
+  (testing "other control characters become caret notation instead of going out raw"
+    (let [d (r/line-display (str "a" (char 27) "b") 4)]
+      (is (= "a^[b" (:text d)))
+      (is (= [0 1 3 4] (:cols d))))))
+
+(deftest frames-never-contain-raw-buffer-control-characters
+  (testing "a tab-indented line paints spaces; a raw tab would skip terminal
+            cells and let the previous frame show through"
+    (let [s (-> (buf/new-state "x.go" [(str (char 9) "for i := 0") "plain"])
+                (buf/ensure-visible 10 60))
+          out (r/frame s 60 12)]
+      (is (not (string/includes? out (str (char 9)))))
+      (is (string/includes? out "    for i := 0")))))
+
+(deftest cursor-and-scroll-account-for-tab-display-width
+  (testing "point just after a tab lands at the tab's display width, not char index 1"
+    (let [s (assoc (buf/new-state nil [(str (char 9) "abc")]) :cursor-col 1)
+          layout (r/dims s 40 10)
+          [col _row] (r/cursor-placement s layout 1 10)]
+      (is (= (+ (:gutter layout) 4 1) col))))
+
+  (testing "scroll-to-fit chases the cursor in display columns on tab-heavy lines"
+    (let [line (apply str (concat (repeat 30 (char 9)) ["x"]))
+          s (assoc (buf/new-state nil [line]) :cursor-col 30)
+          s (r/scroll-to-fit s {:text-rows 5 :text-cols 20 :mb-rows 1})]
+      ;; char 30 sits at display column 120; the window is 20 wide
+      (is (= 101 (:scroll-col s))))))

@@ -16,22 +16,43 @@
 ;; :buffer-command on the state they return, e.g. {:op :switch :id 2}.
 ;; put-current reads that field and applies it to the workspace, then
 ;; clears it -- ordinary state, not a side channel.
+;;
+;; Windows (split panes, see legmacs.windows) ride the exact same
+;; mechanism. The workspace holds one window tree; each window shows a
+;; buffer through its own :view (cursor + scroll). `current` flattens the
+;; *active window's* buffer-plus-view; put-current folds the view slice
+;; back into that window (and, like any other flat field, into the stored
+;; buffer -- so a buffer remembers where you left it and a window newly
+;; showing it resumes there). Window commands are just more :buffer-command
+;; ops: {:op :split :dir :below}, {:op :other-window}, {:op :delete-window},
+;; {:op :delete-other-windows}. The buffer-switching ops (:switch,
+;; :open-new, :next, :prev, :help) now mean "in the active window";
+;; :kill also re-points any window that showed the killed buffer.
+;;
+;; :current (the active buffer id) is kept in sync with the active
+;; window's :buffer after every fold -- one is derived from the other, so
+;; the rest of the editor keeps its "there is a current buffer" view of
+;; the world.
 
 (ns legmacs.buffers
   (:require [string]
-            [os]))
+            [os]
+            [legmacs.windows :as win]))
 
 (def shared-keys [:clipboard :message :minibuffer :pending-prefix :pending-keys :overlay])
 
 (defn new-workspace
-  "A workspace holding one buffer (id 0, current), seeded from
-   `initial-buffer-state`'s own :clipboard (everything else shared starts
-   empty)."
+  "A workspace holding one buffer (id 0, current) shown in one window
+   (id 0, active), seeded from `initial-buffer-state`'s own :clipboard
+   (everything else shared starts empty)."
   [initial-buffer-state]
   {:buffers {0 initial-buffer-state}
    :order [0]
    :current 0
    :next-id 1
+   :windows (win/single 0 0 (win/view-of initial-buffer-state))
+   :active-window 0
+   :next-window-id 1
    :clipboard (:clipboard initial-buffer-state "")
    :message nil
    :minibuffer nil
@@ -69,16 +90,29 @@
                (conj out {:id id :name name :filename (:filename buf)
                           :modified? (:modified? buf) :mode (:mode buf)}))))))
 
+(defn flat-for-window
+  "Window `win-id`'s buffer flattened with that window's view (the view
+   wins -- it's the authoritative cursor/scroll for that window) and the
+   shared fields. What legmacs.render draws any one window from; the
+   active window's version of this, plus the command-facing extras, is
+   `current`."
+  [workspace win-id]
+  (let [leaf (win/find-leaf (:windows workspace) win-id)]
+    (merge (get-in workspace [:buffers (:buffer leaf)])
+           (select-keys workspace shared-keys)
+           (:view leaf)
+           {:current-buffer-id (:buffer leaf)})))
+
 (defn current
-  "The active buffer, flattened with the shared fields and a read-only
-   :buffer-list/:current-buffer-id, in exactly the shape legmacs.dispatch
-   and legmacs.render already expect."
+  "The active window's buffer, flattened with the window's view, the
+   shared fields, and read-only :buffer-list/:current-buffer-id/
+   :window-count, in exactly the shape legmacs.dispatch and
+   legmacs.render already expect."
   [workspace]
-  (merge (get-in workspace [:buffers (:current workspace)])
-         (select-keys workspace shared-keys)
+  (merge (flat-for-window workspace (:active-window workspace))
          {:quit? (:quit? workspace)
           :buffer-list (buffer-list workspace)
-          :current-buffer-id (:current workspace)
+          :window-count (count (win/leaf-ids (:windows workspace)))
           :buffer-command nil}))
 
 (defn- index-of [coll x]
@@ -115,14 +149,88 @@
                         (nth remaining (min (index-of old-order id) (dec (count remaining))))
                         (:current workspace))))))
 
+(defn- set-window-buffer
+  "Point window `wid` at buffer `buf-id`, adopting the view stored on
+   that buffer's state -- a buffer remembers where you left it, so a
+   window newly showing it resumes there."
+  [workspace wid buf-id]
+  (let [view (win/view-of (get-in workspace [:buffers buf-id]))]
+    (update workspace :windows win/update-leaf wid
+            (fn [leaf] (assoc leaf :buffer buf-id :view view)))))
+
+(defn- add-buffer
+  "Register `state` as a new buffer at the end of :order. Returns
+   [workspace new-id]."
+  [workspace state]
+  (let [id (:next-id workspace)]
+    [(-> workspace
+         (assoc-in [:buffers id] state)
+         (update :order conj id)
+         (update :next-id inc))
+     id]))
+
+(defn- apply-buffer-command
+  "Apply one :buffer-command to the workspace. The buffer-switching ops
+   act on the active window; the window ops reshape the tree itself."
+  [workspace cmd]
+  (let [awin (:active-window workspace)]
+    (case (:op cmd)
+      :switch (set-window-buffer workspace awin (:id cmd))
+      :open-new (let [[ws id] (add-buffer workspace (:state cmd))]
+                  (set-window-buffer ws awin id))
+      ;; after the kill, every window that showed the dead buffer gets
+      ;; re-pointed at whatever buffer kill-buffer-op picked as current
+      ;; (or the fresh fallback) -- a window is never left on a buffer
+      ;; that no longer exists.
+      :kill (let [ws (kill-buffer-op workspace (:id cmd) (:fallback cmd))]
+              (update ws :windows win/remap-buffer (:id cmd) (:current ws)
+                      (win/view-of (get-in ws [:buffers (:current ws)]))))
+      :next (set-window-buffer workspace awin (cycle-id workspace 1))
+      :prev (set-window-buffer workspace awin (cycle-id workspace -1))
+      ;; :help find-or-create -- a named singleton buffer (e.g. *Help*)
+      ;; whose content is (re)filled from :state, then focused. Reusing the
+      ;; slot keeps repeated C-h from piling up *Help*<2>, *Help*<3>, ... and
+      ;; refreshes stale content, the way Emacs reuses its *Help* buffer.
+      :help (if-let [existing (some (fn [id] (when (= (:name cmd) (:buffer-name (get-in workspace [:buffers id]))) id))
+                                    (:order workspace))]
+              (-> workspace
+                  (assoc-in [:buffers existing] (:state cmd))
+                  (set-window-buffer awin existing))
+              (let [[ws id] (add-buffer workspace (:state cmd))]
+                (set-window-buffer ws awin id)))
+      :split (-> workspace
+                 (update :windows win/split-leaf awin (:dir cmd) (:next-window-id workspace))
+                 (update :next-window-id inc))
+      :other-window (assoc workspace :active-window
+                           (win/next-leaf-id (:windows workspace) awin 1))
+      ;; refuses to delete the sole window (the command layer messages
+      ;; that case; refusing here too keeps the tree valid regardless of
+      ;; who sends the op).
+      :delete-window (if (> (count (win/leaf-ids (:windows workspace))) 1)
+                       (-> workspace
+                           (assoc :active-window (win/next-leaf-id (:windows workspace) awin 1))
+                           (update :windows win/delete-leaf awin))
+                       workspace)
+      :delete-other-windows (assoc workspace :windows
+                                   (win/find-leaf (:windows workspace) awin))
+      workspace)))
+
+(defn- sync-current
+  "Re-derive :current (the active buffer id) from the active window --
+   the one invariant tying the flat-state world to the window tree."
+  [workspace]
+  (assoc workspace :current
+         (:buffer (win/find-leaf (:windows workspace) (:active-window workspace)))))
+
 (defn put-current
   "Fold `flat-state` (whatever legmacs.dispatch produced) back into
    `workspace`: the current buffer's own fields go back into :buffers,
-   the shared fields go back onto the workspace, :quit? is read off
-   directly, and a :buffer-command (if any) is applied and consumed."
+   the shared fields go back onto the workspace, the view slice goes back
+   into the active window, :quit? is read off directly, and a
+   :buffer-command (if any) is applied and consumed."
   [workspace flat-state]
   (let [cmd (:buffer-command flat-state)
-        stored (apply dissoc flat-state (concat shared-keys [:buffer-command :buffer-list :current-buffer-id :quit?]))
+        stored (apply dissoc flat-state (concat shared-keys [:buffer-command :buffer-list :current-buffer-id :quit? :window-count]))
         workspace (-> workspace
                       (assoc-in [:buffers (:current workspace)] stored)
                       ;; explicit get, not select-keys: a command that
@@ -133,29 +241,7 @@
                       ;; get defaults to nil either way, so both styles
                       ;; of "clear this" actually clear it here.
                       (merge (reduce (fn [m k] (assoc m k (get flat-state k))) {} shared-keys))
-                      (assoc :quit? (boolean (:quit? flat-state))))]
-    (case (:op cmd)
-      :switch (assoc workspace :current (:id cmd))
-      :open-new (let [id (:next-id workspace)]
-                  (-> workspace
-                      (assoc-in [:buffers id] (:state cmd))
-                      (update :order conj id)
-                      (update :next-id inc)
-                      (assoc :current id)))
-      :kill (kill-buffer-op workspace (:id cmd) (:fallback cmd))
-      :next (assoc workspace :current (cycle-id workspace 1))
-      :prev (assoc workspace :current (cycle-id workspace -1))
-      ;; :help find-or-create -- a named singleton buffer (e.g. *Help*)
-      ;; whose content is (re)filled from :state, then focused. Reusing the
-      ;; slot keeps repeated C-h from piling up *Help*<2>, *Help*<3>, ... and
-      ;; refreshes stale content, the way Emacs reuses its *Help* buffer.
-      :help (if-let [existing (some (fn [id] (when (= (:name cmd) (:buffer-name (get-in workspace [:buffers id]))) id))
-                                    (:order workspace))]
-              (-> workspace (assoc-in [:buffers existing] (:state cmd)) (assoc :current existing))
-              (let [id (:next-id workspace)]
-                (-> workspace
-                    (assoc-in [:buffers id] (:state cmd))
-                    (update :order conj id)
-                    (update :next-id inc)
-                    (assoc :current id))))
-      workspace)))
+                      (assoc :quit? (boolean (:quit? flat-state)))
+                      (update :windows win/update-leaf (:active-window workspace)
+                              (fn [leaf] (assoc leaf :view (win/view-of flat-state)))))]
+    (sync-current (apply-buffer-command workspace cmd))))

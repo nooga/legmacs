@@ -15,7 +15,9 @@
   (:require [string]
             [legmacs.buffer :as buf]
             [legmacs.modes :as modes]
-            [legmacs.modeline :as ml]))
+            [legmacs.modeline :as ml]
+            [legmacs.windows :as win]
+            [legmacs.buffers :as bufs]))
 
 (defn- csi [s] (str (char 27) "[" s))
 (def reset (csi "0m"))
@@ -69,6 +71,70 @@
    including the trailing separator space."
   [total-lines]
   (max 4 (+ 2 (count (str total-lines)))))
+
+;; --- display expansion (tabs and control characters) --------------------
+;;
+;; The no-clear rendering strategy only works if every text row *paints*
+;; every one of its columns. A raw tab byte written to the terminal
+;; doesn't -- it jumps the cursor to the next tab stop, leaving the
+;; previous frame's cells showing through (stale fragments that look like
+;; a refresh bug the moment you scroll a tab-indented file). Other raw
+;; control characters are worse: an ESC in a file would be *executed* as
+;; ANSI mid-frame. So no buffer text reaches the frame raw: each line is
+;; expanded for display -- tabs become spaces up to the next tab stop,
+;; other control characters become caret notation (same convention as
+;; `sanitize` uses for the echo area) -- together with a char-index ->
+;; display-column map, so the cursor, highlight spans, and horizontal
+;; scroll all stay aligned with what's actually on screen. :scroll-col
+;; is a *display* column; on lines with no control characters (the
+;; overwhelmingly common case) the mapping is the identity and nothing
+;; changes.
+
+(def tab-width
+  "Display width of a tab stop. Display-only: what a tab looks like, not
+   what TAB inserts (that's tab-insert in legmacs.commands)."
+  (atom 4))
+
+(defn line-display
+  "Expand `line` for display: {:text expanded-string :cols mapping}.
+   `mapping` has (inc (count line)) entries; entry i is the display
+   column where character i starts (the last entry is the line's total
+   display width)."
+  [line tw]
+  (let [chars (vec (seq line))
+        n (count chars)]
+    (loop [i 0, dc 0, out [], cols []]
+      (if (>= i n)
+        {:text (apply str out) :cols (conj cols dc)}
+        (let [ch (nth chars i)
+              c (int ch)
+              piece (cond
+                      (= c 9) (apply str (repeat (- (* tw (inc (quot dc tw))) dc) \space))
+                      (< c 32) (str "^" (char (+ c 64)))
+                      (= c 127) "^?"
+                      :else (str ch))]
+          (recur (inc i) (+ dc (count piece)) (conj out piece) (conj cols dc)))))))
+
+(defn display-col
+  "The display column where character index `col` of `line` lands. Past
+   the end of the line the mapping continues one-for-one, so open-ended
+   span ends and the append position both keep working."
+  [line col tw]
+  (let [cols (:cols (line-display line tw))
+        n (dec (count cols))]
+    (if (>= col n)
+      (+ (nth cols n) (- col n))
+      (nth cols col))))
+
+(defn- display-span
+  "Re-express one {:start :end} span (char columns) in display columns
+   via a precomputed `cols` mapping for its line."
+  [span cols]
+  (let [n (dec (count cols))
+        dcol (fn [c] (cond (< c 0) c
+                           (>= c n) (+ (nth cols n) (- c n))
+                           :else (nth cols c)))]
+    (assoc span :start (dcol (:start span)) :end (dcol (:end span)))))
 
 ;; --- variable-height bottom area --------------------------------------
 ;;
@@ -152,7 +218,18 @@
                     state))
                 state)
         before (:scroll-row state)
-        state (buf/ensure-visible state text-rows text-cols)]
+        state (buf/ensure-visible state text-rows text-cols)
+        ;; ensure-visible fits columns in *character* space; re-fit in
+        ;; display space (:scroll-col's real unit) so a cursor past a
+        ;; tab still lands inside the window. Identical on lines with no
+        ;; control characters, where display col = char col.
+        dcur (display-col (nth (:lines state) (:cursor-row state) "")
+                          (:cursor-col state) @tab-width)
+        state (assoc state :scroll-col
+                     (cond
+                       (< dcur (:scroll-col state)) dcur
+                       (>= dcur (+ (:scroll-col state) text-cols)) (- dcur text-cols -1)
+                       :else (:scroll-col state)))]
     (if (and grown?
              (nil? (:scroll-anchor state))
              (not= before (:scroll-row state)))
@@ -311,28 +388,32 @@
             (reverse (modes/active-modes state)))))
 
 (defn- text-row
-  [state screen-row buf-row {:keys [gutter text-cols]}]
+  "One text row of a window whose left edge sits at 0-based column `x` --
+   the gutter cell plus the styled visible slice, padded to exactly the
+   window's text width (never wider, so side-by-side windows don't paint
+   over each other or their divider)."
+  [state x screen-row buf-row {:keys [gutter text-cols]}]
   (let [total (count (:lines state))]
-    (str (move-to 1 screen-row)
+    (str (move-to (inc x) screen-row)
          (if (< buf-row total)
            (let [scroll-col (:scroll-col state)
-                 visible (pad-right (visible-slice (nth (:lines state) buf-row) scroll-col text-cols) text-cols)
-                 bg-spans (concat (region-spans-for-row state buf-row)
-                                  (paren-match-spans-for-row state buf-row)
-                                  (search-match-spans-for-row state buf-row))
-                 fg-spans (concat (mode-highlight-spans-for-row state buf-row)
-                                  (paren-match-spans-for-row state buf-row))
+                 {dtext :text cols :cols} (line-display (nth (:lines state) buf-row) @tab-width)
+                 ;; mapv, not map: in let-go, reducing over a lazy (map f
+                 ;; (concat ...)) that is *empty* still calls the reducing
+                 ;; fn once with nil (see CLAUDE.md gotchas); style-array
+                 ;; reduces over these, so materialize.
+                 conv (fn [spans] (mapv #(display-span % cols) spans))
+                 visible (pad-right (visible-slice dtext scroll-col text-cols) text-cols)
+                 bg-spans (conv (concat (region-spans-for-row state buf-row)
+                                        (paren-match-spans-for-row state buf-row)
+                                        (search-match-spans-for-row state buf-row)))
+                 fg-spans (conv (concat (mode-highlight-spans-for-row state buf-row)
+                                        (paren-match-spans-for-row state buf-row)))
                  fg-arr (style-array text-cols fg-spans scroll-col)
                  bg-arr (style-array text-cols bg-spans scroll-col)]
              (str (gutter-cell (inc buf-row) gutter (= buf-row (:cursor-row state)))
                   (render-spans visible fg-arr bg-arr)))
            (str tilde-fg (pad-right "~" gutter) reset (pad-right "" text-cols))))))
-
-(defn- text-area [state screen-row0 layout]
-  (let [{:keys [text-rows]} layout]
-    (apply str
-           (map (fn [i] (text-row state (+ screen-row0 i) (+ (:scroll-row state) i) layout))
-                (range text-rows)))))
 
 ;; --- mode-line segment compositor --------------------------------------
 ;;
@@ -363,13 +444,21 @@
                      (str (apply bg (or (:bg seg) default-bg)) (apply fg (or (:fg seg) default-fg))
                           text-piece reset)))))))
 
-(defn- status-line [state screen-row cols]
+;; A window that isn't active renders its mode line in these muted colors
+;; instead of the theme's (and with every segment's own badge colors
+;; stripped) -- the one bright mode line on screen is where your keys go,
+;; the same cue Emacs gives.
+(def ^:private inactive-ml-bg [30 33 42])
+(def ^:private inactive-ml-fg [122 127 142])
+
+(defn- status-line [state x screen-row cols active?]
   (let [theme @ml/theme
-        default-bg (:bg theme)
-        default-fg (:fg theme)
+        default-bg (if active? (:bg theme) inactive-ml-bg)
+        default-fg (if active? (:fg theme) inactive-ml-fg)
         sep @ml/separator
-        left-segs (ml/left-segments state)
-        right-segs (ml/right-segments state)
+        dim (fn [segs] (if active? segs (map #(dissoc % :fg :bg) segs)))
+        left-segs (dim (ml/left-segments state))
+        right-segs (dim (ml/right-segments state))
         right-plain (string/join sep (map :text right-segs))
         right-width (min cols (if (seq right-plain) (inc (count right-plain)) 0))
         avail-left (max 0 (- cols right-width))
@@ -387,7 +476,7 @@
         left-fill (fill (- avail-left left-visible))
         right-fill (fill (- right-width right-visible 1))
         trailing (if (pos? right-width) (fill 1) "")]
-    (str (move-to 1 screen-row)
+    (str (move-to (inc x) screen-row)
          left-ansi left-fill right-ansi right-fill trailing)))
 
 ;; --- echo area (bottom `mb-rows` rows) ---------------------------------
@@ -451,8 +540,10 @@
   [state layout screen-row0 rows]
   (if-let [mb (:minibuffer state)]
     [(inc (+ (count (:prompt mb)) (:cursor-col mb))) (+ 2 (:text-rows layout))]
-    [(inc (+ (:gutter layout) (- (:cursor-col state) (:scroll-col state))))
-     (+ screen-row0 (- (:cursor-row state) (:scroll-row state)))]))
+    (let [dcur (display-col (nth (:lines state) (:cursor-row state) "")
+                            (:cursor-col state) @tab-width)]
+      [(inc (+ (:gutter layout) (- dcur (:scroll-col state))))
+       (+ screen-row0 (- (:cursor-row state) (:scroll-row state)))])))
 
 (defn- overlay-frame [overlay cols rows]
   (let [{:keys [title lines]} overlay
@@ -469,18 +560,139 @@
                   (pad-right (if (pos? more) (format " %d more -- press any key" more) " press any key to continue") cols)
                   reset)]))))
 
+;; --- windows: one buffer view per rectangle -----------------------------
+;;
+;; Everything above renders one buffer view; from here down it gets placed.
+;; A window (see legmacs.windows) is a rectangle {:x :y :w :h} in 0-based
+;; screen cells holding a text area plus that window's own mode line on
+;; its bottom row -- stacked windows are separated by their mode lines,
+;; side-by-side ones by a │ divider column. The echo/minibuffer area stays
+;; global, full-width, under all of it.
+
+(defn window-dims
+  "Per-window layout: `dims` for one window's rectangle instead of the
+   whole terminal. `h` includes the window's own mode-line row."
+  [state rect]
+  {:gutter (gutter-width (count (:lines state)))
+   :text-rows (max 1 (dec (:h rect)))
+   :text-cols (max 1 (- (:w rect) (gutter-width (count (:lines state)))))})
+
+(defn window-frame
+  "One window's text area plus its own mode line, drawn inside `rect`.
+   Every row is padded to exactly the rect's width, so windows tile the
+   screen with no clearing between frames -- the same invariant `frame`
+   keeps for the whole terminal."
+  [state rect active?]
+  (let [{:keys [x y w h]} rect
+        wd (window-dims state rect)]
+    (str (apply str
+                (map (fn [i] (text-row state x (+ y 1 i) (+ (:scroll-row state) i) wd))
+                     (range (:text-rows wd))))
+         (status-line state x (+ y h) w active?))))
+
+(def ^:private divider-char "│")
+
+(defn- divider-column [{:keys [x y h]}]
+  (apply str
+         (map (fn [i] (str (move-to (inc x) (+ y 1 i)) tilde-fg divider-char reset))
+              (range h))))
+
+(defn- clamp-view
+  "Bring an *inactive* window's view back inside its buffer -- edits made
+   through another window may have shrunk it out from under this one.
+   Only clamps; it deliberately doesn't chase the cursor the way
+   scroll-to-fit does, since a window you're not in shouldn't scroll on
+   its own."
+  [state]
+  (let [state (buf/clamp-cursor state)]
+    (assoc state
+           :scroll-row (max 0 (min (:scroll-row state) (dec (count (:lines state)))))
+           :scroll-col (max 0 (:scroll-col state)))))
+
+(defn- workspace-geometry
+  "This frame's screen plan: the echo area's height (a function of the
+   active flat state, same as the single-window path), the window area
+   above it, and legmacs.windows/layout's rectangles and dividers for the
+   whole tree within that area."
+  [workspace flat cols rows]
+  (let [mb-rows (minibuffer-height flat cols rows)
+        area-h (max 2 (- rows mb-rows))]
+    (assoc (win/layout (:windows workspace) 0 0 cols area-h)
+           :mb-rows mb-rows :area-h area-h)))
+
+(defn prepare-workspace
+  "The workspace-level scroll pass, run before workspace-frame with the
+   same cols/rows: the active window gets the full scroll-to-fit
+   treatment (recenter, echo-growth anchoring, ensure-visible) against
+   its own rectangle; every other window just gets its view clamped back
+   inside its buffer. The updated views fold back into the workspace --
+   scroll position is real state and has to survive to the next frame."
+  [workspace cols rows]
+  (let [flat (bufs/current workspace)
+        geo (workspace-geometry workspace flat cols rows)]
+    (reduce (fn [ws rect]
+              (let [wid (:win-id rect)
+                    st (bufs/flat-for-window ws wid)
+                    st (if (= wid (:active-window ws))
+                         (scroll-to-fit (buf/clamp-cursor st)
+                                        (assoc (window-dims st rect) :mb-rows (:mb-rows geo)))
+                         (clamp-view st))]
+                (update ws :windows win/update-leaf wid
+                        (fn [leaf] (assoc leaf :view (win/view-of st))))))
+            workspace
+            (:windows geo))))
+
+(defn- window-cursor
+  "Where the terminal cursor lands in the multi-window frame: on the
+   minibuffer prompt when one is open (first echo row, under the whole
+   window area), else at point inside the active window's rectangle."
+  [flat geo active-rect]
+  (if-let [mb (:minibuffer flat)]
+    [(inc (+ (count (:prompt mb)) (:cursor-col mb))) (inc (:area-h geo))]
+    (let [dcur (display-col (nth (:lines flat) (:cursor-row flat) "")
+                            (:cursor-col flat) @tab-width)]
+      [(+ (:x active-rect) (gutter-width (count (:lines flat))) (- dcur (:scroll-col flat)) 1)
+       (+ (:y active-rect) (- (:cursor-row flat) (:scroll-row flat)) 1)])))
+
+(defn workspace-frame
+  "Build the full-screen ANSI string for one render of `workspace`: every
+   window in the tree drawn into its own rectangle (per-window mode line,
+   only the active one bright), │ dividers between side-by-side windows,
+   and the shared echo/minibuffer area across the bottom. Call
+   prepare-workspace with the same cols/rows first so scrolling matches."
+  [workspace cols rows]
+  (let [flat (bufs/current workspace)]
+    (if-let [overlay (:overlay flat)]
+      (str hide-cursor (overlay-frame overlay cols rows))
+      (let [geo (workspace-geometry workspace flat cols rows)
+            active (:active-window workspace)
+            active-rect (some (fn [r] (when (= active (:win-id r)) r)) (:windows geo))]
+        (str hide-cursor
+             (apply str
+                    (map (fn [rect]
+                           (window-frame (bufs/flat-for-window workspace (:win-id rect))
+                                         rect
+                                         (= active (:win-id rect))))
+                         (:windows geo)))
+             (apply str (map divider-column (:dividers geo)))
+             (echo-area flat (inc (:area-h geo)) (:mb-rows geo) cols)
+             (let [[col row] (window-cursor flat geo active-rect)]
+               (str (move-to col row) show-cursor)))))))
+
 (defn frame
-  "Build the full-screen ANSI string for one render of `state`, sized to
-   `cols` x `rows`. Caller is responsible for calling buf/ensure-visible
-   with the same dims (see `dims`) before this so scrolling matches."
+  "Build the full-screen ANSI string for one render of a single flat
+   `state`, sized to `cols` x `rows` -- the one-window special case of
+   workspace-frame, kept as the direct flat-state entry point (it's also
+   what the render tests drive). Caller is responsible for calling
+   buf/ensure-visible with the same dims (see `dims`) before this so
+   scrolling matches."
   [state cols rows]
   (if-let [overlay (:overlay state)]
     (str hide-cursor (overlay-frame overlay cols rows))
     (let [layout (dims state cols rows)
-          text-rows (:text-rows layout)]
+          area-h (inc (:text-rows layout))]
       (str hide-cursor
-           (text-area state 1 layout)
-           (status-line state (inc text-rows) cols)
-           (echo-area state (+ 2 text-rows) (:mb-rows layout) cols)
+           (window-frame state {:x 0 :y 0 :w cols :h area-h} true)
+           (echo-area state (inc area-h) (:mb-rows layout) cols)
            (let [[col row] (cursor-placement state layout 1 rows)]
              (str (move-to col row) show-cursor))))))

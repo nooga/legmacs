@@ -73,24 +73,24 @@
     (require 'legmacs-init)
     (catch e nil)))
 
-(defn render! [state]
+(defn render! [workspace]
   (let [[cols rows] (term-size)
-        layout (render/dims state cols rows)
-        state (render/scroll-to-fit state layout)]
-    (term/write (render/frame state cols rows))
+        workspace (render/prepare-workspace workspace cols rows)]
+    (term/write (render/workspace-frame workspace cols rows))
     (term/flush)
-    state))
+    workspace))
 
 (defn run
   "Threads a workspace (see legmacs.buffers) rather than a single flat
-   buffer state, so multiple buffers can exist -- but render!/dispatch
-   still only ever see the flat, current-buffer view; workspace-level
-   bookkeeping (switching, opening, killing) happens in the fold back via
-   bufs/put-current, driven by whatever :buffer-command a command set."
+   buffer state, so multiple buffers and windows can exist -- but dispatch
+   still only ever sees the flat, current-window view; workspace-level
+   bookkeeping (switching, opening, killing, splitting) happens in the
+   fold back via bufs/put-current, driven by whatever :buffer-command a
+   command set. render! draws every window but likewise returns just a
+   workspace with per-window scroll positions brought up to date."
   [workspace]
   (loop [workspace workspace]
-    (let [flat (render! (bufs/current workspace))
-          workspace (bufs/put-current workspace flat)]
+    (let [workspace (render! workspace)]
       (if (:quit? workspace)
         workspace
         (let [chord (keys/read-chord)]
@@ -110,7 +110,11 @@
   [paths]
   (let [initial-state (load-file-or-scratch (first paths))
         workspace (reduce open-additional-buffer (bufs/new-workspace initial-state) (rest paths))]
-    (assoc workspace :current 0)))
+    ;; a real :switch op, not a bare (assoc :current 0) -- the active
+    ;; window has to come along to buffer 0 too, and put-current is the
+    ;; one place that knows how to keep the two in step.
+    (bufs/put-current workspace
+                      (assoc (bufs/current workspace) :buffer-command {:op :switch :id 0}))))
 
 (defn main []
   (bindings/install!)
