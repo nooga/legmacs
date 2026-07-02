@@ -1,0 +1,219 @@
+;; legmacs.modes.prog — highlight-only major modes for common programming
+;; languages, all driven by one spec-based per-line scanner. A language is
+;; just a data map (comment markers, string delimiters, keyword/type/
+;; constant word sets); register-prog-mode! turns it into a registered
+;; mode plus its auto-mode suffixes. A user's init.lg can add a language
+;; the exact same way:
+;;
+;;   (prog/register-prog-mode! :zig "zig-mode"
+;;     {:line-comments ["//"] :string-delims ["\""]
+;;      :keywords #{"fn" "pub" "const" ...}}
+;;     [".zig"])
+;;
+;; Same simplification legmacs.modes.markdown documents: one line at a
+;; time, no state carried across lines. Strings and /* */ comments that
+;; close on their own line work; a multi-line construct highlights only
+;; on the line where it opens (the opener runs to end-of-line), not on
+;; its continuation lines. Cheap, predictable, and good enough for
+;; reading code -- not a parser.
+
+(ns legmacs.modes.prog
+  (:require [string]
+            [legmacs.modes :as modes]))
+
+(defn- at?
+  "True if `line` has the literal substring `s` starting at index `i`."
+  [line i s]
+  (and (<= (+ i (count s)) (count line))
+       (= s (subs line i (+ i (count s))))))
+
+(defn- word-char? [c]
+  (and c
+       (let [n (int c)]
+         (or (<= 97 n 122) (<= 65 n 90) (<= 48 n 57) (= n 95) (= n 36)))))
+
+(defn- digit? [c]
+  (and c (<= 48 (int c) 57)))
+
+(defn- scan-string
+  "Index just past the closing delimiter `q` for a string opening at `i`
+   (which is on the opening delimiter), honoring backslash escapes.
+   Unterminated -> end of line."
+  [chars n i q]
+  (loop [j (inc i)]
+    (cond
+      (>= j n) n
+      (= \\ (nth chars j)) (recur (+ j 2))
+      (= q (nth chars j)) (inc j)
+      :else (recur (inc j)))))
+
+(defn- scan-word
+  "Index just past the identifier/number starting at `i`. A token starting
+   with a digit also swallows dots, so \"3.14\" and \"1.5e3\" stay one
+   number token instead of three."
+  [chars n i]
+  (let [number? (digit? (nth chars i))]
+    (loop [j (inc i)]
+      (if (and (< j n)
+               (or (word-char? (nth chars j))
+                   (and number? (= \. (nth chars j)))))
+        (recur (inc j))
+        j))))
+
+(defn make-highlighter
+  "Build a per-line :highlighter (see legmacs.modes/register-mode!) from a
+   language spec map:
+     :line-comments  [\"//\" ...]  comment-to-end-of-line markers
+     :block-comment  [\"/*\" \"*/\"]  optional; closes-same-line or runs to EOL
+     :string-delims  [\"\\\"\" ...]  one-char string delimiters, \\-escapable
+     :keywords / :types / :constants  word sets, painted :keyword / :type /
+                                      :keyword-literal respectively"
+  [{:keys [line-comments block-comment string-delims keywords types constants]}]
+  (let [keywords (or keywords #{})
+        types (or types #{})
+        constants (or constants #{})
+        [block-open block-close] block-comment]
+    (fn [line]
+      (let [n (count line)
+            chars (vec (seq line))]
+        (loop [i 0, spans []]
+          (if (>= i n)
+            spans
+            (cond
+              (some #(at? line i %) line-comments)
+              (conj spans {:style :comment :start i :end n})
+
+              (and block-open (at? line i block-open))
+              (if-let [close (string/index-of line block-close (+ i (count block-open)))]
+                (let [end (+ close (count block-close))]
+                  (recur end (conj spans {:style :comment :start i :end end})))
+                (conj spans {:style :comment :start i :end n}))
+
+              (some #(at? line i %) string-delims)
+              (let [end (scan-string chars n i (nth chars i))]
+                (recur end (conj spans {:style :string :start i :end end})))
+
+              (word-char? (nth chars i))
+              (let [end (scan-word chars n i)
+                    word (subs line i end)
+                    style (cond
+                            (digit? (nth chars i)) :number
+                            (contains? keywords word) :keyword
+                            (contains? types word) :type
+                            (contains? constants word) :keyword-literal
+                            :else nil)]
+                (recur end (if style (conj spans {:style style :start i :end end}) spans)))
+
+              :else (recur (inc i) spans))))))))
+
+(defn register-prog-mode!
+  "Register `mode-kw` as a highlight-only major mode built from `spec` (see
+   make-highlighter) and associate it with each filename suffix in
+   `suffixes`. This is the whole public surface -- the built-in languages
+   below and a user's own additions go through the same call."
+  [mode-kw doc spec suffixes]
+  (modes/register-mode! mode-kw (atom {}) doc {:highlighter (make-highlighter spec)})
+  (doseq [suffix suffixes]
+    (modes/register-auto-mode! suffix mode-kw))
+  mode-kw)
+
+;; --- the built-in language pack -----------------------------------------
+
+(register-prog-mode! :go "go-mode: syntax highlighting for Go"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'" "`"]
+   :keywords #{"break" "case" "chan" "const" "continue" "default" "defer"
+               "else" "fallthrough" "for" "func" "go" "goto" "if" "import"
+               "interface" "map" "package" "range" "return" "select"
+               "struct" "switch" "type" "var"}
+   :types #{"any" "bool" "byte" "complex64" "complex128" "error" "float32"
+            "float64" "int" "int8" "int16" "int32" "int64" "rune" "string"
+            "uint" "uint8" "uint16" "uint32" "uint64" "uintptr"}
+   :constants #{"true" "false" "nil" "iota"}}
+  [".go"])
+
+(register-prog-mode! :javascript "javascript-mode: syntax highlighting for JavaScript/TypeScript"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'" "`"]
+   :keywords #{"async" "await" "break" "case" "catch" "class" "const"
+               "continue" "debugger" "default" "delete" "do" "else" "enum"
+               "export" "extends" "finally" "for" "function" "if"
+               "implements" "import" "in" "instanceof" "interface" "let"
+               "new" "of" "return" "static" "super" "switch" "this" "throw"
+               "try" "type" "typeof" "var" "void" "while" "with" "yield"
+               "declare" "namespace" "readonly" "public" "private"
+               "protected" "as" "satisfies"}
+   :types #{"any" "bigint" "boolean" "never" "number" "object" "symbol"
+            "unknown"}
+   :constants #{"true" "false" "null" "undefined" "NaN" "Infinity"}}
+  [".js" ".jsx" ".mjs" ".cjs" ".ts" ".tsx"])
+
+(register-prog-mode! :python "python-mode: syntax highlighting for Python"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"and" "as" "assert" "async" "await" "break" "class"
+               "continue" "def" "del" "elif" "else" "except" "finally"
+               "for" "from" "global" "if" "import" "in" "is" "lambda"
+               "match" "nonlocal" "not" "or" "pass" "raise" "return" "try"
+               "while" "with" "yield"}
+   :types #{"bool" "bytes" "dict" "float" "int" "list" "object" "set"
+            "str" "tuple"}
+   :constants #{"True" "False" "None" "self"}}
+  [".py"])
+
+(register-prog-mode! :c "c-mode: syntax highlighting for C/C++"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :keywords #{"auto" "break" "case" "catch" "class" "const" "constexpr"
+               "continue" "default" "delete" "do" "else" "enum" "extern"
+               "final" "for" "goto" "if" "inline" "namespace" "new"
+               "operator" "override" "private" "protected" "public"
+               "register" "restrict" "return" "sizeof" "static" "struct"
+               "switch" "template" "this" "throw" "try" "typedef"
+               "typename" "union" "using" "virtual" "volatile" "while"}
+   :types #{"bool" "char" "double" "float" "int" "long" "short" "signed"
+            "size_t" "unsigned" "void" "int8_t" "int16_t" "int32_t"
+            "int64_t" "uint8_t" "uint16_t" "uint32_t" "uint64_t"}
+   :constants #{"true" "false" "NULL" "nullptr"}}
+  [".c" ".h" ".cpp" ".hpp" ".cc" ".hh" ".cxx"])
+
+(register-prog-mode! :shell "shell-mode: syntax highlighting for shell scripts"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"alias" "break" "case" "continue" "coproc" "declare" "do"
+               "done" "elif" "else" "esac" "exit" "export" "fi" "for"
+               "function" "if" "in" "local" "readonly" "return" "select"
+               "shift" "source" "then" "time" "unset" "until" "while"}
+   :constants #{"true" "false"}}
+  [".sh" ".bash" ".zsh"])
+
+(register-prog-mode! :rust "rust-mode: syntax highlighting for Rust"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   ;; no ' delimiter: a lifetime ('a) would swallow the rest of the line
+   :string-delims ["\""]
+   :keywords #{"as" "async" "await" "break" "const" "continue" "crate"
+               "dyn" "else" "enum" "extern" "fn" "for" "if" "impl" "in"
+               "let" "loop" "match" "mod" "move" "mut" "pub" "ref"
+               "return" "self" "static" "struct" "super" "trait" "type"
+               "unsafe" "use" "where" "while"}
+   :types #{"Box" "Option" "Result" "String" "Vec" "bool" "char" "f32"
+            "f64" "i8" "i16" "i32" "i64" "i128" "isize" "str" "u8" "u16"
+            "u32" "u64" "u128" "usize"}
+   :constants #{"true" "false" "None" "Some" "Ok" "Err"}}
+  [".rs"])
+
+(register-prog-mode! :json "json-mode: syntax highlighting for JSON"
+  {:line-comments []
+   :string-delims ["\""]
+   :constants #{"true" "false" "null"}}
+  [".json"])
+
+(register-prog-mode! :yaml "yaml-mode: syntax highlighting for YAML"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :constants #{"true" "false" "null" "yes" "no" "on" "off"}}
+  [".yaml" ".yml"])

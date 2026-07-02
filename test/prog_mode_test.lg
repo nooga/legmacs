@@ -1,0 +1,76 @@
+(ns test.prog-mode-test
+  (:require [test :refer :all]
+            [legmacs.modes :as modes]
+            [legmacs.modes.prog :as prog]))
+
+;; A small spec exercised directly, so assertions don't churn every time a
+;; word is added to the real go-mode keyword list.
+(def go-hl (prog/make-highlighter
+            {:line-comments ["//"]
+             :block-comment ["/*" "*/"]
+             :string-delims ["\"" "'" "`"]
+             :keywords #{"func" "return" "if"}
+             :types #{"int" "string"}
+             :constants #{"true" "nil"}}))
+
+(deftest auto-modes-are-registered
+  (testing "the built-in language pack claims its filename suffixes"
+    (is (= :go (modes/mode-for-filename "main.go")))
+    (is (= :javascript (modes/mode-for-filename "app.ts")))
+    (is (= :javascript (modes/mode-for-filename "app.jsx")))
+    (is (= :python (modes/mode-for-filename "tool.py")))
+    (is (= :c (modes/mode-for-filename "kernel.c")))
+    (is (= :c (modes/mode-for-filename "widget.hpp")))
+    (is (= :shell (modes/mode-for-filename "deploy.sh")))
+    (is (= :rust (modes/mode-for-filename "lib.rs")))
+    (is (= :json (modes/mode-for-filename "package.json")))
+    (is (= :yaml (modes/mode-for-filename "ci.yml")))))
+
+(deftest keywords-types-and-constants
+  (testing "known words are classified, unknown identifiers left unstyled"
+    (is (= [{:style :keyword :start 0 :end 4}] (go-hl "func main()")))
+    (is (= [{:style :keyword :start 0 :end 6} {:style :keyword-literal :start 7 :end 10}]
+           (go-hl "return nil")))
+    (is (= [{:style :type :start 6 :end 9}] (go-hl "var x int")))
+    (is (empty? (go-hl "identifier another_one")))))
+
+(deftest word-boundaries-respected
+  (testing "a keyword inside a longer identifier does not light up"
+    (is (empty? (go-hl "functor iffy")))
+    (is (empty? (go-hl "printf")))))
+
+(deftest numbers
+  (testing "tokens starting with a digit are numbers, dots and hex included"
+    (is (= [{:style :number :start 4 :end 6}] (go-hl "x = 42")))
+    (is (= [{:style :number :start 0 :end 4}] (go-hl "3.14")))
+    (is (= [{:style :number :start 0 :end 4}] (go-hl "0x1F")))))
+
+(deftest strings-and-escapes
+  (testing "strings span delimiter to delimiter, honoring backslash escapes"
+    (is (= [{:style :string :start 4 :end 9}] (go-hl "s = \"abc\"")))
+    (is (= [{:style :string :start 0 :end 9}] (go-hl "\"a\\\"b\\\"c\"x")))
+    (is (= [{:style :string :start 4 :end 7}] (go-hl "c = 'x' "))))
+
+  (testing "an unterminated string runs to end of line"
+    (is (= [{:style :string :start 0 :end 8}] (go-hl "\"no end ")))))
+
+(deftest comments
+  (testing "a line comment swallows everything after it, keywords included"
+    (is (= [{:style :comment :start 2 :end 15}] (go-hl "x // func \"str\""))))
+
+  (testing "a block comment closed on the same line is one span; scanning continues after it"
+    (is (= [{:style :comment :start 0 :end 7} {:style :keyword :start 8 :end 12}]
+           (go-hl "/* c */ func"))))
+
+  (testing "an unclosed block comment runs to end of line"
+    (is (= [{:style :keyword :start 0 :end 4} {:style :comment :start 5 :end 12}]
+           (go-hl "func /* open")))))
+
+(deftest keywords-inside-strings-stay-plain
+  (testing "the scanner consumes a whole string before looking for words"
+    (is (= [{:style :string :start 0 :end 13}] (go-hl "\"if func int\"")))))
+
+(deftest rust-lifetimes-do-not-swallow-lines
+  (testing "rust-mode has no ' string delimiter, so a lifetime 'a stays plain"
+    (let [rust-hl (:highlighter (get @modes/registry :rust))]
+      (is (= [{:style :keyword :start 0 :end 2}] (rust-hl "fn foo<'a>(x: &'a T)"))))))

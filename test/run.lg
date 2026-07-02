@@ -11,6 +11,7 @@
             [test.crutch-mode-test]
             [test.keycast-mode-test]
             [test.markdown-mode-test]
+            [test.prog-mode-test]
             [test.completion-test]
             [test.swiper-test]
             [test.help-mode-test]

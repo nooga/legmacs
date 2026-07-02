@@ -20,6 +20,7 @@
             [legmacs.modes :as modes]
             [legmacs.modes.letgo]
             [legmacs.modes.markdown]
+            [legmacs.modes.prog]
             [legmacs.modes.crutch]
             [legmacs.modes.keycast]
             [legmacs.modes.help]

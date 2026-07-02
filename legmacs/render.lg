@@ -191,6 +191,7 @@
    :keyword (fg 100 170 220)
    :number (fg 210 150 90)
    :keyword-literal (fg 90 200 190)
+   :type (fg 180 160 220)
    :paren-match (str bold-on (fg 255 255 255))
    ;; legmacs.modes.markdown's styles
    :md-header (str bold-on (fg 235 170 60))
