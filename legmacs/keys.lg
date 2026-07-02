@@ -9,7 +9,8 @@
 ;; editor and sidesteps escape-sequence ambiguity entirely.
 
 (ns legmacs.keys
-  (:require [term]))
+  (:require [term]
+            [string]))
 
 (def ^:private ESC (str (char 27)))
 (def ^:private DEL-BYTE (str (char 127)))
@@ -27,10 +28,88 @@
               ["[D" "left"]  ["OD" "left"]
               ["[H" "home"]  ["OH" "home"] ["[1~" "home"] ["[7~" "home"]
               ["[F" "end"]   ["OF" "end"]  ["[4~" "end"]  ["[8~" "end"]
-              ["[3~" "delete"]
+              ["[3~" "delete"] ["[2~" "insert"]
               ["[5~" "pageup"]
               ["[6~" "pagedown"]
-              ["[Z" "S-TAB"]])))
+              ["[Z" "S-TAB"]
+              ["OP" "f1"] ["OQ" "f2"] ["OR" "f3"] ["OS" "f4"]])))
+
+;; --- modified / extended CSI sequences ---------------------------------
+;;
+;; Terminals send modifier-carrying navigation keys (Ctrl-arrow, Alt-Home,
+;; Shift-F5, ...) as CSI sequences the fixed table above can't enumerate:
+;; ESC [ 1 ; <mod> <letter>  for the arrow/home/end/F1-F4 family, and
+;; ESC [ <code> (; <mod>) ~  for delete/insert/page/F5-F12. Both arrive
+;; from term/read-key as one token. Anything even these don't cover is
+;; caret-escaped (describe-raw) rather than passed through: a chord string
+;; must NEVER carry raw control bytes, because dispatch embeds it in the
+;; "... is undefined" echo message and the terminal would *execute* those
+;; bytes as ANSI codes mid-frame (the classic symptom: the cursor jumps
+;; home and prints garbage over the first screen line).
+
+(def ^:private csi-letter-keys
+  {"A" "up" "B" "down" "C" "right" "D" "left"
+   "H" "home" "F" "end"
+   "P" "f1" "Q" "f2" "R" "f3" "S" "f4"})
+
+(def ^:private csi-tilde-keys
+  {"1" "home" "2" "insert" "3" "delete" "4" "end"
+   "5" "pageup" "6" "pagedown" "7" "home" "8" "end"
+   "11" "f1" "12" "f2" "13" "f3" "14" "f4" "15" "f5"
+   "17" "f6" "18" "f7" "19" "f8" "20" "f9" "21" "f10"
+   "23" "f11" "24" "f12"})
+
+(defn- modifier-prefix
+  "xterm encodes held modifiers in a CSI parameter as 1 + a bitmask of
+   Shift(1) Alt(2) Ctrl(4); render that as a chord prefix in Emacs's
+   canonical order (C- before M- before S-)."
+  [m]
+  (let [bits (dec m)]
+    (str (if (pos? (bit-and bits 4)) "C-" "")
+         (if (pos? (bit-and bits 2)) "M-" "")
+         (if (pos? (bit-and bits 1)) "S-" ""))))
+
+(defn- digits? [s]
+  (and (string? s) (seq s)
+       (every? (fn [ch] (<= 48 (int ch) 57)) (seq s))))
+
+(defn decode-csi
+  "Decode a modifier-carrying CSI token (see comment above) into a chord
+   like \"C-left\", \"M-home\" or \"C-S-delete\". nil if `k` isn't a shape
+   this understands -- callers then fall back to describe-raw."
+  [k]
+  (when (and (string? k) (> (count k) 3) (= (esc-seq "[") (subs k 0 2)))
+    (let [final (subs k (dec (count k)))
+          body (subs k 2 (dec (count k)))
+          parts (vec (string/split body ";"))]
+      (cond
+        (= final "~")
+        (when (and (<= (count parts) 2)
+                   (digits? (nth parts 0 nil))
+                   (or (nil? (nth parts 1 nil)) (digits? (nth parts 1 nil))))
+          (when-let [base (get csi-tilde-keys (nth parts 0))]
+            (str (if-let [m (nth parts 1 nil)] (modifier-prefix (parse-long m)) "")
+                 base)))
+
+        (contains? csi-letter-keys final)
+        (when (and (= 2 (count parts)) (digits? (nth parts 1)))
+          (str (modifier-prefix (parse-long (nth parts 1)))
+               (get csi-letter-keys final)))
+
+        :else nil))))
+
+(defn describe-raw
+  "Render a raw input token with control bytes in caret notation (^[ for
+   ESC, ^M for CR, ^? for DEL): safe to show in the echo area or use as a
+   chord name, never something the terminal would execute."
+  [k]
+  (apply str (map (fn [ch]
+                    (let [c (int ch)]
+                      (cond
+                        (< c 32) (str "^" (char (+ c 64)))
+                        (= c 127) "^?"
+                        :else (str ch))))
+                  (seq k))))
 
 (defn control-chord
   "Canonical name for a single raw control byte (0-31), or nil if it has a
@@ -67,6 +146,10 @@
     (contains? escape-sequences k) (get escape-sequences k)
     (= k ESC) "ESC"
     (and (= (count k) 1) (< (int (first (seq k))) 32)) (control-chord (int (first (seq k))))
+    ;; any other multi-char token is an escape sequence the tables don't
+    ;; know: decode a modified nav key, else caret-escape it -- either way
+    ;; the result contains no raw control bytes (see decode-csi's comment)
+    (and (string? k) (> (count k) 1) (= ESC (subs k 0 1))) (or (decode-csi k) (describe-raw k))
     :else k))
 
 (defn meta-chord

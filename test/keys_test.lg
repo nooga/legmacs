@@ -1,5 +1,6 @@
 (ns test.keys-test
   (:require [test :refer :all]
+            [string]
             [legmacs.keys :as k]))
 
 (defn- esc [s] (str (char 27) s))
@@ -33,8 +34,36 @@
     (is (= "home" (k/raw->chord (esc "[H"))))
     (is (= "end" (k/raw->chord (esc "[F"))))
     (is (= "delete" (k/raw->chord (esc "[3~"))))
+    (is (= "insert" (k/raw->chord (esc "[2~"))))
     (is (= "pageup" (k/raw->chord (esc "[5~"))))
-    (is (= "pagedown" (k/raw->chord (esc "[6~"))))))
+    (is (= "pagedown" (k/raw->chord (esc "[6~"))))
+    (is (= "f1" (k/raw->chord (esc "OP"))))
+    (is (= "f4" (k/raw->chord (esc "OS"))))))
+
+(deftest modified-csi-sequences
+  (testing "xterm modifier parameters decode into C-/M-/S- chord prefixes"
+    (is (= "C-left" (k/raw->chord (esc "[1;5D"))))
+    (is (= "C-right" (k/raw->chord (esc "[1;5C"))))
+    (is (= "M-up" (k/raw->chord (esc "[1;3A"))))
+    (is (= "S-right" (k/raw->chord (esc "[1;2C"))))
+    (is (= "C-M-down" (k/raw->chord (esc "[1;7B"))))
+    (is (= "C-S-left" (k/raw->chord (esc "[1;6D"))))
+    (is (= "C-home" (k/raw->chord (esc "[1;5H"))))
+    (is (= "M-end" (k/raw->chord (esc "[1;3F"))))
+    (is (= "C-delete" (k/raw->chord (esc "[3;5~"))))
+    (is (= "S-pageup" (k/raw->chord (esc "[5;2~"))))
+    (is (= "C-f1" (k/raw->chord (esc "[1;5P"))))
+    (is (= "f5" (k/raw->chord (esc "[15~"))))
+    (is (= "C-f5" (k/raw->chord (esc "[15;5~"))))
+    (is (= "f12" (k/raw->chord (esc "[24~"))))))
+
+(deftest unknown-sequences-are-caret-escaped
+  (testing "a chord never carries raw control bytes -- dispatch embeds it in
+            the echo message and the terminal would execute them"
+    (is (= "^[[999z" (k/raw->chord (esc "[999z"))))
+    (is (= "^[[27;5;106~" (k/raw->chord (esc "[27;5;106~"))))
+    (is (= "^[Ox" (k/raw->chord (esc "Ox"))))
+    (is (not (string/includes? (k/raw->chord (esc "[1;99Q")) (str (char 27)))))))
 
 (deftest printable-chars
   (testing "plain characters pass through unchanged"
