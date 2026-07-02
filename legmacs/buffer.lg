@@ -274,7 +274,7 @@
 
 (defn- char-at [state row col]
   (let [line (nth (:lines state) row "")]
-    (when (< col (count line)) (nth (seq line) col))))
+    (when (and (<= 0 col) (< col (count line))) (nth (seq line) col))))
 
 (defn word-char?
   "True for letters, digits, and underscore -- good enough for M-f/M-b word
@@ -287,9 +287,18 @@
 (defn- word-char-at? [state row col]
   (word-char? (char-at state row col)))
 
+(defn- at-buffer-end? [state]
+  (and (= (:cursor-row state) (dec (line-count state)))
+       (= (:cursor-col state) (line-length state (:cursor-row state)))))
+
+;; The skip loops walk with move-right/move-left, so they cross line
+;; boundaries the way Emacs word motion does: at end of line the "char at
+;; point" is nil (the newline), which never counts as a word char -- the
+;; non-word skip steps over it onto the next line, the word skip stops.
+
 (defn- skip-while [state pred]
   (loop [s state]
-    (if (and (< (:cursor-col s) (line-length s (:cursor-row s)))
+    (if (and (not (at-buffer-end? s))
              (pred s (:cursor-row s) (:cursor-col s)))
       (recur (move-right s))
       s)))
@@ -301,9 +310,13 @@
       (skip-while (fn [s r c] (not (word-char-at? s r c))))
       (skip-while word-char-at?)))
 
+(defn- at-buffer-start? [state]
+  (and (= 0 (:cursor-row state)) (= 0 (:cursor-col state))))
+
 (defn- skip-while-back [state pred]
   (loop [s state]
-    (if (and (> (:cursor-col s) 0) (pred s (:cursor-row s) (dec (:cursor-col s))))
+    (if (and (not (at-buffer-start? s))
+             (pred s (:cursor-row s) (dec (:cursor-col s))))
       (recur (move-left s))
       s)))
 
@@ -314,6 +327,34 @@
   (-> state
       (skip-while-back (fn [s r c] (not (word-char-at? s r c))))
       (skip-while-back word-char-at?)))
+
+(defn- blank-line? [state row]
+  (string/blank? (nth (:lines state) row "")))
+
+(defn move-paragraph-forward
+  "Emacs M-}: move to the blank line after the current/next paragraph, or
+   the end of the buffer if there isn't one."
+  [state]
+  (let [n (line-count state)
+        skip (fn [row pred] (loop [r row] (if (and (< r n) (pred r)) (recur (inc r)) r)))
+        row (:cursor-row state)
+        row (skip row #(blank-line? state %))
+        row (skip row #(not (blank-line? state %)))
+        row (min row (dec n))]
+    (assoc state :cursor-row row
+           :cursor-col (if (blank-line? state row) 0 (line-length state row))
+           :goal-col nil)))
+
+(defn move-paragraph-backward
+  "Emacs M-{: move to the blank line before the current/previous
+   paragraph, or the start of the buffer if there isn't one."
+  [state]
+  (let [skip (fn [row pred] (loop [r row] (if (and (>= r 0) (pred r)) (recur (dec r)) r)))
+        row (dec (:cursor-row state))
+        row (skip row #(blank-line? state %))
+        row (skip row #(not (blank-line? state %)))
+        row (max 0 row)]
+    (assoc state :cursor-row row :cursor-col 0 :goal-col nil)))
 
 (defn page-move [state delta page-size]
   (let [{:keys [cursor-row]} state
@@ -387,7 +428,8 @@
    where it was and clearing the mark. No-op (but still clears the mark)
    if the region is empty."
   [state]
-  (if-let [[[sr sc] [er ec]] (region-bounds state)]
+  (if-not (writable? state) (blocked state)
+   (if-let [[[sr sc] [er ec]] (region-bounds state)]
     (let [lines (:lines state)]
       (if (= sr er)
         (-> state push-undo
@@ -397,7 +439,34 @@
               lines* (vec (concat (subvec lines 0 sr) [merged] (subvec lines (inc er))))]
           (-> state push-undo
               (assoc :lines lines* :cursor-row sr :cursor-col sc :mark nil :modified? true)))))
-    state))
+    state)))
+
+;; --- word kills (built on word motion + the region primitives) ---------
+
+(defn kill-word
+  "Emacs M-d: kill from point to the end of the next word, into the
+   clipboard. Replaces any active mark (like the other kill commands, the
+   region machinery is reused for the deletion itself)."
+  [state]
+  (if-not (writable? state) (blocked state)
+   (let [end (move-word-forward state)
+         probe (assoc state :mark [(:cursor-row end) (:cursor-col end)])
+         text (region-text probe)]
+     (if (seq text)
+       (-> probe delete-region (assoc :clipboard text))
+       state))))
+
+(defn backward-kill-word
+  "Emacs M-DEL: kill from the start of the previous word to point, into
+   the clipboard."
+  [state]
+  (if-not (writable? state) (blocked state)
+   (let [start (move-word-backward state)
+         probe (assoc start :mark [(:cursor-row state) (:cursor-col state)])
+         text (region-text probe)]
+     (if (seq text)
+       (-> probe delete-region (assoc :clipboard text))
+       state))))
 
 ;; --- offset <-> [row col] --------------------------------------------
 ;;

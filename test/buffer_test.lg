@@ -96,3 +96,68 @@
           s (buf/ensure-visible s 10 80)]
       (is (<= (:scroll-row s) 30))
       (is (< 30 (+ (:scroll-row s) 10))))))
+
+(deftest word-kills
+  (testing "kill-word removes to the end of the next word, into the clipboard"
+    (let [s (buf/new-state nil ["foo bar baz"])
+          s (buf/kill-word s)]
+      (is (= [" bar baz"] (:lines s)))
+      (is (= "foo" (:clipboard s)))
+      (let [s (buf/kill-word s)]
+        (is (= [" baz"] (:lines s)))
+        (is (= " bar" (:clipboard s))))))
+
+  (testing "kill-word joins lines when the next word starts on the next line"
+    (let [s (buf/new-state nil ["foo" "bar"])
+          s (assoc s :cursor-col 3)
+          s (buf/kill-word s)]
+      (is (= ["foo"] (:lines s)))
+      (is (= "\nbar" (:clipboard s)))))
+
+  (testing "backward-kill-word removes the previous word, leaving point at its start"
+    (let [s (buf/new-state nil ["foo bar baz"])
+          s (assoc s :cursor-col 7)
+          s (buf/backward-kill-word s)]
+      (is (= ["foo  baz"] (:lines s)))
+      (is (= "bar" (:clipboard s)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "kill-word at end of buffer is a no-op"
+    (let [s (buf/new-state nil ["foo"])
+          s (assoc s :cursor-col 3)
+          s (buf/kill-word s)]
+      (is (= ["foo"] (:lines s))))))
+
+(deftest paragraph-motion
+  (testing "forward-paragraph lands on the blank line after the paragraph"
+    (let [s (buf/new-state nil ["one" "two" "" "three" "" "four"])
+          s (buf/move-paragraph-forward s)]
+      (is (= 2 (:cursor-row s)))
+      (is (= 0 (:cursor-col s)))
+      (let [s (buf/move-paragraph-forward s)]
+        (is (= 4 (:cursor-row s))))))
+
+  (testing "forward-paragraph with no trailing blank line stops at buffer end"
+    (let [s (buf/new-state nil ["one" "two"])
+          s (buf/move-paragraph-forward s)]
+      (is (= 1 (:cursor-row s)))
+      (is (= 3 (:cursor-col s)))))
+
+  (testing "backward-paragraph lands on the blank line before the paragraph"
+    (let [s (buf/new-state nil ["one" "" "two" "three"])
+          s (assoc s :cursor-row 3)
+          s (buf/move-paragraph-backward s)]
+      (is (= 1 (:cursor-row s)))
+      (is (= 0 (:cursor-col s)))
+      (let [s (buf/move-paragraph-backward s)]
+        (is (= 0 (:cursor-row s)))))))
+
+(deftest read-only-blocks-region-and-word-kills
+  (testing "delete-region and the word kills refuse on a read-only buffer"
+    (let [s (assoc (buf/new-state nil ["foo bar"]) :read-only? true)
+          s (assoc s :mark [0 0] :cursor-col 3)]
+      (is (= ["foo bar"] (:lines (buf/delete-region s))))
+      (is (= "Buffer is read-only" (:message (buf/delete-region s))))
+      (is (= ["foo bar"] (:lines (buf/kill-word s))))
+      (is (= ["foo bar"] (:lines (buf/backward-kill-word s))))
+      (is (= "" (:clipboard (buf/kill-word s)))))))
