@@ -346,3 +346,11 @@
                        {:highlighter highlight-line
                         :after-command update-paren-match})
 (modes/register-auto-mode! ".lg" :let-go)
+;; let-go is a Clojure dialect, and shares its reader syntax closely enough
+;; (parens/brackets/braces, `;` line comments, `"`-delimited strings) that
+;; real Clojure/ClojureScript/ClojureCommon/Babashka source and EDN data
+;; files get correct highlighting, paren-matching, auto-pairing, and
+;; auto-indent from let-go-mode as-is -- eval (C-x C-e etc.) will of course
+;; only succeed on forms that are also valid let-go.
+(doseq [suffix [".clj" ".cljc" ".cljs" ".bb" ".edn"]]
+  (modes/register-auto-mode! suffix :let-go))

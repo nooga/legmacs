@@ -34,7 +34,14 @@
                :status-right (fn [state] -> string) -- right-aligned lighter
                :suppress-self-insert? (bool | (fn [state] -> bool))
                  -- when truthy, an unbound printable key does nothing
-                    instead of self-inserting (modal editing)}"
+                    instead of self-inserting (modal editing)
+               :syntax-spec {:line-comments :block-comment :string-delims
+                             :brackets :indent-width}
+                 -- a major mode's language spec (see legmacs.prog-syntax and
+                    legmacs.modes.prog/register-prog-mode!); switch-to-mode
+                    auto-enables the generic :paren-match/:electric-pair/
+                    :auto-indent minor modes (legmacs.modes.structural) for
+                    any major mode that declares one}"
   (atom {}))
 
 (def auto-mode-alist
@@ -58,7 +65,7 @@
   ([mode-kw keymap doc opts]
    (swap! registry assoc mode-kw (merge {:on-enter nil :on-exit nil :highlighter nil
                                          :after-command nil :status nil :status-right nil
-                                         :suppress-self-insert? nil}
+                                         :suppress-self-insert? nil :syntax-spec nil}
                                          opts
                                          {:keymap keymap :doc doc}))
    mode-kw))
@@ -98,6 +105,9 @@
 
 (defn mode-status-right [mode-kw]
   (:status-right (get @registry mode-kw)))
+
+(defn mode-syntax-spec [mode-kw]
+  (:syntax-spec (get @registry mode-kw)))
 
 (defn describe-mode [mode-kw]
   (:doc (get @registry mode-kw)))
@@ -140,15 +150,6 @@
              (if (fn? v) (v state) v)))
          (active-modes state))))
 
-(defn switch-to-mode
-  "Switch `state` into `mode-kw` as its major mode, running its :on-enter
-   hook if any. This is the content-mode slot -- at most one at a time."
-  [state mode-kw]
-  (if-let [mode (get @registry mode-kw)]
-    (let [state (assoc state :mode mode-kw)]
-      (if-let [on-enter (:on-enter mode)] (on-enter state) state))
-    (assoc state :message (str "No such mode: " (name mode-kw)))))
-
 (defn minor-mode-active? [state mode-kw]
   (boolean (some #(= % mode-kw) (:minor-modes state))))
 
@@ -171,6 +172,30 @@
     (let [state (update state :minor-modes (fn [ms] (vec (remove #(= % mode-kw) ms))))]
       (if-let [on-exit (:on-exit (get @registry mode-kw))] (on-exit state) state))
     state))
+
+(def default-structural-minor-modes
+  "The minor modes legmacs.modes.structural registers (paren-match,
+   electric-pair, auto-indent) -- switch-to-mode auto-enables all three the
+   moment a buffer's major mode declares a :syntax-spec, so a language
+   registered with legmacs.modes.prog/register-prog-mode! gets all three
+   for free, the same way :let-go already has its own hand-written versions
+   of all three built into its own major-mode keymap/:after-command."
+  [:paren-match :electric-pair :auto-indent])
+
+(defn switch-to-mode
+  "Switch `state` into `mode-kw` as its major mode, running its :on-enter
+   hook if any. This is the content-mode slot -- at most one at a time. If
+   the mode declares a :syntax-spec, also auto-enables
+   default-structural-minor-modes (idempotent, so re-switching into the same
+   mode or one that also has a spec doesn't duplicate them)."
+  [state mode-kw]
+  (if-let [mode (get @registry mode-kw)]
+    (let [state (assoc state :mode mode-kw)
+          state (if-let [on-enter (:on-enter mode)] (on-enter state) state)]
+      (if (:syntax-spec mode)
+        (reduce enable-minor-mode state default-structural-minor-modes)
+        state))
+    (assoc state :message (str "No such mode: " (name mode-kw)))))
 
 (defn toggle-minor-mode [state mode-kw]
   (if (minor-mode-active? state mode-kw)

@@ -1,0 +1,107 @@
+(ns test.structural-mode-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.modes.prog]
+            [legmacs.modes.structural :as structural]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as dispatch]))
+
+(bindings/install!)
+
+(defn- at-end [state]
+  (let [row (dec (count (:lines state)))]
+    (assoc state :cursor-row row :cursor-col (count (nth (:lines state) row)))))
+
+(deftest switching-into-a-prog-mode-auto-enables-the-structural-minors
+  (testing "go-mode declares a :syntax-spec, so switch-to-mode enables all three for free"
+    (let [s (modes/switch-to-mode (buf/new-state nil ["package main"]) :go)]
+      (is (= #{:paren-match :electric-pair :auto-indent} (set (:minor-modes s))))))
+
+  (testing "a major mode with no :syntax-spec doesn't get them auto-enabled"
+    (modes/register-mode! :test-structural-no-spec (atom {}) "no spec")
+    (let [s (modes/switch-to-mode (buf/new-state nil ["x"]) :test-structural-no-spec)]
+      (is (= [] (:minor-modes s))))))
+
+(deftest paren-match-generic
+  (testing "point on an open bracket highlights it and its match, using go-mode's spec"
+    (let [s (-> (buf/new-state nil ["func foo() {" "  bar()" "}"])
+                (assoc :cursor-row 0 :cursor-col 11)
+                (modes/switch-to-mode :go))]
+      (is (= [[0 11] [2 0]] (:paren-match (structural/update-paren-match s))))))
+
+  (testing "clears (rather than errors) when the major mode has no :syntax-spec"
+    (modes/register-mode! :test-structural-pm-no-spec (atom {}) "no spec")
+    (let [s (-> (buf/new-state nil ["(foo)"])
+                (assoc :cursor-row 0 :cursor-col 0)
+                (modes/switch-to-mode :test-structural-pm-no-spec))]
+      (is (nil? (:paren-match (structural/update-paren-match s)))))))
+
+(deftest paren-match-runs-automatically-in-a-prog-mode-buffer
+  (testing "dispatching a movement command in go-mode keeps :paren-match current"
+    (let [s (-> (buf/new-state nil ["(foo)"])
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "C-a"))] ;; move-beginning-of-line, point now right before "("
+      (is (= [[0 0] [0 4]] (:paren-match s))))))
+
+(deftest electric-pair-generic
+  (testing "typing an opener inserts its closer too, point between them"
+    (let [s (dispatch/dispatch (modes/switch-to-mode (buf/new-state nil [""]) :go) "(")]
+      (is (= ["()"] (:lines s)))
+      (is (= 1 (:cursor-col s)))))
+
+  (testing "typing a closer already under point moves over it instead of doubling it"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :go)
+                     ["(" "f" "o" "o" ")"])]
+      (is (= ["(foo)"] (:lines s)))
+      (is (= 5 (:cursor-col s)))))
+
+  (testing "backspacing between an empty auto-inserted pair deletes both sides"
+    (let [s (dispatch/dispatch
+             (dispatch/dispatch (modes/switch-to-mode (buf/new-state nil [""]) :go) "(")
+             "DEL")]
+      (is (= [""] (:lines s)))))
+
+  (testing "inside an (unterminated) string, an opener doesn't pair"
+    (let [s (reduce dispatch/dispatch
+                     (modes/switch-to-mode (buf/new-state nil [""]) :go)
+                     ["\"" "("])]
+      (is (= ["\"("] (:lines s)))))
+
+  (testing "a bracket typed with no :syntax-spec just self-inserts, same as if unbound"
+    (modes/register-mode! :test-structural-ep-no-spec (atom {}) "no spec")
+    (let [s (-> (buf/new-state nil [""])
+                (modes/switch-to-mode :test-structural-ep-no-spec)
+                (modes/enable-minor-mode :electric-pair)
+                (dispatch/dispatch "("))]
+      (is (= ["("] (:lines s)))
+      (is (= 1 (:cursor-col s))))))
+
+(deftest auto-indent-generic
+  (testing "indents the new line by paren depth * the spec's :indent-width (go-mode defaults to 2)"
+    (let [s (-> (at-end (buf/new-state nil ["func foo() {"]))
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "RET"))]
+      (is (= ["func foo() {" "  "] (:lines s)))
+      (is (= 2 (:cursor-col s)))))
+
+  (testing "depth 0 (top level) indents nothing"
+    (let [s (-> (at-end (buf/new-state nil ["foo()"]))
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "RET"))]
+      (is (= ["foo()" ""] (:lines s)))))
+
+  (testing "a comment doesn't confuse depth-tracking"
+    (let [s (-> (at-end (buf/new-state nil ["func foo() { // {"]))
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "RET"))]
+      (is (= "  " (nth (:lines s) 1)))))
+
+  (testing "RET with no :syntax-spec is a plain newline"
+    (modes/register-mode! :test-structural-ai-no-spec (atom {}) "no spec")
+    (let [s (-> (at-end (buf/new-state nil ["(foo"]))
+                (modes/switch-to-mode :test-structural-ai-no-spec)
+                (modes/enable-minor-mode :auto-indent)
+                (dispatch/dispatch "RET"))]
+      (is (= ["(foo" ""] (:lines s))))))

@@ -24,7 +24,25 @@
     (is (= :shell (modes/mode-for-filename "deploy.sh")))
     (is (= :rust (modes/mode-for-filename "lib.rs")))
     (is (= :json (modes/mode-for-filename "package.json")))
-    (is (= :yaml (modes/mode-for-filename "ci.yml")))))
+    (is (= :yaml (modes/mode-for-filename "ci.yml")))
+    (is (= :toml (modes/mode-for-filename "Cargo.toml")))
+    (is (= :lua (modes/mode-for-filename "init.lua")))
+    (is (= :ruby (modes/mode-for-filename "app.rb")))
+    (is (= :sql (modes/mode-for-filename "migration.sql")))
+    (is (= :dockerfile (modes/mode-for-filename "Dockerfile")))
+    (is (= :dockerfile (modes/mode-for-filename "worker.dockerfile")))
+    (is (= :css (modes/mode-for-filename "site.css")))
+    (is (= :html (modes/mode-for-filename "index.html")))
+    (is (= :html (modes/mode-for-filename "page.htm")))
+    (is (= :zig (modes/mode-for-filename "main.zig")))
+    (is (= :java (modes/mode-for-filename "Main.java")))
+    (is (= :kotlin (modes/mode-for-filename "Main.kt")))
+    (is (= :kotlin (modes/mode-for-filename "build.gradle.kts")))
+    (is (= :swift (modes/mode-for-filename "App.swift")))
+    (is (= :csharp (modes/mode-for-filename "Program.cs")))
+    (is (= :php (modes/mode-for-filename "index.php")))
+    (is (= :makefile (modes/mode-for-filename "Makefile")))
+    (is (= :makefile (modes/mode-for-filename "build.mk")))))
 
 (deftest keywords-types-and-constants
   (testing "known words are classified, unknown identifiers left unstyled"
@@ -74,3 +92,95 @@
   (testing "rust-mode has no ' string delimiter, so a lifetime 'a stays plain"
     (let [rust-hl (:highlighter (get @modes/registry :rust))]
       (is (= [{:style :keyword :start 0 :end 2}] (rust-hl "fn foo<'a>(x: &'a T)"))))))
+
+(deftest lua-block-comment-wins-over-its-own-line-comment-prefix
+  (testing "\"--[[\" opens a block comment, not a line comment, even though \"--\" is its prefix"
+    (let [lua-hl (:highlighter (get @modes/registry :lua))]
+      (is (= [{:style :comment :start 0 :end 9} {:style :keyword :start 10 :end 14}]
+             (lua-hl "--[[ c ]] then")))))
+
+  (testing "a bare \"--\" (no following [[) is still an ordinary line comment"
+    (let [lua-hl (:highlighter (get @modes/registry :lua))]
+      (is (= [{:style :comment :start 9 :end 23}] (lua-hl "print(x) -- not a block"))))))
+
+(deftest sql-keywords-are-case-insensitive
+  (testing "both SELECT and select are tagged :keyword"
+    (let [sql-hl (:highlighter (get @modes/registry :sql))]
+      (is (= [{:style :keyword :start 0 :end 6} {:style :keyword :start 9 :end 13}]
+             (sql-hl "SELECT * from t")))
+      (is (= [{:style :keyword :start 0 :end 6} {:style :keyword :start 9 :end 13}]
+             (sql-hl "select * FROM t")))))
+
+  (testing "-- starts a line comment (SQL has no [[ ]] business like Lua's)"
+    (let [sql-hl (:highlighter (get @modes/registry :sql))]
+      (is (= [{:style :comment :start 0 :end 12}] (sql-hl "-- a comment"))))))
+
+(deftest dockerfile-matches-the-bare-filename-and-is-case-insensitive
+  (testing "FROM and from both highlight as keywords"
+    (let [docker-hl (:highlighter (get @modes/registry :dockerfile))]
+      (is (= [{:style :keyword :start 0 :end 4}] (docker-hl "FROM alpine")))
+      (is (= [{:style :keyword :start 0 :end 4}] (docker-hl "from alpine"))))))
+
+(deftest css-has-no-keywords-just-comments-and-strings
+  (testing "css-mode only tags block comments and strings, no word classification"
+    (let [css-hl (:highlighter (get @modes/registry :css))]
+      (is (= [{:style :comment :start 0 :end 15}] (css-hl "/* a comment */")))
+      (is (= [{:style :string :start 9 :end 13}] (css-hl "content: \"hi\";"))))))
+
+(deftest html-has-no-keywords-just-comments-and-attribute-strings
+  (testing "html-mode tags <!-- --> comments and quoted attribute values, no tag/word classification"
+    (let [html-hl (:highlighter (get @modes/registry :html))]
+      (is (= [{:style :comment :start 0 :end 18}] (html-hl "<!-- a comment -->")))
+      (is (= [{:style :string :start 8 :end 11}] (html-hl "<a href=\"x\">"))))))
+
+(deftest zig-java-kotlin-swift-csharp-php-makefile-basics
+  (testing "zig-mode: keywords, types, and /// doc comments (a \"//\" prefix, no block comments)"
+    (let [zig-hl (:highlighter (get @modes/registry :zig))]
+      (is (= [{:style :keyword :start 0 :end 3} {:style :keyword :start 4 :end 6}
+              {:style :type :start 14 :end 18}]
+             (zig-hl "pub fn main() void {")))
+      (is (= [{:style :comment :start 0 :end 15}] (zig-hl "/// doc comment")))))
+
+  (testing "java-mode: keywords"
+    (let [java-hl (:highlighter (get @modes/registry :java))]
+      (is (= [{:style :keyword :start 0 :end 6} {:style :keyword :start 7 :end 12}]
+             (java-hl "public class Foo {")))))
+
+  (testing "kotlin-mode: fun/val keywords, true as a constant"
+    (let [kotlin-hl (:highlighter (get @modes/registry :kotlin))]
+      (is (= [{:style :keyword :start 0 :end 3} {:style :keyword :start 13 :end 16}
+              {:style :keyword-literal :start 21 :end 25}]
+             (kotlin-hl "fun main() { val x = true }")))))
+
+  (testing "swift-mode: func/return keywords, Int type"
+    (let [swift-hl (:highlighter (get @modes/registry :swift))]
+      (is (= [{:style :keyword :start 0 :end 4} {:style :type :start 14 :end 17}
+              {:style :keyword :start 20 :end 26} {:style :number :start 27 :end 28}]
+             (swift-hl "func foo() -> Int { return 1 }")))))
+
+  (testing "csharp-mode: keywords"
+    (let [csharp-hl (:highlighter (get @modes/registry :csharp))]
+      (is (= [{:style :keyword :start 0 :end 6} {:style :keyword :start 7 :end 12}]
+             (csharp-hl "public class Foo { }")))))
+
+  (testing "php-mode: has both // and # line comments"
+    (let [php-hl (:highlighter (get @modes/registry :php))]
+      (is (= [{:style :keyword :start 6 :end 10} {:style :string :start 11 :end 15}
+              {:style :comment :start 17 :end 24}]
+             (php-hl "<?php echo \"hi\"; // done")))
+      (is (= [{:style :comment :start 0 :end 21}] (php-hl "# shell-style comment")))))
+
+  (testing "makefile-mode: # comments, a handful of directive keywords"
+    (let [make-hl (:highlighter (get @modes/registry :makefile))]
+      (is (= [{:style :comment :start 11 :end 20}] (make-hl "all: build # comment"))))))
+
+(deftest toml-and-ruby-basics
+  (testing "toml-mode: # comments, true/false constants"
+    (let [toml-hl (:highlighter (get @modes/registry :toml))]
+      (is (= [{:style :keyword-literal :start 8 :end 12}] (toml-hl "debug = true")))
+      (is (= [{:style :comment :start 0 :end 11}] (toml-hl "# a comment")))))
+
+  (testing "ruby-mode: def/end keywords, nil constant"
+    (let [ruby-hl (:highlighter (get @modes/registry :ruby))]
+      (is (some #(= {:style :keyword :start 0 :end 3} %) (ruby-hl "def foo; end")))
+      (is (some #(= {:style :keyword-literal :start 0 :end 3} %) (ruby-hl "nil"))))))

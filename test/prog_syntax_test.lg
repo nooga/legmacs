@@ -1,0 +1,108 @@
+(ns test.prog-syntax-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.prog-syntax :as ps]))
+
+(def go-spec
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'" "`"]})
+
+(def json-spec
+  {:string-delims ["\""]})
+
+(def lua-spec
+  {:line-comments ["--"]
+   :block-comment ["--[[" "]]"]
+   :string-delims ["\"" "'"]})
+
+(deftest basic-matching
+  (testing "nested brackets all match correctly, both directions"
+    (let [text "func(a, [x], {y}) {}"
+          s (ps/scan text go-spec)]
+      (is (= (string/index-of text ")") (ps/matching s (string/index-of text "("))))
+      (is (= (string/index-of text "]") (ps/matching s (string/index-of text "["))))
+      (is (= (string/last-index-of text "}") (ps/matching s (string/last-index-of text "{")))))))
+
+(deftest line-comments-are-skipped
+  (testing "a paren inside a // comment doesn't count as structure"
+    (let [text "(a) // comment (fake paren)\n(b)"
+          s (ps/scan text go-spec)
+          second-open (string/last-index-of text "(")]
+      (is (= (string/index-of text ")") (ps/matching s 0)))
+      (is (= (dec (count text)) (ps/matching s second-open)))
+      (is (= 1 (count (:spans s))))
+      (is (= :comment (:type (first (:spans s))))))))
+
+(deftest block-comments
+  (testing "a block comment closed on the same line doesn't break structure across it"
+    (let [text "(a /* (fake) */ b)"
+          s (ps/scan text go-spec)]
+      (is (= (dec (count text)) (ps/matching s 0)))))
+
+  (testing "an unterminated block comment reports :in-comment? at the cutoff"
+    (let [text "/* still open"
+          s (ps/scan text (count text) go-spec)]
+      (is (:in-comment? s))
+      (is (not (:in-string? s)))))
+
+  (testing "a block comment closed exactly at the cutoff is not :in-comment?"
+    (let [text "/* done */"
+          s (ps/scan text (count text) go-spec)]
+      (is (not (:in-comment? s))))))
+
+(deftest strings-with-multiple-delimiters
+  (testing "double, single, and backtick delimiters all skip structure inside them"
+    (is (= (dec (count "(\"str)\")")) (ps/matching (ps/scan "(\"str)\")" go-spec) 0)))
+    (is (= (dec (count "('str)')")) (ps/matching (ps/scan "('str)')" go-spec) 0)))
+    (is (= (dec (count "(`str)`)")) (ps/matching (ps/scan "(`str)`)" go-spec) 0))))
+
+  (testing "backslash escapes inside strings are honored"
+    (let [text "(a \"str ) with \\\" escaped quote\" b)"]
+      (is (= (dec (count text)) (ps/matching (ps/scan text go-spec) 0)))))
+
+  (testing "in-string? distinguishes an open string from one closed exactly at the cutoff"
+    (is (:in-string? (ps/scan "\"unterminated" 13 go-spec)))
+    (is (not (:in-string? (ps/scan "\"foo\"" 5 go-spec))))))
+
+(deftest block-comment-open-marker-wins-over-a-prefix-line-comment-marker
+  (testing "Lua's \"--[[\" is checked before the plain \"--\" line comment it's a prefix of"
+    (let [text "f(--[[ (fake) ]] a)"
+          s (ps/scan text lua-spec)]
+      (is (= (dec (count text)) (ps/matching s 1)))))
+
+  (testing "a bare \"--\" with no following [[ is still an ordinary line comment"
+    (let [text "f(a) -- (b)\nf(c)"
+          s (ps/scan text lua-spec)]
+      (is (= (string/index-of text ")") (ps/matching s 1)))
+      (is (= (dec (count text)) (ps/matching s (string/last-index-of text "(")))))))
+
+(deftest depth-at-tracks-currently-open-brackets
+  (testing "depth grows with unmatched opens before point, ignoring closed ones"
+    (let [text "func foo(x) {\n  if (x) {"]
+      (is (= 0 (ps/depth-at text 0 go-spec)))
+      (is (= 2 (ps/depth-at text (count text) go-spec))))))
+
+(deftest json-spec-has-no-comments-or-brackets-override
+  (testing "an empty :line-comments list never matches, default brackets still apply"
+    (let [text "{\"a\": [1, 2]}"
+          s (ps/scan text json-spec)]
+      (is (= (dec (count text)) (ps/matching s 0)))
+      (is (= (string/index-of text "]") (ps/matching s (string/index-of text "[")))))))
+
+(deftest point-in-string-or-comment?-cases
+  (testing "inside an open string at the cutoff"
+    (is (ps/point-in-string-or-comment? (ps/scan "\"foo" 4 go-spec) 4)))
+  (testing "inside an open block comment at the cutoff"
+    (is (ps/point-in-string-or-comment? (ps/scan "/* foo" 6 go-spec) 6)))
+  (testing "inside a line comment at the cutoff"
+    (is (ps/point-in-string-or-comment? (ps/scan "// foo" 6 go-spec) 6)))
+  (testing "top level is not in a string or comment"
+    (is (not (ps/point-in-string-or-comment? (ps/scan "(foo)" 5 go-spec) 5)))))
+
+(deftest bracket-predicates
+  (testing "open-bracket?/close-bracket?/close-for use the spec's bracket map, defaulting to the standard three pairs"
+    (is (ps/open-bracket? go-spec \())
+    (is (ps/close-bracket? go-spec \)))
+    (is (not (ps/open-bracket? go-spec \x)))
+    (is (= \) (ps/close-for go-spec \()))))

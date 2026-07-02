@@ -21,6 +21,7 @@
             [legmacs.modes.letgo]
             [legmacs.modes.markdown]
             [legmacs.modes.prog]
+            [legmacs.modes.structural]
             [legmacs.modes.crutch]
             [legmacs.modes.keycast]
             [legmacs.modes.help]

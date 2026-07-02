@@ -53,6 +53,14 @@
   (testing ".lg is in the auto-mode-alist, pointing at :let-go"
     (is (= :let-go (modes/mode-for-filename "foo.lg")))))
 
+(deftest let-go-mode-also-claims-clojure-and-edn-files
+  (testing "clj/cljc/cljs/bb/edn share close enough reader syntax to reuse let-go-mode"
+    (is (= :let-go (modes/mode-for-filename "foo.clj")))
+    (is (= :let-go (modes/mode-for-filename "foo.cljc")))
+    (is (= :let-go (modes/mode-for-filename "foo.cljs")))
+    (is (= :let-go (modes/mode-for-filename "foo.bb")))
+    (is (= :let-go (modes/mode-for-filename "foo.edn")))))
+
 (deftest highlight-line-cases
   (testing "special forms are tagged :keyword"
     (let [spans (lg-mode/highlight-line "(defn foo [x] x)")]

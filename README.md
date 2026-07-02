@@ -18,12 +18,16 @@ that, it does a lot more than I expected it would when I started:
   its own cursor and scroll, side-by-side ones separated by `│` dividers
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
-- syntax highlighting for let-go and Markdown, plus a spec-driven language
-  pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML) you can extend with
-  one call
-- paren matching, auto-closing brackets, and structural expand-region
+- syntax highlighting for 20+ languages out of the box, plus paren
+  matching, auto-closing brackets, and depth-based auto-indent for all of
+  them (see [Language support](#language-support)) -- and it's a one-call
+  `register-prog-mode!` to add your own
 - in-process eval (`C-x C-e` / `C-j`), because it's a Lisp editing a Lisp in
-  the very same runtime, so `*scratch*` is a live REPL over the editor itself
+  the very same runtime, so `*scratch*` is a live REPL over the editor
+  itself -- and since let-go is close enough to Clojure's reader syntax,
+  `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files open into the same mode too
+- structural expand-region for let-go, growing the selection one
+  s-expression at a time
 - swiper-style live incremental search
 - vertico/ivy-style fuzzy completion for commands, files, and buffers
 - CRUTCH, a bundled vi-style modal minor mode (yes, modal editing, if you want it)
@@ -68,6 +72,57 @@ Drop a `legmacs-init` namespace at `~/.config/legmacs/legmacs_init.lg`:
 Same `defcommand`/`bind-key!` the editor defines its own keys with. See
 [examples/legmacs_init.example.lg](examples/legmacs_init.example.lg) for a
 fuller one.
+
+## Language support
+
+let-go-mode and markdown-mode are hand-written (in-process eval for the
+former); `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` reuse let-go-mode's syntax
+handling as-is, since let-go is a Clojure dialect close enough in reader
+syntax. Everything else comes from one spec-driven scanner
+([`legmacs/modes/prog.lg`](legmacs/modes/prog.lg)): syntax highlighting,
+paren matching, auto-closing brackets, and auto-indent, all from a single
+data map of comment markers, string delimiters, and keyword/type/constant
+word sets.
+
+| Language | Extensions |
+|---|---|
+| let-go / Clojure / EDN | `.lg` `.clj` `.cljc` `.cljs` `.bb` `.edn` |
+| Markdown | `.md` `.markdown` |
+| Go | `.go` |
+| JavaScript / TypeScript | `.js` `.jsx` `.mjs` `.cjs` `.ts` `.tsx` |
+| Python | `.py` |
+| C / C++ | `.c` `.h` `.cpp` `.hpp` `.cc` `.hh` `.cxx` |
+| Rust | `.rs` |
+| Java | `.java` |
+| Kotlin | `.kt` `.kts` |
+| Swift | `.swift` |
+| C# | `.cs` |
+| PHP | `.php` |
+| Zig | `.zig` |
+| Ruby | `.rb` |
+| Lua | `.lua` |
+| Shell | `.sh` `.bash` `.zsh` |
+| SQL | `.sql` |
+| JSON | `.json` |
+| YAML | `.yaml` `.yml` |
+| TOML | `.toml` |
+| CSS | `.css` |
+| HTML | `.html` `.htm` |
+| Dockerfile | `Dockerfile` `.dockerfile` |
+| Makefile | `Makefile` `.mk` |
+
+Adding one more is a single call from `legmacs-init.lg`:
+
+```clojure
+(require '[legmacs.modes.prog :as prog])
+
+(prog/register-prog-mode! :elixir "elixir-mode"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"def" "defmodule" "do" "end" "if" "else" "case" "fn"}
+   :constants #{"true" "false" "nil"}}
+  [".ex" ".exs"])
+```
 
 ## More
 

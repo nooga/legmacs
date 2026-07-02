@@ -89,9 +89,34 @@ paren-matching, auto-indent, expand-region, and auto-pairing in
 independent mode (highlighting only) built the same way; and `legmacs/
 modes/prog.lg` generalizes that shape into one spec-driven per-line scanner
 (comment markers, string delimiters, keyword/type/constant word sets)
-behind highlight-only modes for Go/JS/Python/C/shell/Rust/JSON/YAML —
-its `register-prog-mode!` is both how the built-ins register and the
-user-facing one-call way to add a language.
+behind major modes for Go/JS/Python/C/shell/Rust/JSON/YAML/TOML/Lua/Ruby/
+SQL/Dockerfile/CSS/HTML/Zig/Java/Kotlin/Swift/C#/PHP/Makefile — its
+`register-prog-mode!` is both how the built-ins
+register and the user-facing one-call way to add a language. `:block-comment`
+is checked before `:line-comments` in both this scanner and
+`legmacs/prog_syntax.lg` below, since a block-open marker can be a
+strict-prefix superstring of the line-comment marker (Lua: `--[[` vs `--`).
+
+**Paren-matching, auto-pairing, and auto-indent are reusable minor modes,
+not let-go-only.** `legmacs/prog_syntax.lg` is a sibling of
+`legmacs/lisp_syntax.lg` — the same full-buffer bracket/string/comment scan,
+but driven by a language `:spec` map (the exact one `register-prog-mode!`
+already builds a highlighter from: `:line-comments`, `:block-comment`,
+`:string-delims`, plus purely-structural `:brackets`/`:indent-width`
+knobs) instead of Lisp's fixed rules. `legmacs/modes/structural.lg` builds
+three ordinary minor modes on top of it — `:paren-match`, `:electric-pair`,
+`:auto-indent` — that look up `(modes/mode-syntax-spec (:mode state))` at
+call time and degrade to plain behavior (self-insert, plain newline, clear
+the match) when the active buffer's major mode has none. `register-prog-mode!`
+stores its spec as the mode's `:syntax-spec`, and `legmacs.modes/switch-to-mode`
+auto-enables all three whenever the mode being switched to has one — so
+every language in the pack gets all three "for free" the same way `.lg`
+files already had them, with zero extra wiring per language. `:let-go`
+deliberately doesn't declare a `:syntax-spec` and keeps its own
+hand-written versions in `legmacs/modes/letgo.lg` instead, since a real
+Lisp reader has structure (character literals like `\(`) this generic
+scanner doesn't model — merging the two would either lose that or bloat
+the generic scanner with Lisp-only rules every other language pays for.
 
 **Major vs minor modes are one registry, distinguished only by which buffer
 slot holds them.** A buffer's `:mode` is its single major (content) mode;

@@ -181,7 +181,13 @@ right-aligned mode-line lighter) all compose across every active mode.
 state.
 
 `*scratch*` starts in **let-go-mode**, and any file ending in `.lg` opens
-into it automatically:
+into it automatically -- as do `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files,
+since let-go is a Clojure dialect close enough in reader syntax
+(parens/brackets/braces, `;` comments, `"`-strings) that real
+Clojure/ClojureScript/Babashka source and EDN data get correct
+highlighting, paren-matching, auto-pairing, and auto-indent as-is; only
+in-process eval (`C-x C-e` etc.) is let-go-specific and won't succeed on
+forms that aren't also valid let-go:
 
 | Keys | Action |
 |---|---|
@@ -243,29 +249,41 @@ so only a fenced-code-block's ` ``` ` delimiter lines are recognized, not
 the code between them (the same limitation, for the same reason, as the
 multi-line string case above).
 
-### The language pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML)
+### The language pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, Makefile)
 
 Beyond the two hand-written modes, one spec-driven scanner
-([`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg)) provides highlight-only
-modes for the usual suspects: **go-mode** (`.go`), **javascript-mode**
+([`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg)) provides major modes
+for the usual suspects: **go-mode** (`.go`), **javascript-mode**
 (`.js`/`.jsx`/`.mjs`/`.cjs`/`.ts`/`.tsx`), **python-mode** (`.py`),
 **c-mode** (`.c`/`.h`/`.cpp`/`.hpp`/`.cc`/...), **shell-mode**
-(`.sh`/`.bash`/`.zsh`), **rust-mode** (`.rs`), **json-mode** (`.json`), and
-**yaml-mode** (`.yaml`/`.yml`). A language here is just a data map -- line
-and block comment markers, string delimiters (backslash-escapes honored),
-and keyword/type/constant word sets -- and `register-prog-mode!` turns it
-into a registered mode plus its filename associations. Adding your own from
+(`.sh`/`.bash`/`.zsh`), **rust-mode** (`.rs`), **json-mode** (`.json`),
+**yaml-mode** (`.yaml`/`.yml`), **toml-mode** (`.toml`), **lua-mode**
+(`.lua`), **ruby-mode** (`.rb`), **sql-mode** (`.sql`, keywords
+case-insensitive), **dockerfile-mode** (`Dockerfile`/`.dockerfile`, also
+case-insensitive), **css-mode** (`.css`), **html-mode** (`.html`/`.htm`,
+comments-and-strings only, like css-mode -- neither has a keyword
+vocabulary this scanner's word-based classification applies to, HTML's
+structure being tags and attributes rather than keywords), **zig-mode**
+(`.zig`, no block comments, just `//`/`///`/`//!` line comments),
+**java-mode** (`.java`), **kotlin-mode** (`.kt`/`.kts`), **swift-mode**
+(`.swift`), **csharp-mode** (`.cs`), **php-mode** (`.php`, both `//` and
+`#` line comments), and **makefile-mode** (`Makefile`/`makefile`/
+`GNUmakefile`/`.mk`). A language here is just a data map -- line and block
+comment markers, string delimiters (backslash-escapes honored), and
+keyword/type/constant word sets -- and `register-prog-mode!` turns it into
+a registered mode plus its filename associations. Adding your own from
 `legmacs-init.lg` is one call:
 
 ```clojure
 (require '[legmacs.modes.prog :as prog])
 
-(prog/register-prog-mode! :zig "zig-mode"
-  {:line-comments ["//"]
-   :string-delims ["\""]
-   :keywords #{"fn" "pub" "const" "var" "if" "else" "while" "return"}
-   :constants #{"true" "false" "null" "undefined"}}
-  [".zig"])
+(prog/register-prog-mode! :elixir "elixir-mode"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"def" "defmodule" "defp" "do" "end" "if" "else" "case"
+               "cond" "fn" "import" "alias" "require" "use"}
+   :constants #{"true" "false" "nil"}}
+  [".ex" ".exs"])
 ```
 
 (That last argument is the general file-association mechanism, usable with
@@ -275,6 +293,35 @@ filename suffix to a major mode, consulted whenever a file is opened.)
 Same per-line simplification as the other highlighters: strings and `/* */`
 comments that close on their own line are exact; a multi-line construct
 highlights on the line where it opens and not on its continuation lines.
+`:block-comment` is always checked before `:line-comments`, so a language
+whose block-open marker starts with its own line-comment marker (Lua's
+`--[[` is prefixed by its `--`) still opens a block comment rather than a
+line comment swallowing the rest of the line. SQL and Dockerfile keywords
+are matched case-insensitively (`register-prog-mode!`'s callers just widen
+`:keywords`/`:constants` to both cases, via `both-cases` in
+`legmacs/modes/prog.lg`) since real-world SQL/Dockerfiles mix casing.
+
+Every language in the pack also gets paren matching, auto-paired brackets,
+and depth-based auto-indent for free -- the same three features
+let-go-mode has always had, generalized instead of reimplemented per
+language. [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) is a
+full-buffer scanner like `legmacs.lisp-syntax`, but spec-driven (the exact
+same `:line-comments`/`:block-comment`/`:string-delims` map
+`register-prog-mode!` already builds a highlighter from, plus `:brackets`
+and `:indent-width` if you want to override either). Three ordinary minor
+modes -- `:paren-match`, `:electric-pair`, `:auto-indent`
+([`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg)) -- read
+whatever spec the buffer's *major* mode declares and behave accordingly; a
+major mode with no spec makes them no-ops (plain newline, plain
+self-insert), so `register-prog-mode!` is the only thing a language needs
+to call to get all three, tuned to it, with zero extra wiring.
+`legmacs.modes/switch-to-mode` auto-enables all three the moment a buffer's
+major mode has a `:syntax-spec`, so this happens by default for every
+built-in language and any you add the same way. let-go-mode keeps its own
+older, hand-written versions of all three (built on `legmacs.lisp-syntax`,
+which additionally understands Lisp character literals like `\(` --
+genuinely Lisp-specific structure the generic scanner doesn't model) rather
+than switching to the generic ones.
 
 ### CRUTCH mode (vi-style modal editing)
 
@@ -441,9 +488,11 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/bindings.lg`](../legmacs/bindings.lg) | The default keymap, defined with `bind-key!`. |
 | [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a per-line highlighter, an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
-| [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*` and `.lg` files. |
+| [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules). Registered for `.md`/`.markdown` files. |
-| [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven per-line scanner (comments, strings, keyword/type/constant sets) behind highlight-only modes for Go, JS/TS, Python, C/C++, shell, Rust, JSON, and YAML. `register-prog-mode!` is the one-call way to add a language. |
+| [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven per-line scanner (comments, strings, keyword/type/constant sets) behind major modes for Go, JS/TS, Python, C/C++, shell, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
+| [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |
+| [`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg) | Three generic minor modes -- `:paren-match`, `:electric-pair`, `:auto-indent` -- driven by whatever `:syntax-spec` the buffer's major mode declares; no-op (plain newline/self-insert) when it has none. `legmacs.modes/switch-to-mode` auto-enables all three for any major mode with a spec, so the whole language pack gets them by default. |
 | [`legmacs/modes/crutch.lg`](../legmacs/modes/crutch.lg) | CRUTCH: vi-style modal editing as a bundled minor mode (`M-x crutch-mode`). A worked example of the minor-mode/`:keymap`-fn/`:suppress-self-insert?` machinery. |
 | [`legmacs/modes/keycast.lg`](../legmacs/modes/keycast.lg) | keycast: a right-aligned live keystroke preview (`M-x keycast-mode`). A pure observer minor mode built on `:last-chord` + `:status-right`. |
 | [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (see `C-h`/`describe-bindings`). Highlight-only, like markdown-mode. |

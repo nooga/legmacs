@@ -80,14 +80,17 @@
           (if (>= i n)
             spans
             (cond
-              (some #(at? line i %) line-comments)
-              (conj spans {:style :comment :start i :end n})
-
+              ;; Checked before line-comments: a language whose block-open
+              ;; marker starts with its line-comment marker (Lua's "--[["
+              ;; vs "--") needs the longer, more specific one to win.
               (and block-open (at? line i block-open))
               (if-let [close (string/index-of line block-close (+ i (count block-open)))]
                 (let [end (+ close (count block-close))]
                   (recur end (conj spans {:style :comment :start i :end end})))
                 (conj spans {:style :comment :start i :end n}))
+
+              (some #(at? line i %) line-comments)
+              (conj spans {:style :comment :start i :end n})
 
               (some #(at? line i %) string-delims)
               (let [end (scan-string chars n i (nth chars i))]
@@ -106,13 +109,27 @@
 
               :else (recur (inc i) spans))))))))
 
+(defn- both-cases
+  "Both-case variants of every word in `words`, for languages (SQL,
+   Dockerfile) whose keywords are conventionally uppercase but not
+   case-sensitive -- a plain :keywords set would only ever match one
+   casing."
+  [words]
+  (into #{} (mapcat (fn [w] [(string/upper-case w) (string/lower-case w)]) words)))
+
 (defn register-prog-mode!
-  "Register `mode-kw` as a highlight-only major mode built from `spec` (see
+  "Register `mode-kw` as a major mode built from `spec` (see
    make-highlighter) and associate it with each filename suffix in
    `suffixes`. This is the whole public surface -- the built-in languages
-   below and a user's own additions go through the same call."
+   below and a user's own additions go through the same call.
+   `spec` also becomes the mode's :syntax-spec (legmacs.modes/register-mode!),
+   which is what makes legmacs.modes.structural's paren-match, electric-pair,
+   and auto-indent minor modes -- auto-enabled by legmacs.modes/switch-to-mode
+   for any major mode with a :syntax-spec -- work for this language too, for
+   free: no separate call needed to get all three tuned to it."
   [mode-kw doc spec suffixes]
-  (modes/register-mode! mode-kw (atom {}) doc {:highlighter (make-highlighter spec)})
+  (modes/register-mode! mode-kw (atom {}) doc
+                         {:highlighter (make-highlighter spec) :syntax-spec spec})
   (doseq [suffix suffixes]
     (modes/register-auto-mode! suffix mode-kw))
   mode-kw)
@@ -217,3 +234,184 @@
    :string-delims ["\"" "'"]
    :constants #{"true" "false" "null" "yes" "no" "on" "off"}}
   [".yaml" ".yml"])
+
+(register-prog-mode! :toml "toml-mode: syntax highlighting for TOML"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :constants #{"true" "false"}}
+  [".toml"])
+
+(register-prog-mode! :lua "lua-mode: syntax highlighting for Lua"
+  {:line-comments ["--"]
+   ;; Lua's long-bracket comment; --[=[ ]=] variants aren't handled, same
+   ;; simplification as everything else here.
+   :block-comment ["--[[" "]]"]
+   :string-delims ["\"" "'"]
+   :keywords #{"and" "break" "do" "else" "elseif" "end" "for" "function"
+               "goto" "if" "in" "local" "not" "or" "repeat" "return"
+               "then" "until" "while"}
+   :constants #{"true" "false" "nil"}}
+  [".lua"])
+
+(register-prog-mode! :ruby "ruby-mode: syntax highlighting for Ruby"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"and" "attr_accessor" "attr_reader" "attr_writer" "begin"
+               "break" "case" "class" "def" "do" "else" "elsif" "end"
+               "ensure" "for" "if" "in" "lambda" "module" "next" "not"
+               "or" "private" "proc" "protected" "public" "raise" "redo"
+               "require" "require_relative" "rescue" "retry" "return"
+               "self" "super" "then" "unless" "until" "when" "while"
+               "yield"}
+   :constants #{"true" "false" "nil"}}
+  [".rb"])
+
+(register-prog-mode! :sql "sql-mode: syntax highlighting for SQL"
+  {:line-comments ["--"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["'" "\""]
+   :keywords (both-cases
+              ["select" "from" "where" "insert" "into" "values" "update"
+               "set" "delete" "create" "table" "alter" "drop" "join"
+               "inner" "left" "right" "outer" "on" "group" "by" "order"
+               "having" "limit" "offset" "union" "all" "distinct" "as"
+               "and" "or" "not" "is" "in" "exists" "between" "like" "case"
+               "when" "then" "else" "end" "primary" "key" "foreign"
+               "references" "default" "index" "view" "with"])
+   :constants (both-cases ["null" "true" "false"])}
+  [".sql"])
+
+(register-prog-mode! :dockerfile "dockerfile-mode: syntax highlighting for Dockerfiles"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords (both-cases
+              ["from" "run" "cmd" "label" "maintainer" "expose" "env"
+               "add" "copy" "entrypoint" "volume" "user" "workdir" "arg"
+               "onbuild" "stopsignal" "healthcheck" "shell" "as"])}
+  ["Dockerfile" ".dockerfile"])
+
+(register-prog-mode! :css "css-mode: syntax highlighting for CSS"
+  {:block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]}
+  [".css"])
+
+(register-prog-mode! :html "html-mode: syntax highlighting for HTML"
+  {:block-comment ["<!--" "-->"]
+   :string-delims ["\"" "'"]}
+  [".html" ".htm"])
+
+(register-prog-mode! :zig "zig-mode: syntax highlighting for Zig"
+  {;; no block comments in Zig -- only //, plus doc-comment variants ///
+   ;; and //! that this still catches since they all start with "//"
+   :line-comments ["//"]
+   :string-delims ["\"" "'"]
+   :keywords #{"align" "allowzero" "and" "asm" "async" "await" "break"
+               "catch" "comptime" "const" "continue" "defer" "else" "enum"
+               "errdefer" "error" "export" "extern" "fn" "for" "if"
+               "inline" "noalias" "noinline" "nosuspend" "opaque" "or"
+               "orelse" "packed" "pub" "resume" "return" "struct"
+               "suspend" "switch" "test" "threadlocal" "try"
+               "unreachable" "union" "usingnamespace" "var" "volatile"
+               "while"}
+   :types #{"anyerror" "anyframe" "anyopaque" "anytype" "bool" "c_int"
+            "c_long" "c_longdouble" "c_longlong" "c_short" "c_uint"
+            "c_ulong" "c_ulonglong" "c_ushort" "f16" "f32" "f64" "f128"
+            "i8" "i16" "i32" "i64" "i128" "isize" "noreturn" "type" "u8"
+            "u16" "u32" "u64" "u128" "usize" "void"}
+   :constants #{"true" "false" "null" "undefined"}}
+  [".zig"])
+
+(register-prog-mode! :java "java-mode: syntax highlighting for Java"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :keywords #{"abstract" "assert" "break" "case" "catch" "class" "const"
+               "continue" "default" "do" "else" "enum" "extends" "final"
+               "finally" "for" "goto" "if" "implements" "import"
+               "instanceof" "interface" "native" "new" "package"
+               "private" "protected" "public" "return" "static"
+               "strictfp" "super" "switch" "synchronized" "this" "throw"
+               "throws" "transient" "try" "void" "volatile" "while"}
+   :types #{"boolean" "byte" "char" "double" "float" "int" "long" "short"
+            "String" "Integer" "Long" "Double" "Float" "Boolean" "Object"
+            "List" "Map" "Set"}
+   :constants #{"true" "false" "null"}}
+  [".java"])
+
+(register-prog-mode! :kotlin "kotlin-mode: syntax highlighting for Kotlin"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :keywords #{"as" "break" "class" "companion" "const" "constructor"
+               "continue" "data" "do" "else" "enum" "for" "fun" "if"
+               "import" "in" "infix" "init" "inline" "inner" "interface"
+               "internal" "is" "lateinit" "object" "open" "operator"
+               "out" "override" "package" "private" "protected" "public"
+               "reified" "return" "sealed" "suspend" "this" "throw" "try"
+               "typealias" "val" "var" "vararg" "when" "where" "while"}
+   :types #{"Any" "Boolean" "Byte" "Char" "Double" "Float" "Int" "List"
+            "Long" "Map" "Set" "Short" "String" "Unit"}
+   :constants #{"true" "false" "null"}}
+  [".kt" ".kts"])
+
+(register-prog-mode! :swift "swift-mode: syntax highlighting for Swift"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\""]
+   :keywords #{"as" "associatedtype" "break" "case" "catch" "class"
+               "continue" "default" "defer" "deinit" "do" "else" "enum"
+               "extension" "fallthrough" "fileprivate" "for" "func"
+               "guard" "if" "import" "in" "init" "inout" "internal" "is"
+               "let" "open" "operator" "private" "protocol" "public"
+               "repeat" "rethrows" "return" "self" "static" "struct"
+               "subscript" "super" "switch" "throw" "throws" "try"
+               "typealias" "var" "where" "while"}
+   :types #{"Any" "AnyObject" "Array" "Bool" "Character" "Dictionary"
+            "Double" "Float" "Int" "Int8" "Int16" "Int32" "Int64" "Set"
+            "String" "UInt" "Void"}
+   :constants #{"true" "false" "nil"}}
+  [".swift"])
+
+(register-prog-mode! :csharp "csharp-mode: syntax highlighting for C#"
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :keywords #{"abstract" "as" "async" "await" "base" "break" "case"
+               "catch" "checked" "class" "const" "continue" "default"
+               "delegate" "do" "else" "enum" "event" "explicit" "extern"
+               "finally" "fixed" "for" "foreach" "goto" "if" "implicit"
+               "in" "interface" "internal" "is" "lock" "namespace" "new"
+               "operator" "out" "override" "params" "private" "protected"
+               "public" "readonly" "ref" "return" "sealed" "sizeof"
+               "stackalloc" "static" "struct" "switch" "this" "throw"
+               "try" "typeof" "unchecked" "unsafe" "using" "var"
+               "virtual" "volatile" "while" "yield"}
+   :types #{"bool" "byte" "char" "decimal" "double" "float" "int" "long"
+            "object" "sbyte" "short" "string" "uint" "ulong" "ushort"
+            "void"}
+   :constants #{"true" "false" "null"}}
+  [".cs"])
+
+(register-prog-mode! :php "php-mode: syntax highlighting for PHP"
+  {:line-comments ["//" "#"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :keywords #{"abstract" "and" "array" "as" "break" "callable" "case"
+               "catch" "class" "clone" "const" "continue" "declare"
+               "default" "do" "echo" "else" "elseif" "empty" "extends"
+               "final" "finally" "fn" "for" "foreach" "function" "global"
+               "goto" "if" "implements" "include" "include_once"
+               "instanceof" "insteadof" "interface" "isset" "list"
+               "match" "namespace" "new" "or" "print" "private"
+               "protected" "public" "require" "require_once" "return"
+               "static" "switch" "throw" "trait" "try" "unset" "use"
+               "var" "while" "xor" "yield"}
+   :constants #{"true" "false" "null"}}
+  [".php"])
+
+(register-prog-mode! :makefile "makefile-mode: syntax highlighting for Makefiles"
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :keywords #{"ifeq" "ifneq" "ifdef" "ifndef" "else" "endif" "include"
+               "define" "endef" "export" "unexport" "override" "vpath"}}
+  ["Makefile" "makefile" "GNUmakefile" ".mk"])

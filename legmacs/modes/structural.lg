@@ -1,0 +1,162 @@
+;; legmacs.modes.structural — paren-match, electric-pair, and auto-indent as
+;; three ordinary minor modes, generalized over whatever :syntax-spec the
+;; buffer's *major* mode declares (see legmacs.modes/register-mode!),
+;; instead of being hardcoded to one language the way legmacs.modes.letgo's
+;; versions of all three are. legmacs.modes/switch-to-mode auto-enables all
+;; three the moment a buffer's major mode has a spec -- register-prog-mode!
+;; is the only thing a language author needs to call to get all three "for
+;; free", tuned by the very same spec map that already drives its
+;; :highlighter (see legmacs.modes.prog).
+;;
+;; Each command below degrades to exactly the ordinary un-electrified
+;; behavior (self-insert the bare character, plain newline, clear the
+;; paren-match highlight) when the active buffer's major mode has no
+;; :syntax-spec -- so leaving these three minor modes enabled is harmless in
+;; a buffer whose major mode doesn't declare one. :let-go is exactly such a
+;; mode: it keeps its own hand-written, character-literal-aware versions of
+;; all three built on legmacs.lisp-syntax instead of these, since a real
+;; Lisp reader has structure (character literals) this generic scanner
+;; deliberately doesn't model. (A user who manually enables :electric-pair
+;; etc. in a let-go buffer would shadow let-go-mode's own richer bindings
+;; with these plainer ones -- an unusual thing to do on purpose, and
+;; consistent with how any minor mode can shadow a major mode's keys.)
+
+(ns legmacs.modes.structural
+  (:require [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]
+            [legmacs.prog-syntax :as ps]))
+
+(def indent-width-default 2)
+
+(defn- spec-for [state] (modes/mode-syntax-spec (:mode state)))
+
+(defn- char-at [text offset]
+  (when (< -1 offset (count text)) (first (subs text offset (inc offset)))))
+
+;; --- paren matching --------------------------------------------------
+
+(defn update-paren-match
+  "Generic legmacs.modes.letgo/update-paren-match: same show-paren-mode
+   rule, driven by the active major mode's :syntax-spec. Clears the match
+   (rather than erroring) when the mode has none."
+  [state]
+  (if-let [spec (spec-for state)]
+    (let [text (buf/buffer-text state)
+          offset (buf/offset-of state (:cursor-row state) (:cursor-col state))
+          after (char-at text offset)
+          before (char-at text (dec offset))
+          point (cond
+                  (and after (ps/open-bracket? spec after)) offset
+                  (and before (ps/close-bracket? spec before)) (dec offset)
+                  :else nil)]
+      (assoc state :paren-match
+             (when point
+               (when-let [match (ps/matching (ps/scan text spec) point)]
+                 [(buf/row-col-of state point) (buf/row-col-of state match)]))))
+    (assoc state :paren-match nil)))
+
+;; --- auto-pairing brackets ----------------------------------------------
+
+(defn- point-info [state spec]
+  (let [text (buf/buffer-text state)
+        offset (buf/offset-of state (:cursor-row state) (:cursor-col state))]
+    {:before (char-at text (dec offset))
+     :after (char-at text offset)
+     :in-str-or-comment? (ps/point-in-string-or-comment? (ps/scan text offset spec) offset)}))
+
+(defn- insert-pair [state open-ch close-ch]
+  (if-let [spec (spec-for state)]
+    (if (:in-str-or-comment? (point-info state spec))
+      (buf/insert-string state (str open-ch))
+      (-> state
+          (buf/insert-string (str open-ch close-ch))
+          (update :cursor-col dec)))
+    (buf/insert-string state (str open-ch))))
+
+(defn- skip-or-insert-close [state close-ch]
+  (if-let [spec (spec-for state)]
+    (let [{:keys [after in-str-or-comment?]} (point-info state spec)]
+      (if (and (not in-str-or-comment?) (= after close-ch))
+        (buf/move-right state)
+        (buf/insert-string state (str close-ch))))
+    (buf/insert-string state (str close-ch))))
+
+(defcommand structural-insert-paren
+  "\"(\" in electric-pair-mode: insert \"()\" with point between them (see
+   legmacs.modes.letgo/auto-insert-paren, generalized)."
+  [state] (insert-pair state \( \)))
+
+(defcommand structural-insert-bracket
+  "\"[\" in electric-pair-mode: insert \"[]\" with point between them."
+  [state] (insert-pair state \[ \]))
+
+(defcommand structural-insert-brace
+  "\"{\" in electric-pair-mode: insert \"{}\" with point between them."
+  [state] (insert-pair state \{ \}))
+
+(defcommand structural-close-paren
+  "\")\" in electric-pair-mode: move over a following \")\" instead of
+   inserting a second one."
+  [state] (skip-or-insert-close state \)))
+
+(defcommand structural-close-bracket
+  "\"]\" in electric-pair-mode: move over a following \"]\" instead of
+   inserting a second one."
+  [state] (skip-or-insert-close state \]))
+
+(defcommand structural-close-brace
+  "\"}\" in electric-pair-mode: move over a following \"}\" instead of
+   inserting a second one."
+  [state] (skip-or-insert-close state \}))
+
+(defcommand structural-delete-pair
+  "DEL in electric-pair-mode: backspacing right between an empty
+   auto-inserted pair (e.g. \"(|)\") deletes both characters."
+  [state]
+  (if-let [spec (spec-for state)]
+    (let [{:keys [before after in-str-or-comment?]} (point-info state spec)]
+      (if (and before (not in-str-or-comment?) (= after (ps/close-for spec before)))
+        (-> state buf/delete-char-forward buf/delete-char-backward)
+        (buf/delete-char-backward state)))
+    (buf/delete-char-backward state)))
+
+;; --- auto-indent --------------------------------------------------------
+
+(defcommand structural-newline-and-indent
+  "RET in auto-indent-mode: insert a newline, then indent it by paren depth
+   -- depth*indent-width spaces (see legmacs.modes.letgo/newline-and-indent,
+   generalized; :indent-width defaults to 2, overridable per :syntax-spec).
+   Plain newline when the active major mode has no :syntax-spec."
+  [state]
+  (if-let [spec (spec-for state)]
+    (let [state (buf/insert-newline state)
+          text (buf/text-before-cursor state)
+          depth (ps/depth-at text (count text) spec)
+          width (or (:indent-width spec) indent-width-default)]
+      (buf/insert-string state (apply str (repeat (* width depth) \space))))
+    (buf/insert-newline state)))
+
+;; --- registration --------------------------------------------------------
+
+(def electric-pair-keymap (atom {}))
+(km/bind-key! electric-pair-keymap "(" :structural-insert-paren)
+(km/bind-key! electric-pair-keymap "[" :structural-insert-bracket)
+(km/bind-key! electric-pair-keymap "{" :structural-insert-brace)
+(km/bind-key! electric-pair-keymap ")" :structural-close-paren)
+(km/bind-key! electric-pair-keymap "]" :structural-close-bracket)
+(km/bind-key! electric-pair-keymap "}" :structural-close-brace)
+(km/bind-key! electric-pair-keymap "DEL" :structural-delete-pair)
+
+(def auto-indent-keymap (atom {}))
+(km/bind-key! auto-indent-keymap "RET" :structural-newline-and-indent)
+
+(modes/register-minor-mode! :paren-match (atom {})
+                             "paren-match: highlights the bracket at point and its match"
+                             {:after-command update-paren-match})
+
+(modes/register-minor-mode! :electric-pair electric-pair-keymap
+                             "electric-pair: auto-closes (), [], {}")
+
+(modes/register-minor-mode! :auto-indent auto-indent-keymap
+                             "auto-indent: RET indents the new line by paren depth")

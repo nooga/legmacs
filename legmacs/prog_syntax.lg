@@ -1,0 +1,143 @@
+;; legmacs.prog-syntax — a spec-driven, full-buffer version of the same
+;; "where are the brackets/strings/comments" scan legmacs.lisp-syntax does
+;; for let-go, generalized so legmacs.modes.structural's paren-match,
+;; electric-pair, and auto-indent minor modes work across the whole
+;; legmacs.modes.prog language pack instead of being let-go-only.
+;;
+;; Deliberately a sibling of legmacs.lisp-syntax, not a replacement: Lisp's
+;; reader-level character literals (\( \newline etc) are genuinely
+;; Lisp-specific, and generalizing them into every C-like language's grammar
+;; would add real complexity for no benefit, since nothing in the prog-mode
+;; language pack has anything like them. let-go-mode keeps using
+;; legmacs.lisp-syntax for its own (already correct, already tested)
+;; structural features; this scanner only backs the generic prog-pack modes.
+;;
+;; Shares legmacs.modes.prog/make-highlighter's spec shape (:line-comments,
+;; :block-comment, :string-delims) so register-prog-mode! can hand the exact
+;; same map it already builds a highlighter from to also drive these
+;; features, plus two purely-structural knobs: :brackets (default the
+;; standard three pairs) and :indent-width (default 2, applied by
+;; legmacs.modes.structural, not here).
+
+(ns legmacs.prog-syntax
+  (:require [string]))
+
+(def ^:private default-brackets {\( \) \[ \] \{ \}})
+
+(defn- at? [text i s]
+  (and (<= (+ i (count s)) (count text))
+       (= s (subs text i (+ i (count s))))))
+
+(defn- matches-any-at? [text i markers]
+  (some (fn [m] (at? text i m)) markers))
+
+(defn- scan-string-span
+  "From an opening delimiter `q` at `i`, honoring backslash escapes, capped
+   at `len`. [end terminated?] -- terminated? is false when the string runs
+   off the end of `len` still open (see :in-string? below)."
+  [chars len i q]
+  (loop [j (inc i)]
+    (cond
+      (>= j len) [len false]
+      (and (= \\ (nth chars j)) (< (inc j) len)) (recur (+ j 2))
+      (= q (nth chars j)) [(inc j) true]
+      :else (recur (inc j)))))
+
+(defn scan
+  "One pass over `text`, stopping at `upto` (whole string by default),
+   generalizing legmacs.lisp-syntax/scan to a language `spec` map instead of
+   Lisp's fixed `;`/`\"`/three-bracket-pair rules. Returns the same shape:
+     :pairs  {offset matching-offset, ...}
+     :stack  ([open-char open-offset] ...), innermost last, still open at upto
+     :spans  [{:type :string|:comment :start :end} ...] (:end exclusive)
+     :in-string?   upto falls inside a still-open string
+     :in-comment?  upto falls inside a still-open (unterminated) block comment
+   -- both flags exist for the same reason legmacs.lisp-syntax/scan's
+   :in-string? does: a delimiter closed exactly at upto and one still open at
+   upto produce identically-shaped trailing spans, so a flag is the only way
+   to tell them apart. Line comments don't share this ambiguity (nothing
+   closes one early), so they don't need a matching flag."
+  ([text spec] (scan text (count text) spec))
+  ([text upto spec]
+   (let [{:keys [line-comments block-comment string-delims brackets]} spec
+         line-comments (or line-comments [])
+         string-chars (set (mapcat seq (or string-delims [])))
+         brackets (or brackets default-brackets)
+         closers (into {} (map (fn [[o c]] [c o]) brackets))
+         [block-open block-close] block-comment
+         chars (vec (seq text))
+         len (min upto (count chars))]
+     (loop [i 0, stack (), pairs {}, spans []]
+       (if (>= i len)
+         {:pairs pairs :stack stack :in-string? false :in-comment? false :spans spans}
+         (let [ch (nth chars i)]
+           (cond
+             ;; Checked before line-comments: a language whose block-open
+             ;; marker starts with its line-comment marker (Lua's "--[["
+             ;; vs "--") needs the longer, more specific one to win --
+             ;; mirrors legmacs.modes.prog/make-highlighter's same fix.
+             (and block-open (at? text i block-open))
+             (let [close-idx (string/index-of text block-close (+ i (count block-open)))]
+               (if (and close-idx (< close-idx len))
+                 (let [end (+ close-idx (count block-close))]
+                   (recur end stack pairs (conj spans {:type :comment :start i :end end})))
+                 {:pairs pairs :stack stack :in-string? false :in-comment? true
+                  :spans (conj spans {:type :comment :start i :end len})}))
+
+             (matches-any-at? text i line-comments)
+             (let [nl (string/index-of text "\n" i)
+                   end (min len (or nl len))]
+               (recur end stack pairs (conj spans {:type :comment :start i :end end})))
+
+             (contains? string-chars ch)
+             (let [[end terminated?] (scan-string-span chars len i ch)]
+               (if terminated?
+                 (recur end stack pairs (conj spans {:type :string :start i :end end}))
+                 {:pairs pairs :stack stack :in-string? true :in-comment? false
+                  :spans (conj spans {:type :string :start i :end end})}))
+
+             (contains? brackets ch)
+             (recur (inc i) (cons [ch i] stack) pairs spans)
+
+             (contains? closers ch)
+             (if (empty? stack)
+               (recur (inc i) stack pairs spans)
+               (let [[open-ch open-i] (first stack)]
+                 (if (= ch (get brackets open-ch))
+                   (recur (inc i) (rest stack) (assoc pairs open-i i i open-i) spans)
+                   (recur (inc i) (rest stack) pairs spans))))
+
+             :else (recur (inc i) stack pairs spans))))))))
+
+(defn matching
+  "Given a full scan (scan text spec, no upto) and an offset, the matching
+   bracket's offset, or nil if `offset` isn't on a matched bracket."
+  [scanned offset]
+  (get (:pairs scanned) offset))
+
+(defn depth-at
+  "How many brackets opened before `offset` (in text) are still open at that
+   point -- what auto-indent multiplies by an indent width."
+  [text offset spec]
+  (count (:stack (scan text offset spec))))
+
+(defn point-in-string-or-comment?
+  "Given a scan truncated to `offset` (see scan's `upto`), whether `offset`
+   itself -- point, mid-edit, not some already-typed character -- currently
+   sits inside string or comment text. Mirrors legmacs.modes.letgo's
+   point-in-string-or-comment?, generalized over :in-comment? too since block
+   comments share the same closed-vs-still-open ambiguity strings have."
+  [scanned offset]
+  (or (:in-string? scanned)
+      (:in-comment? scanned)
+      (some (fn [{:keys [type end]}] (and (= type :comment) (= end offset))) (:spans scanned))))
+
+(defn open-bracket? [spec ch] (contains? (or (:brackets spec) default-brackets) ch))
+
+(defn close-bracket? [spec ch]
+  (contains? (set (vals (or (:brackets spec) default-brackets))) ch))
+
+(defn close-for
+  "The closing character that pairs with open char `ch` under `spec`, or nil."
+  [spec ch]
+  (get (or (:brackets spec) default-brackets) ch))
