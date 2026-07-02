@@ -10,12 +10,13 @@ configuring legmacs are the same activity.
 
 ![legmacs](legmacs.gif)
 
-It's small. `scc` counts about 2,700 lines of Lisp for the whole editor. For
-that, it does a lot more than I expected it would when I started:
+It's small. About 4,000 lines of Lisp for the whole editor, bundled modes
+included. For that, it does a lot more than I expected it would when I
+started:
 
 - Emacs chords, kill ring, region, undo/redo, multiple buffers
 - window splits (`C-x 2` / `C-x 3`, mix and nest them), each window with
-  its own cursor and scroll, side-by-side ones separated by `│` dividers
+  its own cursor and scroll
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
 - syntax highlighting for 20+ languages out of the box, plus paren
