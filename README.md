@@ -16,7 +16,9 @@ that, it does a lot more than I expected it would when I started:
 - Emacs chords, kill ring, region, undo/redo, multiple buffers
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
-- syntax highlighting for let-go and Markdown
+- syntax highlighting for let-go and Markdown, plus a spec-driven language
+  pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML) you can extend with
+  one call
 - paren matching, auto-closing brackets, and structural expand-region
 - in-process eval (`C-x C-e` / `C-j`), because it's a Lisp editing a Lisp in
   the very same runtime, so `*scratch*` is a live REPL over the editor itself

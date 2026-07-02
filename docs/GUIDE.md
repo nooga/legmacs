@@ -45,14 +45,18 @@ not held together.
 | `C-p` / `↑` | previous-line |
 | `C-a` / Home | beginning of line |
 | `C-e` / End | end of line |
-| `M-f` / `M-b` | forward/backward word |
-| `M-<` / `M->` | start/end of buffer |
+| `M-f` / `M-b` (or `C-→` / `C-←`) | forward/backward word |
+| `M-}` / `M-{` (or `C-↓` / `C-↑`) | forward/backward paragraph |
+| `M-<` / `M->` (or `C-Home` / `C-End`) | start/end of buffer |
 | `C-v` / `M-v` | page down/up |
+| `C-l` | recenter: scroll point to the middle of the window |
+| `M-g g` | go to a line by number |
 | `RET` | newline |
 | `DEL` | delete backward |
 | `C-d` / Delete | delete forward |
 | `C-k` | kill to end of line |
 | `M-k` | kill whole line |
+| `M-d` / `M-DEL` (or `C-Delete`) | kill word forward / backward |
 | `C-y` | yank (paste) |
 | `C-SPC` | set the mark (start a region) |
 | `C-w` | kill (cut) the region |
@@ -61,6 +65,8 @@ not held together.
 | `C-_` / `C-x u` | undo |
 | `M-_` | redo |
 | `C-s` | incremental regexp search (swiper-style); `C-s`/`C-r` step through matches |
+| `M-%` | replace-string: replace every occurrence from point on (prompts for both strings) |
+| `M-!` | run a shell command, output in the echo area |
 | `C-x C-s` | save |
 | `C-x C-w` | write file (always prompts) |
 | `C-x C-f` | open file in a new buffer (or switch to it, if already open) |
@@ -209,6 +215,39 @@ let-go-mode's highlighter, it's per-line with no state carried across lines,
 so only a fenced-code-block's ` ``` ` delimiter lines are recognized, not
 the code between them (the same limitation, for the same reason, as the
 multi-line string case above).
+
+### The language pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML)
+
+Beyond the two hand-written modes, one spec-driven scanner
+([`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg)) provides highlight-only
+modes for the usual suspects: **go-mode** (`.go`), **javascript-mode**
+(`.js`/`.jsx`/`.mjs`/`.cjs`/`.ts`/`.tsx`), **python-mode** (`.py`),
+**c-mode** (`.c`/`.h`/`.cpp`/`.hpp`/`.cc`/...), **shell-mode**
+(`.sh`/`.bash`/`.zsh`), **rust-mode** (`.rs`), **json-mode** (`.json`), and
+**yaml-mode** (`.yaml`/`.yml`). A language here is just a data map -- line
+and block comment markers, string delimiters (backslash-escapes honored),
+and keyword/type/constant word sets -- and `register-prog-mode!` turns it
+into a registered mode plus its filename associations. Adding your own from
+`legmacs-init.lg` is one call:
+
+```clojure
+(require '[legmacs.modes.prog :as prog])
+
+(prog/register-prog-mode! :zig "zig-mode"
+  {:line-comments ["//"]
+   :string-delims ["\""]
+   :keywords #{"fn" "pub" "const" "var" "if" "else" "while" "return"}
+   :constants #{"true" "false" "null" "undefined"}}
+  [".zig"])
+```
+
+(That last argument is the general file-association mechanism, usable with
+any mode: `(legmacs.modes/register-auto-mode! ".ext" :mode-kw)` maps a
+filename suffix to a major mode, consulted whenever a file is opened.)
+
+Same per-line simplification as the other highlighters: strings and `/* */`
+comments that close on their own line are exact; a multi-line construct
+highlights on the line where it opens and not on its continuation lines.
 
 ### CRUTCH mode (vi-style modal editing)
 
@@ -377,6 +416,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*` and `.lg` files. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules). Registered for `.md`/`.markdown` files. |
+| [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven per-line scanner (comments, strings, keyword/type/constant sets) behind highlight-only modes for Go, JS/TS, Python, C/C++, shell, Rust, JSON, and YAML. `register-prog-mode!` is the one-call way to add a language. |
 | [`legmacs/modes/crutch.lg`](../legmacs/modes/crutch.lg) | CRUTCH: vi-style modal editing as a bundled minor mode (`M-x crutch-mode`). A worked example of the minor-mode/`:keymap`-fn/`:suppress-self-insert?` machinery. |
 | [`legmacs/modes/keycast.lg`](../legmacs/modes/keycast.lg) | keycast: a right-aligned live keystroke preview (`M-x keycast-mode`). A pure observer minor mode built on `:last-chord` + `:status-right`. |
 | [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (see `C-h`/`describe-bindings`). Highlight-only, like markdown-mode. |

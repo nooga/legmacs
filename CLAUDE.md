@@ -86,7 +86,12 @@ dispatch while that mode is active — used for paren-matching). `legmacs/
 lisp_syntax.lg` is a single-pass bracket/string/comment scanner shared by
 paren-matching, auto-indent, expand-region, and auto-pairing in
 `legmacs/modes/letgo.lg`; `legmacs/modes/markdown.lg` is a second,
-independent mode (highlighting only) built the same way.
+independent mode (highlighting only) built the same way; and `legmacs/
+modes/prog.lg` generalizes that shape into one spec-driven per-line scanner
+(comment markers, string delimiters, keyword/type/constant word sets)
+behind highlight-only modes for Go/JS/Python/C/shell/Rust/JSON/YAML —
+its `register-prog-mode!` is both how the built-ins register and the
+user-facing one-call way to add a language.
 
 **Major vs minor modes are one registry, distinguished only by which buffer
 slot holds them.** A buffer's `:mode` is its single major (content) mode;
