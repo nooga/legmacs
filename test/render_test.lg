@@ -104,6 +104,50 @@
         (is (string/includes? out "line one"))
         (is (string/includes? out "line three"))))))
 
+(deftest message-control-chars-are-caret-escaped
+  (testing "a message carrying raw control bytes renders in caret notation
+            instead of letting the terminal execute them"
+    (let [s (assoc (buf/new-state nil ["x"]) :message (str "boom " (char 27) "[H" (char 7)))
+          out (r/frame s 40 12)]
+      (is (string/includes? out "boom ^[[H^G"))))
+
+  (testing "explicit newlines still split into rows -- only the bytes inside
+            each line are escaped"
+    (is (= ["a" "^[x"] (vec (r/message-lines (str "a\n" (char 27) "x") 40))))))
+
+(defn- fit [s cols rows] (r/scroll-to-fit s (r/dims s cols rows)))
+
+(deftest echo-area-growth-does-not-permanently-scroll
+  (testing "a transient multi-line message scrolls the view only while shown"
+    (let [s (-> (buf/new-state nil (vec (map str (range 40))))
+                (assoc :cursor-row 21)
+                (fit 80 24))]
+      (is (= 0 (:scroll-row s)))                          ; 22 text rows, cursor on the last
+      (let [shown (fit (assoc s :message "a\nb\nc\nd\ne") 80 24)]
+        (is (= 4 (:scroll-row shown)))                    ; 5 echo rows -> 18 text rows
+        (is (= 0 (:scroll-anchor shown)))
+        (let [cleared (fit (assoc shown :message nil) 80 24)]
+          (is (= 0 (:scroll-row cleared)))                ; original scroll restored
+          (is (nil? (:scroll-anchor cleared)))))))
+
+  (testing "the anchor is dropped, not restored, when the cursor moved out of
+            its window while the echo area was grown"
+    (let [s (-> (buf/new-state nil (vec (map str (range 40))))
+                (assoc :cursor-row 21)
+                (fit 80 24))
+          shown (fit (assoc s :message "a\nb\nc\nd\ne") 80 24)
+          moved (fit (assoc shown :message nil :cursor-row 39) 80 24)]
+      (is (= (- 39 21) (:scroll-row moved)))              ; plain ensure-visible result
+      (is (nil? (:scroll-anchor moved)))))
+
+  (testing "no anchor is recorded when the grown echo area needs no scroll"
+    (let [s (-> (buf/new-state nil (vec (map str (range 40))))
+                (assoc :cursor-row 2)
+                (fit 80 24))
+          shown (fit (assoc s :message "a\nb\nc\nd\ne") 80 24)]
+      (is (= 0 (:scroll-row shown)))
+      (is (nil? (:scroll-anchor shown))))))
+
 (deftest swiper-current-match-highlighted-in-buffer
   (testing "the selected swiper match paints search-current-bg on its buffer line"
     (let [s (assoc (buf/new-state nil ["hello world"])

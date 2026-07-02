@@ -75,7 +75,7 @@
 (defn render! [state]
   (let [[cols rows] (term-size)
         layout (render/dims state cols rows)
-        state (buf/ensure-visible state (:text-rows layout) (:text-cols layout))]
+        state (render/scroll-to-fit state layout)]
     (term/write (render/frame state cols rows))
     (term/flush)
     state))

@@ -48,6 +48,22 @@
       (> n width) (subs s 0 width)
       :else (str s (apply str (repeat (- width n) \space))))))
 
+(defn sanitize
+  "Replace control characters in `s` with caret notation (^[ for ESC, ^M
+   for CR, ^? for DEL). Everything headed for the echo area goes through
+   this: a message can carry control bytes from sources the key decoder
+   never sees (an eval result containing (char 27), a swiper label from a
+   file with control characters) and writing them raw would let the
+   terminal execute them as ANSI codes mid-frame."
+  [s]
+  (apply str (map (fn [ch]
+                    (let [c (int ch)]
+                      (cond
+                        (< c 32) (str "^" (char (+ c 64)))
+                        (= c 127) "^?"
+                        :else (str ch))))
+                  (seq s))))
+
 (defn gutter-width
   "How many columns the line-number gutter needs for a buffer this long,
    including the trailing separator space."
@@ -78,7 +94,7 @@
    error (or any long message) from injecting a raw newline into the frame
    and corrupting the layout -- it becomes N padded rows instead."
   [msg cols]
-  (mapcat #(wrap-line % cols) (string/split msg "\n")))
+  (mapcat #(wrap-line (sanitize %) cols) (string/split msg "\n")))
 
 (defn minibuffer-height
   "How many rows the bottom echo/minibuffer area wants for `state`: one row
@@ -107,6 +123,41 @@
         text-rows (max 1 (- rows 1 mb-rows))
         text-cols (max 1 (- cols g))]
     {:gutter g :text-rows text-rows :text-cols text-cols :mb-rows mb-rows}))
+
+(defn scroll-to-fit
+  "buf/ensure-visible against this frame's layout, plus scroll *stability*
+   across echo-area growth. When the echo area grows past its usual single
+   row (a candidate list, a multi-line message), the text viewport shrinks;
+   if that alone forces a scroll, the pre-growth :scroll-row is remembered
+   as :scroll-anchor and restored once the area is back to one row (provided
+   the cursor is still visible there). Without the anchor, every transient
+   message tall enough to reach the cursor line would permanently shift the
+   viewport -- the cursor visibly jumped up the screen and stayed there."
+  [state layout]
+  (let [{:keys [text-rows text-cols mb-rows]} layout
+        grown? (> mb-rows 1)
+        ;; a command asked for point centered (C-l): an explicit scroll
+        ;; intent, so any pending anchor is stale too
+        state (if (:recenter state)
+                (-> state
+                    (assoc :scroll-row (max 0 (- (:cursor-row state) (quot text-rows 2))))
+                    (dissoc :recenter :scroll-anchor))
+                state)
+        state (if (and (not grown?) (:scroll-anchor state))
+                (let [anchor (:scroll-anchor state)
+                      state (dissoc state :scroll-anchor)]
+                  (if (and (<= anchor (:cursor-row state))
+                           (< (:cursor-row state) (+ anchor text-rows)))
+                    (assoc state :scroll-row anchor)
+                    state))
+                state)
+        before (:scroll-row state)
+        state (buf/ensure-visible state text-rows text-cols)]
+    (if (and grown?
+             (nil? (:scroll-anchor state))
+             (not= before (:scroll-row state)))
+      (assoc state :scroll-anchor before)
+      state)))
 
 (defn- right-align [s width]
   (let [n (count s)]
@@ -359,7 +410,7 @@
         [start (subvec v start (min n (+ start cap)))]))))
 
 (defn- candidate-row [screen-row cand selected? cols]
-  (let [text (pad-right (str (if selected? "> " "  ") (:label cand)) cols)]
+  (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)]
     (str (move-to 1 screen-row) (if selected? (str inverse-on text reset) text))))
 
 (defn- minibuffer-view [state screen-row0 mb-rows cols]
