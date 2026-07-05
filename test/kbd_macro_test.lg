@@ -1,0 +1,56 @@
+;; Keyboard macros: recording lives in legmacs.dispatch (every chord that
+;; arrives while :kbd-macro-recording? is on gets appended, excluding the
+;; start/end keystrokes themselves -- see record-if-still-recording);
+;; legmacs.commands' start/end/call-last-kbd-macro just flip the flag and
+;; drive replay. Driven here through real dispatch/bindings, one chord at a
+;; time, exactly like legmacs.main's read-loop would.
+
+(ns test.kbd-macro-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as d]))
+
+(bindings/install!)
+
+(defn- press [state & chords] (reduce d/dispatch state chords))
+
+(deftest recording-excludes-the-start-and-stop-keystrokes
+  (testing "typing \"abc\" between C-x ( and C-x ) records exactly those three chords, not the C-x prefix that invoked either"
+    (let [s (press (buf/new-state nil [""]) "C-x" "(" "a" "b" "c" "C-x" ")")]
+      (is (not (:kbd-macro-recording? s)))
+      (is (= ["a" "b" "c"] (:last-kbd-macro s)))
+      (is (= ["abc"] (:lines s))))))
+
+(deftest call-last-kbd-macro-replays-the-recorded-chords
+  (testing "C-x e re-runs the macro's chords through dispatch"
+    (let [s (press (buf/new-state nil [""]) "C-x" "(" "a" "b" "C-x" ")")
+          s (press s "C-x" "e")]
+      (is (= ["abab"] (:lines s)))))
+
+  (testing "repeated C-x e replays it again each time"
+    (let [s (press (buf/new-state nil [""]) "C-x" "(" "x" "C-x" ")")
+          s (press s "C-x" "e" "C-x" "e" "C-x" "e")]
+      (is (= ["xxxx"] (:lines s))))))
+
+(deftest call-last-kbd-macro-with-nothing-recorded
+  (testing "reports itself instead of erroring"
+    (let [s (press (buf/new-state nil [""]) "C-x" "e")]
+      (is (= [""] (:lines s)))
+      (is (= "No kbd macro has been defined" (:message s))))))
+
+(deftest a-fresh-recording-replaces-the-previous-macro
+  (testing "recording again overwrites :last-kbd-macro rather than appending to it"
+    (let [s (press (buf/new-state nil [""]) "C-x" "(" "a" "C-x" ")")
+          s (press s "C-x" "(" "z" "C-x" ")")]
+      (is (= ["z"] (:last-kbd-macro s))))))
+
+(deftest replaying-an-old-macro-while-recording-a-new-one-does-not-inline-it
+  (testing "the new macro records just the \"C-x e\" keystrokes, not the replayed macro's steps -- :last-kbd-macro is one global slot (as in real Emacs), so this new recording, once ended, has *replaced* what \"C-x e\" replays; it's a deliberate design property, not tested further here, that a macro recorded this way would recurse into itself if replayed"
+    (let [s (press (buf/new-state nil [""]) "C-x" "(" "a" "C-x" ")")     ;; macro #1: self-insert "a"
+          s (press s "C-x" "(" "b" "C-x" "e" "C-x" ")")]                 ;; macro #2: "b", then replay macro #1 (still "a" at this point), then stop
+      (is (= ["aba"] (:lines s))
+          "\"a\" (defining macro #1) + \"b\" + macro #1 replayed once (\"a\") = \"aba\"")
+      (is (= ["b" "C-x" "e"] (:last-kbd-macro s))
+          "recorded as the literal keystrokes typed -- \"C-x e\" as one nested call, not macro #1's \"a\" inlined")
+      (is (not (:kbd-macro-recording? s))))))

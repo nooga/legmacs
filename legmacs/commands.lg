@@ -11,7 +11,8 @@
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
-            [legmacs.modes :as modes]))
+            [legmacs.modes :as modes]
+            [legmacs.dispatch :as dispatch]))
 
 (defn set-message [state msg] (assoc state :message msg))
 
@@ -599,6 +600,47 @@
   "Make the current window the only one (C-x 1)."
   [state]
   (assoc state :buffer-command {:op :delete-other-windows}))
+
+;; --- keyboard macros --------------------------------------------------------
+;;
+;; The recording itself is legmacs.dispatch's job (see its
+;; record-if-still-recording): every chord that arrives while
+;; :kbd-macro-recording? is on gets appended to :kbd-macro-chords,
+;; excluding the start/end keystrokes themselves. These three commands
+;; only flip that flag and drive replay -- global state (see
+;; legmacs.buffers' shared-keys), same as real Emacs, so a macro survives
+;; switching buffers or windows mid-recording or mid-replay.
+
+(defcommand start-kbd-macro
+  "C-x (: begin recording a keyboard macro."
+  [state]
+  (-> state
+      (assoc :kbd-macro-recording? true :kbd-macro-chords [])
+      (set-message "Defining kbd macro...")))
+
+(defcommand end-kbd-macro
+  "C-x ): stop recording. legmacs.dispatch (record-if-still-recording) is
+   what actually finalizes :kbd-macro-chords into :last-kbd-macro -- it has
+   to be the one to do it, since it also trims this very binding's own
+   \"C-x\" prefix chord back out of the recording."
+  [state]
+  (-> state (assoc :kbd-macro-recording? false) (set-message "Keyboard macro defined")))
+
+(defcommand call-last-kbd-macro
+  "C-x e: replay the last recorded keyboard macro by re-running each of its
+   chords through legmacs.dispatch, exactly as if they'd been typed.
+   Recording is suspended for the duration of the replay itself (then
+   restored) so replaying an old macro while defining a new one records
+   just this one \"replay it\" step, not every one of the old macro's
+   chords inlined into the new one."
+  [state]
+  (if-let [chords (seq (:last-kbd-macro state))]
+    (let [was-recording? (:kbd-macro-recording? state)
+          replayed (reduce dispatch/dispatch
+                            (assoc state :kbd-macro-recording? false)
+                            chords)]
+      (assoc replayed :kbd-macro-recording? was-recording?))
+    (set-message state "No kbd macro has been defined")))
 
 ;; --- misc ------------------------------------------------------------------
 

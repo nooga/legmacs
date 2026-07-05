@@ -22,6 +22,7 @@
             [test.offset-test]
             [test.lisp-syntax-test]
             [test.buffers-test]
-            [test.windows-test]))
+            [test.windows-test]
+            [test.kbd-macro-test]))
 
 (run-tests)

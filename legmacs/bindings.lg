@@ -72,6 +72,11 @@
    "C-x 0" :delete-window
    "C-x 1" :delete-other-windows
 
+   ;; keyboard macros
+   "C-x (" :start-kbd-macro
+   "C-x )" :end-kbd-macro
+   "C-x e" :call-last-kbd-macro
+
    ;; buffers
    "C-x b" :switch-to-buffer
    "C-x C-b" :list-buffers

@@ -118,6 +118,26 @@
           state
           (modes/active-modes state)))
 
+(defn- record-if-still-recording
+  "Owns the whole :kbd-macro-chords lifecycle so start/end-kbd-macro (see
+   legmacs.commands) can be plain flag-flippers:
+     - recording was off before this chord -> untouched, nothing to do.
+     - still on after -> append `chord` (the ordinary case while recording).
+     - just turned off -> this chord (end-kbd-macro's own \"C-x )\" is a
+       2-chord binding) and its *prefix* chord (\"C-x\") both need
+       trimming back out: that prefix chord already got appended on the
+       previous dispatch call, back when recording was still on and
+       nothing yet suggested this sequence would turn it off. `pending-keys`
+       (the prefix already accumulated before this chord, from the
+       pre-dispatch state) says how many trailing entries that was. What's
+       left becomes :last-kbd-macro -- what call-last-kbd-macro replays."
+  [recording-before? pending-keys chord state*]
+  (cond
+    (not recording-before?) state*
+    (:kbd-macro-recording? state*) (update state* :kbd-macro-chords conj chord)
+    :else (let [chords (vec (drop-last (count pending-keys) (:kbd-macro-chords state*)))]
+            (assoc state* :kbd-macro-chords chords :last-kbd-macro chords))))
+
 (defn dispatch
   "state, one chord (as produced by legmacs.keys/read-chord) -> new state.
    The just-pressed chord is stamped onto the threaded state as :last-chord
@@ -128,7 +148,8 @@
    text -- last-chord feeds displays like keycast's mode-line log, and
    dumping an entire pasted block there would be useless at best."
   [state chord]
-  (let [state* (cond
+  (let [recording-before? (boolean (:kbd-macro-recording? state))
+        state* (cond
                  (:overlay state) (dissoc state :overlay)
                  (keys/paste? chord) (dispatch-paste state (keys/paste-text chord))
 
@@ -138,6 +159,7 @@
                  (mb/active? state) (dispatch-minibuffer state chord)
                  (:pending-prefix state) (dispatch-prefix state chord)
                  :else (dispatch-normal state chord))
+        state* (record-if-still-recording recording-before? (:pending-keys state) chord state*)
         last-chord (if (keys/paste? chord)
                      (str "[paste " (count (keys/paste-text chord)) "]")
                      chord)]
