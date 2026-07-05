@@ -69,6 +69,128 @@
 (defcommand redo "Redo the last undone change." [state] (buf/redo state))
 (defcommand tab-insert "Insert spaces for a tab stop." [state] (buf/insert-string state "    "))
 
+;; --- dabbrev-expand -------------------------------------------------------
+;;
+;; M-/: expand the word before point to a longer word already seen
+;; somewhere in the buffer, cycling to the next candidate on repeated
+;; presses. Plain word matching, no language/mode awareness -- real
+;; dabbrev-expand works the same way, on purpose, so it behaves the same
+;; in every major mode including prose.
+;;
+;; Repeat detection doesn't hook :last-chord/last-command -- it compares
+;; point to :dabbrev-expand's stashed :end from the previous call instead.
+;; That's self-contained (no coupling to whatever key this happens to be
+;; bound to) and correctly falls back to a fresh expansion the moment
+;; anything else moves point or edits the buffer in between.
+
+(defn- word-at-end
+  "The run of word chars ending at column `col` (exclusive) on `line`, as
+   [start-col text] -- the already-typed prefix dabbrev-expand completes."
+  [line col]
+  (loop [i col]
+    (if (and (pos? i) (buf/word-char? (nth line (dec i))))
+      (recur (dec i))
+      [i (subs line i col)])))
+
+(defn- words-in-line
+  "Every maximal run of word chars in `line`, as [col text] pairs, in
+   left-to-right order."
+  [line]
+  (let [n (count line)]
+    (loop [i 0, out []]
+      (cond
+        (>= i n) out
+        (buf/word-char? (nth line i))
+        (let [end (loop [j (inc i)] (if (and (< j n) (buf/word-char? (nth line j))) (recur (inc j)) j))]
+          (recur end (conj out [i (subs line i end)])))
+        :else (recur (inc i) out)))))
+
+(defn- all-words
+  "Every word in the buffer as [row col text], in buffer (reading) order."
+  [lines]
+  (vec (mapcat (fn [row] (map (fn [[col text]] [row col text]) (words-in-line (nth lines row))))
+               (range (count lines)))))
+
+(defn- dedupe-texts
+  "The 3rd element (word text) of each triple in `triples`, in order, first
+   occurrence only -- so a word repeated at several buffer positions is
+   still just one candidate to cycle through."
+  [triples]
+  (loop [ts triples, seen #{}, out []]
+    (if (empty? ts)
+      out
+      (let [[_ _ w] (first ts)]
+        (if (contains? seen w)
+          (recur (rest ts) seen out)
+          (recur (rest ts) (conj seen w) (conj out w)))))))
+
+(defn- dabbrev-candidates
+  "Candidate expansions for `prefix` starting from `origin` [row col],
+   nearest first: matches before origin (searched backward, i.e. nearest
+   preceding first) then matches after it (nearest following first) --
+   the same backward-then-forward preference real dabbrev-expand uses.
+   Excludes the bare prefix itself and anything already in `tried`."
+  [words origin prefix tried]
+  (let [[orow ocol] origin
+        before-origin? (fn [[r c _]] (or (< r orow) (and (= r orow) (< c ocol))))
+        matches? (fn [[_ _ w]] (and (string/starts-with? w prefix) (not= w prefix) (not (contains? tried w))))
+        all (filter matches? words)
+        before (reverse (filter before-origin? all))
+        after (remove before-origin? all)]
+    (dedupe-texts (concat before after))))
+
+(defn- replace-span
+  "Replace `line`'s [start-col, end-col) span with `replacement` as one
+   undo step, leaving point right after the inserted text."
+  [state row start-col end-col replacement]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [state (buf/push-undo state)
+          line (nth (:lines state) row)
+          line* (str (subs line 0 start-col) replacement (subs line end-col))]
+      (-> state
+          (assoc :lines (assoc (:lines state) row line*))
+          (assoc :cursor-row row :cursor-col (+ start-col (count replacement)))
+          (assoc :modified? true)))))
+
+(defn- dabbrev-continuing?
+  "True if point sits exactly where the previous dabbrev-expand call left
+   it -- i.e. nothing else has moved point or edited the buffer since."
+  [state]
+  (when-let [d (:dabbrev-expand state)]
+    (= (:end d) [(:cursor-row state) (:cursor-col state)])))
+
+(defn- dabbrev-apply
+  "Replace [origin, point) with `candidate` and stash cycling state for a
+   follow-up dabbrev-expand press."
+  [state origin prefix tried candidate]
+  (let [[orow ocol] origin
+        state (replace-span state orow ocol (:cursor-col state) candidate)]
+    (assoc state :dabbrev-expand
+           {:origin origin :prefix prefix :tried (conj tried candidate)
+            :end [(:cursor-row state) (:cursor-col state)]})))
+
+(defcommand dabbrev-expand
+  "M-/: expand the word before point using a longer word already seen in
+   the buffer. Press again with point unmoved to cycle to the next match
+   instead of repeating the same one."
+  [state]
+  (if (dabbrev-continuing? state)
+    (let [{:keys [origin prefix tried]} (:dabbrev-expand state)
+          candidates (dabbrev-candidates (all-words (:lines state)) origin prefix tried)]
+      (if (empty? candidates)
+        (set-message state (str "No further dabbrev expansions for \"" prefix "\""))
+        (dabbrev-apply state origin prefix tried (first candidates))))
+    (let [[start prefix] (word-at-end (buf/current-line state) (:cursor-col state))
+          origin [(:cursor-row state) start]]
+      (if (string/blank? prefix)
+        (set-message state "No dabbrev prefix before point")
+        (let [tried #{prefix}
+              candidates (dabbrev-candidates (all-words (:lines state)) origin prefix tried)]
+          (if (empty? candidates)
+            (set-message state (str "No dynamic expansion for \"" prefix "\" found"))
+            (dabbrev-apply state origin prefix tried (first candidates))))))))
+
 ;; --- region (mark to point) ---------------------------------------------
 
 (defcommand set-mark-command

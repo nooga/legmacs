@@ -269,6 +269,74 @@
           s (mb/submit (type-text (c/shell-command s) "echo oops 1>&2"))]
       (is (= "oops" (:message s))))))
 
+(defn- at-end-of [state row]
+  (assoc state :cursor-row row :cursor-col (count (nth (:lines state) row))))
+
+(deftest dabbrev-expand-basics
+  (testing "expands to the nearest preceding match sharing the prefix"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foobaz" "foo"]) 2)
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobaz" "foobaz"] (:lines s)))
+      (is (= 6 (:cursor-col s)))))
+
+  (testing "pressing again with point unmoved cycles to the next candidate"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foobaz" "foo"]) 2)
+          s (c/dabbrev-expand s)
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobaz" "foobar"] (:lines s)))))
+
+  (testing "cycling exhausts, then reports itself instead of repeating"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foobaz" "foo"]) 2)
+          s (c/dabbrev-expand s)
+          s (c/dabbrev-expand s)
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobaz" "foobar"] (:lines s)))
+      (is (string/includes? (:message s) "No further dabbrev expansions"))))
+
+  (testing "point returning to right where the last expansion left it still counts as a continuation"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foobaz" "foo"]) 2)
+          s (c/dabbrev-expand s)          ;; -> "foobaz", point at col 6
+          s (buf/move-left s)
+          s (buf/move-right s)            ;; net movement is zero: back to col 6
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobaz" "foobar"] (:lines s)))))
+
+  (testing "without the cycling bookkeeping (as if some other command had run), it re-derives the prefix from the buffer as it now stands rather than reusing stale state"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foobaz" "foo"]) 2)
+          s (c/dabbrev-expand s)          ;; -> "foobaz"; the word at point is now "foobaz", not "foo"
+          s (dissoc s :dabbrev-expand)
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobaz" "foobaz"] (:lines s))
+          "no other word starts with \"foobaz\", so the fresh search finds nothing to expand it to")
+      (is (string/includes? (:message s) "No dynamic expansion"))))
+
+  (testing "no match anywhere in the buffer"
+    (let [s (at-end-of (buf/new-state nil ["bar" "quux"]) 1)
+          s (c/dabbrev-expand (buf/insert-string s "zzz"))]
+      (is (string/includes? (:message s) "No dynamic expansion"))))
+
+  (testing "no word before point is a no-op with a message"
+    (let [s (c/dabbrev-expand (buf/new-state nil [""]))]
+      (is (= [""] (:lines s)))
+      (is (= "No dabbrev prefix before point" (:message s)))))
+
+  (testing "only completes up to point, preserving text after it on the line"
+    (let [s (-> (buf/new-state nil ["foobar" "foo-suffix"])
+                (assoc :cursor-row 1 :cursor-col 3)) ;; point right after "foo", before "-suffix"
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foobar-suffix"] (:lines s)))))
+
+  (testing "read-only buffers refuse the edit"
+    (let [s (-> (buf/new-state nil ["foobar" "foo"]) (at-end-of 1) (assoc :read-only? true))
+          s (c/dabbrev-expand s)]
+      (is (= ["foobar" "foo"] (:lines s)))
+      (is (= "Buffer is read-only" (:message s)))))
+
+  (testing "one undo step restores the pre-expansion text"
+    (let [s (at-end-of (buf/new-state nil ["foobar" "foo"]) 1)
+          s (buf/undo (c/dabbrev-expand s))]
+      (is (= ["foobar" "foo"] (:lines s))))))
+
 (deftest recenter-sets-the-flag
   (testing "recenter marks the state; legmacs.render/scroll-to-fit consumes it"
     (is (:recenter (c/recenter (buf/new-state nil ["x"]))))))

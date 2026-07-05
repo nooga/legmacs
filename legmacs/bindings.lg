@@ -39,6 +39,7 @@
    "C-_" :undo                   "C-x u" :undo
    "M-_" :redo
    "TAB" :tab-insert
+   "M-/" :dabbrev-expand
 
    ;; region
    "C-SPC" :set-mark-command
