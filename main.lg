@@ -39,9 +39,13 @@
 
 ;; CSI ?2004h/l -- bracketed paste mode. Wraps a terminal paste in ESC[200~
 ;; ... ESC[201~ instead of replaying it as ordinary keystrokes; see
-;; legmacs.keys' handling of those markers for why that matters.
-(def ^:private enable-bracketed-paste "\033[?2004h")
-(def ^:private disable-bracketed-paste "\033[?2004l")
+;; legmacs.keys' handling of those markers for why that matters. Built with
+;; (char 27) rather than a \033-style escape in source -- let-go's reader
+;; only understands \t \r \n \b \f \\ \" and \uXXXX, not octal escapes (see
+;; legmacs.keys' own docstring on this exact trap).
+(def ^:private ESC (str (char 27)))
+(def ^:private enable-bracketed-paste (str ESC "[?2004h"))
+(def ^:private disable-bracketed-paste (str ESC "[?2004l"))
 
 (defn init-terminal! []
   (when (nil? (term/size))
