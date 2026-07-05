@@ -164,18 +164,73 @@
     (keyword? next-chord) next-chord
     :else (str "M-" next-chord)))
 
+;; --- bracketed paste ----------------------------------------------------
+;;
+;; A terminal in bracketed-paste mode (enabled with CSI ?2004h -- see
+;; legmacs.main) wraps a pasted block in ESC[200~ ... ESC[201~ rather than
+;; replaying it as ordinary keystrokes. Without this, a multi-line paste
+;; would hit dispatch one character at a time and get mangled by
+;; auto-pairing/auto-indent (each pasted "(" or newline would trigger the
+;; same electric behavior a hand-typed one does). scanKey already tokenizes
+;; both markers as ordinary CSI tokens, so read-chord only needs to
+;; recognize the start marker and switch into a raw text-collection loop
+;; until the end marker.
+
+(def ^:private paste-start (esc-seq "[200~"))
+(def ^:private paste-end (esc-seq "[201~"))
+
+(defn- paste-token->text
+  "One token read inside a paste, decoded to literal text. A bare CR byte
+   (some terminals send \\r line endings inside a paste, same as a hand-typed
+   RET would) becomes a newline instead of the RET chord it'd decode to
+   outside of one; everything else -- including multi-byte runes, which
+   term/read-key already tokenizes whole -- passes through unchanged."
+  [tok]
+  (if (= tok CR) "\n" tok))
+
+(defn paste-tokens->text
+  "Pure: concatenate the raw tokens read after a bracketed-paste start
+   marker (not including the end marker itself) into the pasted text."
+  [tokens]
+  (apply str (map paste-token->text tokens)))
+
+(defn- read-paste-text
+  "Reads raw tokens directly off term/read-key -- bypassing chord
+   translation entirely, since paste content is literal text, not
+   keystrokes -- until the end marker or end-of-input."
+  []
+  (loop [acc []]
+    (let [k (term/read-key)]
+      (if (or (nil? k) (= k paste-end))
+        (paste-tokens->text acc)
+        (recur (conj acc k))))))
+
+(defn paste?
+  "True if `chord` (as returned by read-chord) is a bracketed-paste event
+   rather than an ordinary chord name."
+  [chord]
+  (and (vector? chord) (= :paste (first chord))))
+
+(defn paste-text
+  "The pasted text carried by a paste? chord."
+  [chord]
+  (second chord))
+
 (defn read-chord
-  "Block for one key chord. Returns a chord string, or nil at end-of-input.
+  "Block for one key chord. Returns a chord string, a [:paste text] tuple
+   (see paste?/paste-text) for a bracketed paste, or nil at end-of-input.
    Internally may issue two term/read-key calls to resolve a Meta
-   combination."
+   combination, or many to drain a pasted block."
   []
   (when-let [k (term/read-key)]
-    (let [chord (raw->chord k)]
-      (if (= chord "ESC")
-        (if (term/key-pending?)
-          (meta-chord (when-let [k2 (term/read-key)] (raw->chord k2)))
-          "ESC")
-        chord))))
+    (if (= k paste-start)
+      [:paste (read-paste-text)]
+      (let [chord (raw->chord k)]
+        (if (= chord "ESC")
+          (if (term/key-pending?)
+            (meta-chord (when-let [k2 (term/read-key)] (raw->chord k2)))
+            "ESC")
+          chord)))))
 
 (defn printable?
   "True if a chord is plain self-insertable text rather than a key name.

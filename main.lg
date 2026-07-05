@@ -35,15 +35,24 @@
   (let [[cols rows] (or (term/size) fallback-size)]
     (if (and (pos? cols) (pos? rows)) [cols rows] fallback-size)))
 
+;; CSI ?2004h/l -- bracketed paste mode. Wraps a terminal paste in ESC[200~
+;; ... ESC[201~ instead of replaying it as ordinary keystrokes; see
+;; legmacs.keys' handling of those markers for why that matters.
+(def ^:private enable-bracketed-paste "\033[?2004h")
+(def ^:private disable-bracketed-paste "\033[?2004l")
+
 (defn init-terminal! []
   (when (nil? (term/size))
     (println "legmacs: stdin/stdout must be a terminal.")
     (os/exit 1))
   (term/raw-mode!)
   (term/alternate-screen)
-  (term/clear))
+  (term/clear)
+  (term/write enable-bracketed-paste)
+  (term/flush))
 
 (defn shutdown-terminal! []
+  (term/write disable-bracketed-paste)
   (term/reset-style)
   (term/show-cursor)
   (term/main-screen)

@@ -99,16 +99,29 @@
 
 (defn- clear-note [state] (update state :minibuffer assoc :note nil))
 
-(defn insert-char [state ch]
+(defn insert-text
+  "Insert an arbitrary string at the cursor -- the general form of
+   insert-char, used directly for a bracketed paste landing in the
+   minibuffer (a single keystroke's ch is always one character, so
+   insert-char's (inc cursor-col) was never wrong for it, but a paste needs
+   cursor-col to advance by the whole string's length)."
+  [state text]
   (-> state
       (update :minibuffer
               (fn [mb]
                 (let [{:keys [input cursor-col]} mb]
                   (-> mb
-                      (assoc :input (str (subs input 0 cursor-col) ch (subs input cursor-col)))
-                      (assoc :cursor-col (inc cursor-col))))))
+                      (assoc :input (str (subs input 0 cursor-col) text (subs input cursor-col)))
+                      (assoc :cursor-col (+ cursor-col (count text)))))))
       clear-note
       react))
+
+(defn insert-char
+  "(str ch) so a bare Character (as `seq` yields, and as tests' type-text
+   helper feeds this one rune at a time) works the same as a 1-char string
+   (what dispatch's self-insert path actually passes)."
+  [state ch]
+  (insert-text state (str ch)))
 
 (defn backward-delete-char [state]
   (-> state

@@ -85,3 +85,25 @@
     (is (= "ESC" (k/meta-chord "ESC")))
     (is (= "ESC" (k/meta-chord nil)))
     (is (= :resize (k/meta-chord :resize)))))
+
+(deftest bracketed-paste-token-accumulation
+  (testing "raw tokens between the paste markers concatenate into literal text"
+    (is (= "hello" (k/paste-tokens->text ["h" "e" "l" "l" "o"])))
+    (is (= "" (k/paste-tokens->text []))))
+
+  (testing "a bare CR byte inside a paste becomes a newline, not the RET chord
+            it would decode to outside of one"
+    (is (= "line one\nline two"
+           (k/paste-tokens->text ["l" "i" "n" "e" " " "o" "n" "e" (str (char 13))
+                                   "l" "i" "n" "e" " " "t" "w" "o"]))))
+
+  (testing "multi-byte runes (already whole tokens from term/read-key) pass through"
+    (is (= "café" (k/paste-tokens->text ["c" "a" "f" "é"])))))
+
+(deftest paste-event-shape
+  (testing "paste? / paste-text recognize the tagged tuple read-chord returns for a paste"
+    (is (k/paste? [:paste "hi"]))
+    (is (= "hi" (k/paste-text [:paste "hi"])))
+    (is (not (k/paste? "a")))
+    (is (not (k/paste? "C-x")))
+    (is (not (k/paste? nil)))))

@@ -73,6 +73,19 @@
     (keys/printable? chord) (mb/insert-char state chord)
     :else state))
 
+(defn- dispatch-paste
+  "A bracketed paste (see legmacs.keys) inserts its whole text as one edit,
+   never char-by-char through dispatch-normal -- that's the point: pasted
+   \"(\" or newlines must not trigger electric-pair/auto-indent the way a
+   hand-typed one would. Lands in the minibuffer's single-line input (with
+   embedded newlines stripped -- it has nowhere to put them) when one's
+   open, otherwise the buffer; either way it also clears any pending prefix,
+   since a paste is not a continuation of an in-progress chord sequence."
+  [state text]
+  (if (mb/active? state)
+    (mb/insert-text state (string/replace text "\n" ""))
+    (buf/insert-string (assoc state :pending-prefix nil :pending-keys []) text)))
+
 (defn- dispatch-prefix [state chord]
   (let [path (conj (:pending-keys state) chord)
         [tag v] (lookup-layers (:pending-prefix state) chord)
@@ -110,15 +123,22 @@
    The just-pressed chord is stamped onto the threaded state as :last-chord
    (Emacs's last-command-event, for modes that want to see the raw key --
    e.g. legmacs.modes.keycast), then the state runs through each active
-   mode's :after-command hook (if any) -- see legmacs.modes/register-mode!."
+   mode's :after-command hook (if any) -- see legmacs.modes/register-mode!.
+   A paste (keys/paste?) is stamped as a short summary rather than the raw
+   text -- last-chord feeds displays like keycast's mode-line log, and
+   dumping an entire pasted block there would be useless at best."
   [state chord]
   (let [state* (cond
                  (:overlay state) (dissoc state :overlay)
+                 (keys/paste? chord) (dispatch-paste state (keys/paste-text chord))
 
                  (and (:pending-prefix state) (= chord "C-g"))
                  (km/run-command (assoc state :pending-prefix nil :pending-keys []) :keyboard-quit)
 
                  (mb/active? state) (dispatch-minibuffer state chord)
                  (:pending-prefix state) (dispatch-prefix state chord)
-                 :else (dispatch-normal state chord))]
-    (run-after-commands (assoc state* :last-chord chord))))
+                 :else (dispatch-normal state chord))
+        last-chord (if (keys/paste? chord)
+                     (str "[paste " (count (keys/paste-text chord)) "]")
+                     chord)]
+    (run-after-commands (assoc state* :last-chord last-chord))))

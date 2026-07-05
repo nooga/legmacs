@@ -7,6 +7,8 @@
             [legmacs.bindings :as bindings]
             [legmacs.dispatch :as d]))
 
+(defn- paste [text] [:paste text])
+
 (bindings/install!)
 
 (deftest self-insert-for-unbound-printable-chars
@@ -93,4 +95,33 @@
     (let [s (mb/open (buf/new-state nil ["x"]) "Prompt: " (fn [state input] (assoc state :got input)))
           s (d/dispatch s "TAB")]
       (is (= "" (:input (:minibuffer s)))))))
+
+(deftest bracketed-paste-inserts-as-one-edit
+  (testing "a paste event inserts its whole text into the buffer at once"
+    (let [s (buf/new-state nil [""])
+          s (d/dispatch s (paste "hello\nworld"))]
+      (is (= ["hello" "world"] (:lines s)))
+      (is (= 1 (:cursor-row s)))
+      (is (= 5 (:cursor-col s)))))
+
+  (testing "a paste clears any pending prefix instead of continuing it"
+    (let [s (buf/new-state nil [""])
+          s (d/dispatch s "C-x")
+          s (d/dispatch s (paste "abc"))]
+      (is (nil? (:pending-prefix s)))
+      (is (= [] (:pending-keys s)))
+      (is (= ["abc"] (:lines s)))))
+
+  (testing "a paste into an open minibuffer edits its input, not the buffer,
+            and strips embedded newlines (the input is single-line)"
+    (let [s (buf/new-state nil ["original"])
+          s (mb/open s "Prompt: " (fn [state input] (assoc state :got input)))
+          s (d/dispatch s (paste "foo\nbar"))]
+      (is (= ["original"] (:lines s)))
+      (is (= "foobar" (:input (:minibuffer s))))))
+
+  (testing ":last-chord after a paste is a short summary, not the raw text"
+    (let [s (buf/new-state nil [""])
+          s (d/dispatch s (paste "a fairly long pasted string"))]
+      (is (= "[paste 27]" (:last-chord s))))))
 
