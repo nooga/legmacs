@@ -1,0 +1,140 @@
+;; legmacs.modes.comment — comment-dwim (M-;): toggle line comments on the
+;; current line, or every line the region spans, generalized over whatever
+;; :syntax-spec the buffer's major mode declares (see legmacs.modes.prog) --
+;; the same trick legmacs.modes.structural uses for paren-match/electric-
+;; pair/auto-indent. :let-go has no :syntax-spec (a real Lisp reader has
+;; structure this generic scanner doesn't model -- see structural.lg's
+;; docstring), so it's special-cased to ";;" here the same way.
+;;
+;; A mode with :line-comments uses line-comment style (prefix/strip each
+;; target line). A mode with only :block-comment (CSS, HTML) wraps/unwraps
+;; the whole target range as a single block instead, since block comments
+;; can't nest one per line. A mode with neither (markdown -- prose has no
+;; comment syntax) leaves the buffer alone and says so.
+
+(ns legmacs.modes.comment
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]))
+
+(def ^:private let-go-line-comment ";;")
+
+(defn- indent-len
+  "Index of the first non-blank character on `line` (== (count line) if
+   it's all whitespace)."
+  [line]
+  (loop [i 0]
+    (if (and (< i (count line)) (contains? #{\space \tab} (nth line i)))
+      (recur (inc i))
+      i)))
+
+(defn- line-comment-marker
+  "The line-comment string for `state`'s major mode, or nil if it has none
+   (either no :syntax-spec at all, or a spec whose :line-comments is empty
+   -- JSON has no comment syntax of any kind)."
+  [state]
+  (if (= :let-go (:mode state))
+    let-go-line-comment
+    (first (:line-comments (modes/mode-syntax-spec (:mode state))))))
+
+(defn- block-comment-pair
+  "[open close] for `state`'s major mode, or nil."
+  [state]
+  (seq (:block-comment (modes/mode-syntax-spec (:mode state)))))
+
+(defn- target-rows
+  "The row range comment-dwim acts on: the whole region if one is active,
+   otherwise just the current line."
+  [state]
+  (if-let [[[sr _] [er _]] (buf/region-bounds state)]
+    [sr er]
+    [(:cursor-row state) (:cursor-row state)]))
+
+;; --- line-comment style --------------------------------------------------
+
+(defn- line-commented? [line marker]
+  (let [i (indent-len line)]
+    (and (< i (count line)) (string/starts-with? (subs line i) marker))))
+
+(defn- comment-line [line marker]
+  (let [i (indent-len line)]
+    (str (subs line 0 i) marker (when (< i (count line)) " ") (subs line i))))
+
+(defn- uncomment-line [line marker]
+  (let [i (indent-len line)
+        after (+ i (count marker))
+        after (if (= \space (nth line after \x)) (inc after) after)]
+    (str (subs line 0 i) (subs line after))))
+
+(defn- toggle-line-comments [lines sr er marker]
+  (let [target (subvec lines sr (inc er))
+        non-blank (remove #(string/blank? %) target)
+        all-commented? (and (seq non-blank) (every? #(line-commented? % marker) non-blank))
+        edit (fn [line]
+               (cond
+                 (string/blank? line) line
+                 all-commented? (uncomment-line line marker)
+                 (line-commented? line marker) line
+                 :else (comment-line line marker)))]
+    (vec (concat (subvec lines 0 sr) (map edit target) (subvec lines (inc er))))))
+
+;; --- block-comment style ---------------------------------------------------
+
+(defn- block-wrapped? [lines sr er [open close]]
+  (and (string/starts-with? (subs (nth lines sr) (indent-len (nth lines sr))) open)
+       (string/ends-with? (nth lines er) close)))
+
+(defn- wrap-block [lines sr er [open close]]
+  (let [first-line (nth lines sr)
+        i (indent-len first-line)
+        first-line* (str (subs first-line 0 i) open " " (subs first-line i))
+        last-line (nth lines er)
+        last-line* (str last-line " " close)]
+    (if (= sr er)
+      (assoc lines sr (str (subs first-line 0 i) open " " (subs first-line i) " " close))
+      (-> lines (assoc sr first-line*) (assoc er last-line*)))))
+
+(defn- unwrap-block [lines sr er [open close]]
+  (let [strip-open (fn [line]
+                      (let [i (indent-len line)]
+                        (str (subs line 0 i)
+                             (subs line (+ i (count open) (if (= \space (nth line (+ i (count open)) \x)) 1 0))))))
+        strip-close (fn [line]
+                      (let [line (if (string/ends-with? line close)
+                                   (subs line 0 (- (count line) (count close)))
+                                   line)]
+                        (if (string/ends-with? line " ") (subs line 0 (dec (count line))) line)))]
+    (if (= sr er)
+      (assoc lines sr (strip-close (strip-open (nth lines sr))))
+      (-> lines (assoc sr (strip-open (nth lines sr))) (assoc er (strip-close (nth lines er)))))))
+
+(defn- toggle-block-comment [lines sr er pair]
+  (if (block-wrapped? lines sr er pair)
+    (unwrap-block lines sr er pair)
+    (wrap-block lines sr er pair)))
+
+;; --- the command -----------------------------------------------------------
+
+(defcommand comment-dwim
+  "M-;: toggle a comment on the current line, or every line the region
+   spans. Line-comment style when the major mode has one, block-comment
+   style (wrapping the whole range once) when it only has that, and a
+   \"no comment syntax\" message when it has neither."
+  [state]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [[sr er] (target-rows state)]
+      (cond
+        (line-comment-marker state)
+        (assoc (buf/push-undo state)
+               :lines (toggle-line-comments (:lines state) sr er (line-comment-marker state))
+               :modified? true)
+
+        (block-comment-pair state)
+        (assoc (buf/push-undo state)
+               :lines (toggle-block-comment (:lines state) sr er (block-comment-pair state))
+               :modified? true)
+
+        :else
+        (assoc state :message (str "No comment syntax for " (name (or (:mode state) :fundamental))))))))

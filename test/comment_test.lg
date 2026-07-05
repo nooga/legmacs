@@ -1,0 +1,104 @@
+(ns test.comment-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.modes.prog]
+            [legmacs.modes.letgo]
+            [legmacs.modes.comment]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as dispatch]))
+
+(bindings/install!)
+
+(defn- dwim [s] (dispatch/dispatch s "M-;"))
+
+(deftest line-comment-toggle-on-current-line
+  (testing "an uncommented line gets the mode's line-comment marker + a space"
+    (let [s (-> (buf/new-state nil ["foo()"]) (modes/switch-to-mode :go) dwim)]
+      (is (= ["// foo()"] (:lines s)))))
+
+  (testing "toggling again removes it, back to the original line"
+    (let [s (-> (buf/new-state nil ["foo()"]) (modes/switch-to-mode :go) dwim dwim)]
+      (is (= ["foo()"] (:lines s)))))
+
+  (testing "indentation is preserved -- the marker lands after leading whitespace"
+    (let [s (-> (buf/new-state nil ["  foo()"]) (modes/switch-to-mode :go) dwim)]
+      (is (= ["  // foo()"] (:lines s))))))
+
+(deftest line-comment-toggle-over-a-region
+  (testing "every line the region touches is commented in one edit"
+    (let [s (-> (buf/new-state nil ["a" "b" "c"])
+                (modes/switch-to-mode :go)
+                (assoc :mark [0 0] :cursor-row 2 :cursor-col 1)
+                dwim)]
+      (is (= ["// a" "// b" "// c"] (:lines s)))))
+
+  (testing "toggling the same region again uncomments all three"
+    (let [s (-> (buf/new-state nil ["a" "b" "c"])
+                (modes/switch-to-mode :go)
+                (assoc :mark [0 0] :cursor-row 2 :cursor-col 1)
+                dwim dwim)]
+      (is (= ["a" "b" "c"] (:lines s)))))
+
+  (testing "a blank separator line inside the region is left alone"
+    (let [s (-> (buf/new-state nil ["a" "" "c"])
+                (modes/switch-to-mode :go)
+                (assoc :mark [0 0] :cursor-row 2 :cursor-col 1)
+                dwim)]
+      (is (= ["// a" "" "// c"] (:lines s)))))
+
+  (testing "a mixed region (some lines already commented) fully comments on the first press"
+    (let [s (-> (buf/new-state nil ["// a" "b"])
+                (modes/switch-to-mode :go)
+                (assoc :mark [0 0] :cursor-row 1 :cursor-col 1)
+                dwim)]
+      (is (= ["// a" "// b"] (:lines s))))))
+
+(deftest let-go-mode-uses-semicolons
+  (testing "let-go has no :syntax-spec but is special-cased to \";;\""
+    (let [s (-> (buf/new-state nil ["(+ 1 2)"]) (modes/switch-to-mode :let-go) dwim)]
+      (is (= [";; (+ 1 2)"] (:lines s))))))
+
+(deftest block-only-languages-wrap-instead
+  (testing "CSS has only :block-comment -- wraps the whole line in /* */"
+    (let [s (-> (buf/new-state nil ["color: red;"]) (modes/switch-to-mode :css) dwim)]
+      (is (= ["/* color: red; */"] (:lines s)))))
+
+  (testing "toggling again unwraps it"
+    (let [s (-> (buf/new-state nil ["color: red;"]) (modes/switch-to-mode :css) dwim dwim)]
+      (is (= ["color: red;"] (:lines s)))))
+
+  (testing "a multi-line region wraps once around the whole range, not per line"
+    (let [s (-> (buf/new-state nil ["a {" "  color: red;" "}"])
+                (modes/switch-to-mode :css)
+                (assoc :mark [0 0] :cursor-row 2 :cursor-col 1)
+                dwim)]
+      (is (= ["/* a {" "  color: red;" "} */"] (:lines s))))))
+
+(deftest no-comment-syntax-is-a-no-op-with-a-message
+  (testing "a mode with neither :line-comments nor :block-comment reports itself"
+    (let [s (-> (buf/new-state nil ["1"]) (modes/switch-to-mode :json) dwim)]
+      (is (= ["1"] (:lines s)))
+      (is (= "No comment syntax for json" (:message s)))))
+
+  (testing "a buffer with no major mode at all reports \"fundamental\""
+    (let [s (dwim (buf/new-state nil ["x"]))]
+      (is (= "No comment syntax for fundamental" (:message s))))))
+
+(deftest read-only-buffers-are-not-editable-by-comment-dwim
+  (testing "a read-only buffer refuses the edit with the usual message"
+    (let [s (-> (buf/new-state nil ["foo()"])
+                (modes/switch-to-mode :go)
+                (assoc :read-only? true)
+                dwim)]
+      (is (= ["foo()"] (:lines s)))
+      (is (= "Buffer is read-only" (:message s))))))
+
+(deftest comment-dwim-is-a-single-undo-step
+  (testing "undo restores every commented line at once, not one at a time"
+    (let [s (-> (buf/new-state nil ["a" "b"])
+                (modes/switch-to-mode :go)
+                (assoc :mark [0 0] :cursor-row 1 :cursor-col 1)
+                dwim
+                buf/undo)]
+      (is (= ["a" "b"] (:lines s))))))

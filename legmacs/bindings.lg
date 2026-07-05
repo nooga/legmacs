@@ -45,6 +45,7 @@
    "C-w" :kill-region
    "M-w" :copy-region-as-kill
    "C-x C-x" :exchange-point-and-mark
+   "M-;" :comment-dwim
 
    ;; search / replace / jump
    "C-s" :swiper
