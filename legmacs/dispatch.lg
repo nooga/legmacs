@@ -151,6 +151,7 @@
   (let [recording-before? (boolean (:kbd-macro-recording? state))
         state* (cond
                  (:overlay state) (dissoc state :overlay)
+                 (buf/query-replace-active? state) (buf/query-replace-answer state chord)
                  (keys/paste? chord) (dispatch-paste state (keys/paste-text chord))
 
                  (and (:pending-prefix state) (= chord "C-g"))

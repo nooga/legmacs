@@ -202,3 +202,33 @@
                 (assoc :lines ["a"] :cursor-row 0 :cursor-col 0)
                 buf/pop-mark)]
       (is (= 0 (:cursor-row s))))))
+
+(deftest replace-span-basics
+  (testing "splices [start-col, end-col) with the replacement, leaving point right after it"
+    (let [s (buf/replace-span (buf/new-state nil ["hello world"]) 0 6 11 "there")]
+      (is (= ["hello there"] (:lines s)))
+      (is (= 11 (:cursor-col s)))
+      (is (:modified? s))))
+
+  (testing "one undo step restores the original span"
+    (let [s (buf/undo (buf/replace-span (buf/new-state nil ["foo bar"]) 0 0 3 "baz"))]
+      (is (= ["foo bar"] (:lines s)))))
+
+  (testing "refuses on a read-only buffer"
+    (let [s (buf/replace-span (assoc (buf/new-state nil ["foo"]) :read-only? true) 0 0 3 "bar")]
+      (is (= ["foo"] (:lines s)))
+      (is (= "Buffer is read-only" (:message s))))))
+
+(deftest find-next-match-basics
+  (testing "finds the first occurrence at or after (row, col)"
+    (is (= {:row 0 :col 2 :end 5} (buf/find-next-match ["a foo bar"] 0 0 "foo"))))
+
+  (testing "searches forward across lines, never wraps"
+    (is (= {:row 1 :col 0 :end 3} (buf/find-next-match ["foo" "foo"] 0 3 "foo")))
+    (is (nil? (buf/find-next-match ["foo" "bar"] 1 3 "foo"))))
+
+  (testing "starting exactly on a match finds that same match, not the next one"
+    (is (= {:row 0 :col 0 :end 3} (buf/find-next-match ["foofoo"] 0 0 "foo"))))
+
+  (testing "nil when there's nothing left to find"
+    (is (nil? (buf/find-next-match ["abc"] 0 0 "zzz")))))

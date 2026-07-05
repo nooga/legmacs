@@ -141,20 +141,6 @@
         after (remove before-origin? all)]
     (dedupe-texts (concat before after))))
 
-(defn- replace-span
-  "Replace `line`'s [start-col, end-col) span with `replacement` as one
-   undo step, leaving point right after the inserted text."
-  [state row start-col end-col replacement]
-  (if-not (buf/writable? state)
-    (assoc state :message "Buffer is read-only")
-    (let [state (buf/push-undo state)
-          line (nth (:lines state) row)
-          line* (str (subs line 0 start-col) replacement (subs line end-col))]
-      (-> state
-          (assoc :lines (assoc (:lines state) row line*))
-          (assoc :cursor-row row :cursor-col (+ start-col (count replacement)))
-          (assoc :modified? true)))))
-
 (defn- dabbrev-continuing?
   "True if point sits exactly where the previous dabbrev-expand call left
    it -- i.e. nothing else has moved point or edited the buffer since."
@@ -167,7 +153,7 @@
    follow-up dabbrev-expand press."
   [state origin prefix tried candidate]
   (let [[orow ocol] origin
-        state (replace-span state orow ocol (:cursor-col state) candidate)]
+        state (buf/replace-span state orow ocol (:cursor-col state) candidate)]
     (assoc state :dabbrev-expand
            {:origin origin :prefix prefix :tried (conj tried candidate)
             :end [(:cursor-row state) (:cursor-col state)]})))
@@ -380,6 +366,22 @@
                                       buf/clamp-cursor
                                       (set-message (format "Replaced %d occurrence%s"
                                                            total (if (= 1 total) "" "s"))))))))))))))
+
+(defcommand query-replace
+  "Replace occurrences of a string from point to the end of the buffer,
+   asking at each one (M-%, see legmacs.buffer/query-replace-start and
+   -answer for how the session itself is driven): y replaces and moves on,
+   n skips it, ! replaces it and every remaining occurrence unconditionally,
+   q (or RET/ESC/C-g) stops leaving the rest untouched."
+  [state]
+  (if-not (buf/writable? state)
+    (set-message state "Buffer is read-only")
+    (mb/open state "Query replace: "
+             (fn [state from]
+               (if (string/blank? from)
+                 state
+                 (mb/open state (str "Query replace \"" from "\" with: ")
+                          (fn [state to] (buf/query-replace-start state from to))))))))
 
 ;; --- shell -----------------------------------------------------------------
 

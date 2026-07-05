@@ -51,7 +51,7 @@
 
    ;; search / replace / jump
    "C-s" :swiper
-   "M-%" :replace-string
+   "M-%" :query-replace
    "M-g g" :goto-line             "M-g M-g" :goto-line
    "C-l" :recenter
 

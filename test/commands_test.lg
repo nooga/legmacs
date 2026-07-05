@@ -5,6 +5,7 @@
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
             [legmacs.commands :as c]
+            [legmacs.dispatch :as d]
             [legmacs.modes.letgo]))
 
 (defn- type-text [state text]
@@ -290,6 +291,68 @@
           s (c/replace-string s)]
       (is (not (mb/active? s)))
       (is (= "Buffer is read-only" (:message s))))))
+
+(defn- start-query-replace [state from to]
+  (mb/submit (type-text (mb/submit (type-text (c/query-replace state) from)) to)))
+
+(deftest query-replace-interactive-loop
+  (testing "y replaces the current match and advances to the next; the session ends after the last one"
+    (let [s (start-query-replace (buf/new-state nil ["foo bar foo"]) "foo" "baz")]
+      (is (:query-replace s))
+      (is (= "Query replace \"foo\" with \"baz\" (y, n, !, q)? " (:message s)))
+      (is (= [0 0] [(:cursor-row s) (:cursor-col s)]))
+      (let [s (d/dispatch s "y")]
+        (is (= ["baz bar foo"] (:lines s)))
+        (is (:query-replace s) "one match left to ask about")
+        (let [s (d/dispatch s "y")]
+          (is (= ["baz bar baz"] (:lines s)))
+          (is (not (:query-replace s)))
+          (is (= "Replaced 2 occurrences" (:message s)))))))
+
+  (testing "n skips the current match without touching it, moving on to the next"
+    (let [s (start-query-replace (buf/new-state nil ["foo foo"]) "foo" "bar")
+          s (d/dispatch s "n")]
+      (is (= ["foo foo"] (:lines s)))
+      (is (:query-replace s))
+      (let [s (d/dispatch s "y")]
+        (is (= ["foo bar"] (:lines s)))
+        (is (not (:query-replace s))))))
+
+  (testing "! replaces the current match and every remaining one unconditionally, in one step"
+    (let [s (start-query-replace (buf/new-state nil ["foo foo foo"]) "foo" "x")
+          s (d/dispatch s "!")]
+      (is (= ["x x x"] (:lines s)))
+      (is (not (:query-replace s)))
+      (is (= "Replaced 3 occurrences" (:message s)))))
+
+  (testing "q stops immediately, leaving the rest of the buffer untouched"
+    (let [s (start-query-replace (buf/new-state nil ["foo foo"]) "foo" "x")
+          s (d/dispatch s "q")]
+      (is (= ["foo foo"] (:lines s)))
+      (is (not (:query-replace s)))
+      (is (= "Replaced 0 occurrences" (:message s)))))
+
+  (testing "any other unrecognized key also stops the session, same as q"
+    (let [s (start-query-replace (buf/new-state nil ["foo"]) "foo" "x")
+          s (d/dispatch s "ESC")]
+      (is (not (:query-replace s)))
+      (is (= ["foo"] (:lines s)))))
+
+  (testing "no occurrences at all reports itself; no session starts"
+    (let [s (start-query-replace (buf/new-state nil ["aaa"]) "zzz" "y")]
+      (is (not (:query-replace s)))
+      (is (= "Replaced 0 occurrences" (:message s)))))
+
+  (testing "read-only buffers refuse before prompting"
+    (let [s (c/query-replace (assoc (buf/new-state nil ["foo"]) :read-only? true))]
+      (is (not (mb/active? s)))
+      (is (= "Buffer is read-only" (:message s)))))
+
+  (testing "each replacement is its own undo step"
+    (let [s (start-query-replace (buf/new-state nil ["foo foo"]) "foo" "x")
+          s (d/dispatch s "y")
+          s (buf/undo s)]
+      (is (= ["foo foo"] (:lines s))))))
 
 (deftest shell-command-shows-output
   (testing "stdout lands in the echo area"

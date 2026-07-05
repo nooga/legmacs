@@ -156,6 +156,22 @@
 (defn insert-newline [state]
   (insert-string state "\n"))
 
+(defn replace-span
+  "Replace `row`'s [start-col, end-col) span with `replacement` as one
+   undo step, leaving point right after the inserted text -- the general
+   \"replace this bit of a line\" primitive behind dabbrev-expand's
+   cycling and query-replace's per-match substitution."
+  [state row start-col end-col replacement]
+  (if-not (writable? state)
+    (blocked state)
+    (let [state (push-undo state)
+          line (nth (:lines state) row)
+          line* (str (subs line 0 start-col) replacement (subs line end-col))]
+      (-> state
+          (assoc :lines (assoc (:lines state) row line*))
+          (assoc :cursor-row row :cursor-col (+ start-col (count replacement)))
+          (assoc :modified? true)))))
+
 (defn delete-char-forward
   "Delete the character under the cursor (or join with the next line at
    end-of-line). No-op at the very end of the buffer."
@@ -549,3 +565,90 @@
       (let [start (loop [c anchor] (if (word-char? (char-at (dec c))) (recur (dec c)) c))
             end (loop [c (inc anchor)] (if (word-char? (char-at c)) (recur (inc c)) c))]
         [[row start] [row end]]))))
+
+;; --- query-replace (interactive replace) --------------------------------
+;;
+;; Lives here rather than in legmacs.commands (which starts the session)
+;; or legmacs.dispatch (which drives it keystroke by keystroke) because
+;; both need it and neither can require the other: legmacs.commands
+;; already requires legmacs.dispatch (for call-last-kbd-macro's replay),
+;; so legmacs.dispatch requiring legmacs.commands back would be a cycle.
+;; legmacs.buffer, underneath both, is a query-replace session's natural
+;; home anyway -- it's just a temporary bit of extra state (:query-replace)
+;; riding along in the buffer's own state map, same as :mark or :dabbrev-
+;; expand, driven purely by :lines/:cursor-* the way everything else here
+;; is.
+
+(defn- find-match-in-line [line needle from-col]
+  (when-let [j (string/index-of line needle from-col)]
+    {:col j :end (+ j (count needle))}))
+
+(defn find-next-match
+  "The next occurrence of `needle` at or after (row, col), searching
+   forward to the end of the buffer -- never wraps, matching
+   query-replace/replace-string's shared \"point to end of buffer\" scope.
+   nil if there is none."
+  [lines row col needle]
+  (loop [row row, col col]
+    (if (>= row (count lines))
+      nil
+      (if-let [m (find-match-in-line (nth lines row) needle col)]
+        {:row row :col (:col m) :end (:end m)}
+        (recur (inc row) 0)))))
+
+(defn- qr-prompt [from to]
+  (str "Query replace \"" from "\" with \"" to "\" (y, n, !, q)? "))
+
+(defn- qr-finish [state n]
+  (-> state (dissoc :query-replace)
+      (assoc :message (format "Replaced %d occurrence%s" n (if (= 1 n) "" "s")))))
+
+(defn- qr-goto [state from to row col end n]
+  (-> state
+      (assoc :cursor-row row :cursor-col col :goal-col nil)
+      (assoc :query-replace {:from from :to to :row row :col col :end end :n n})
+      (assoc :message (qr-prompt from to))))
+
+(defn- qr-advance
+  "Land on the next match of `from` from (row, col) onward, or finish (with
+   `n` as the final count) if there is none left."
+  [state from to row col n]
+  (if-let [m (find-next-match (:lines state) row col from)]
+    (qr-goto state from to (:row m) (:col m) (:end m) n)
+    (qr-finish state n)))
+
+(defn query-replace-start
+  "Begin an interactive query-replace session (M-%, see
+   legmacs.commands/query-replace): jump to the first match of `from` from
+   point onward and stash :query-replace for query-replace-answer to drive
+   from here. Reports itself (same as replace-string) instead if there are
+   no matches at all."
+  [state from to]
+  (qr-advance state from to (:cursor-row state) (:cursor-col state) 0))
+
+(defn query-replace-active? [state] (boolean (:query-replace state)))
+
+(defn query-replace-answer
+  "Handle one keypress of an active query-replace session (see
+   legmacs.dispatch, which routes to this instead of ordinary dispatch
+   while query-replace-active?): y replaces the current match and moves to
+   the next, n skips it and moves on, ! replaces it and every remaining
+   match unconditionally, anything else (q, RET, ESC, C-g, ...) stops,
+   leaving the rest of the buffer untouched."
+  [state chord]
+  (let [{:keys [from to row col end n]} (:query-replace state)]
+    (cond
+      (= chord "y")
+      (qr-advance (replace-span state row col end to) from to row (+ col (count to)) (inc n))
+
+      (= chord "n")
+      (qr-advance state from to row end n)
+
+      (= chord "!")
+      (loop [state state, row row, col col, n n]
+        (if-let [m (find-next-match (:lines state) row col from)]
+          (let [state (replace-span state (:row m) (:col m) (:end m) to)]
+            (recur state (:row m) (+ (:col m) (count to)) (inc n)))
+          (qr-finish state n)))
+
+      :else (qr-finish state n))))
