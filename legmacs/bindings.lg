@@ -83,6 +83,7 @@
    "C-x k" :kill-buffer
    "C-x right" :next-buffer
    "C-x left" :previous-buffer
+   "C-c C-z" :repl
 
    ;; help / misc
    "C-g" :keyboard-quit

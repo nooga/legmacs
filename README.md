@@ -27,6 +27,10 @@ started:
   the very same runtime, so `*scratch*` is a live REPL over the editor
   itself -- and since let-go is close enough to Clojure's reader syntax,
   `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files open into the same mode too
+- a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
+  running transcript instead of building one by hand with `C-j`
+- keyboard macros, a mark ring, interactive query-replace, dabbrev-expand,
+  comment-dwim, and bracketed paste
 - structural expand-region for let-go, growing the selection one
   s-expression at a time
 - swiper-style live incremental search

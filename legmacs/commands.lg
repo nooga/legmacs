@@ -12,7 +12,8 @@
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
             [legmacs.modes :as modes]
-            [legmacs.dispatch :as dispatch]))
+            [legmacs.dispatch :as dispatch]
+            [legmacs.modes.repl :as repl]))
 
 (defn set-message [state msg] (assoc state :message msg))
 
@@ -337,9 +338,10 @@
 
 (defcommand replace-string
   "Replace every occurrence of a string from point to the end of the
-   buffer, prompting for the string and its replacement (M-%). Replaces
-   unconditionally -- there is no per-match querying (yet), which is why
-   the echo message counts what it did."
+   buffer, prompting for the string and its replacement. Unconditional --
+   see query-replace (bound to M-% instead) for the version that asks at
+   each match; this one's still reachable via M-x for a no-questions-asked
+   pass, which is why the echo message counts what it did."
   [state]
   (if-not (buf/writable? state)
     (set-message state "Buffer is read-only")
@@ -532,6 +534,17 @@
            {:submit-selected? true
             :completer (fn [input]
                          (completion/fuzzy-filter input (map :name (:buffer-list state))))}))
+
+(defcommand repl
+  "Open -- or switch to -- the *repl* buffer (C-c C-z), legmacs's own
+   interactive let-go REPL (see legmacs.modes.repl). Reuses the same
+   buffer across calls so its history survives switching away and back,
+   unlike the :help singleton (which refreshes its content every time) --
+   a REPL buffer must never be silently reset."
+  [state]
+  (if-let [existing (some #(when (= (:name %) "*repl*") %) (:buffer-list state))]
+    (assoc state :buffer-command {:op :switch :id (:id existing)})
+    (assoc state :buffer-command {:op :open-new :state (repl/new-repl-state)})))
 
 (defcommand list-buffers
   "Show every open buffer: name, modified flag, mode."

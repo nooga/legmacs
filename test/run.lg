@@ -8,6 +8,7 @@
             [test.dispatch-test]
             [test.modes-test]
             [test.letgo-mode-test]
+            [test.repl-mode-test]
             [test.crutch-mode-test]
             [test.keycast-mode-test]
             [test.markdown-mode-test]

@@ -65,7 +65,12 @@ not held together.
 | `C-_` / `C-x u` | undo |
 | `M-_` | redo |
 | `C-s` | incremental regexp search (swiper-style); `C-s`/`C-r` step through matches |
-| `M-%` | replace-string: replace every occurrence from point on (prompts for both strings) |
+| `M-%` | query-replace: replace occurrences from point on, asking at each one (`y`/`n`/`!`/`q`) |
+| `M-;` | comment-dwim: toggle a comment on the current line, or every line the region spans |
+| `M-/` | dabbrev-expand: complete the word before point from one already in the buffer; press again to cycle |
+| `C-x C-SPC` | pop-mark: jump back to before the last long-range jump (`goto-line`, landing on a swiper match, `beginning`/`end-of-buffer`) |
+| `C-x (` / `C-x )` | start / stop recording a keyboard macro |
+| `C-x e` | replay the last recorded keyboard macro |
 | `M-!` | run a shell command, output in the echo area |
 | `C-x C-s` | save |
 | `C-x C-w` | write file (always prompts) |
@@ -74,6 +79,7 @@ not held together.
 | `C-x C-b` | list open buffers |
 | `C-x k` | kill (close) the current buffer |
 | `C-x <right>` / `C-x <left>` | cycle to the next / previous buffer |
+| `C-c C-z` | open (or switch to) the `*repl*` buffer |
 | `C-x 2` | split the current window in two, one above the other |
 | `C-x 3` | split the current window in two, side by side |
 | `C-x o` | move to the next window (cycles top-to-bottom, left-to-right) |
@@ -81,9 +87,14 @@ not held together.
 | `C-x 1` | make the current window the only one |
 | `C-x C-c` | quit (prompts if the current buffer has unsaved changes) |
 | `C-g` | cancel / quit-out-of-here |
-| `M-x` | run a command by name (`TAB` completes) |
+| `M-x` | run a command by name (`TAB` completes) -- `replace-string` (the old unconditional M-% behavior) is still there under this |
 | `C-x C-q` | toggle the current buffer read-only |
 | `C-h` | show all key bindings (in a read-only `*Help*` buffer) |
+
+Pasting into a terminal that supports bracketed paste lands as one atomic
+insert, not a burst of individual keystrokes -- so a multi-line paste can't
+trip auto-pairing or auto-indent into mangling it the way replaying it one
+character at a time would.
 
 Files indented with real tabs (Go, Makefiles) display with each tab
 expanded to the next 4-column stop — `(reset! legmacs.render/tab-width 8)`
@@ -219,6 +230,25 @@ down the buffer is what makes `*scratch*` feel like a REPL transcript, the
 same way Emacs's does. Eval errors (bad syntax, a runtime exception,
 whatever) are caught and shown in the echo area rather than crashing the
 editor.
+
+`C-c C-z` opens (or switches to) `*repl*` -- a dedicated, persistent REPL
+buffer rather than a transcript you build by hand with `C-j`. It's plain
+let-go-mode (so everything above -- highlighting, auto-pairing, paren
+matching, expand-region -- comes along for free) plus one extra minor
+mode that reinterprets `RET`: type an expression after the `=> ` prompt
+and press it. A complete top-level form gets evaluated in place (same
+`load-string`, same running-editor namespace as `C-x C-e`), its result
+printed right after it, and a fresh prompt opened below; an incomplete one
+(an open bracket) just inserts a newline and auto-indents so a multi-line
+`defn` can keep being typed across several `RET` presses, the same way it
+would in an ordinary `.lg` buffer. `RET` anywhere but the last line is an
+ordinary let-go-mode `RET` -- editing earlier transcript text doesn't try
+to re-run it. [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) has the
+details, including the one real wrinkle: because auto-pairing keeps
+closing every bracket you open immediately, "is the input complete" has to
+be judged from the text *before point*, not the whole line -- otherwise
+the auto-inserted closer sitting after point would make every half-typed
+form look finished the moment its first bracket goes in.
 
 Syntax highlighting (strings, comments, a curated set of special-form
 names), paren matching, auto-indent, and expand-region all share one
@@ -489,6 +519,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a per-line highlighter, an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
+| [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven per-line scanner (comments, strings, keyword/type/constant sets) behind major modes for Go, JS/TS, Python, C/C++, shell, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |

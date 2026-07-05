@@ -217,6 +217,20 @@
     (is (= {:op :next} (:buffer-command (c/next-buffer (buf/new-state nil ["x"])))))
     (is (= {:op :prev} (:buffer-command (c/previous-buffer (buf/new-state nil ["x"])))))))
 
+(deftest repl-command-opens-or-reuses-the-repl-buffer
+  (testing "no *repl* open yet -> opens a fresh one"
+    (let [s (c/repl (buf/new-state nil ["x"]))
+          cmd (:buffer-command s)]
+      (is (= :open-new (:op cmd)))
+      (is (= "*repl*" (:buffer-name (:state cmd))))
+      (is (= :let-go (:mode (:state cmd))))))
+
+  (testing "a *repl* already in :buffer-list -> just switches to it, never re-created"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :buffer-list [{:id 9 :name "*repl*" :filename nil :modified? true :mode :let-go}])
+          s (c/repl s)]
+      (is (= {:op :switch :id 9} (:buffer-command s))))))
+
 (deftest goto-line-jumps-and-clamps
   (testing "goto-line moves point to the requested line, clamped to the buffer"
     (let [s (buf/new-state nil ["a" "b" "c" "d"])

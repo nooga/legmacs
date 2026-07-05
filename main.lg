@@ -19,6 +19,7 @@
             [legmacs.bindings :as bindings]
             [legmacs.modes :as modes]
             [legmacs.modes.letgo]
+            [legmacs.modes.repl]
             [legmacs.modes.markdown]
             [legmacs.modes.prog]
             [legmacs.modes.structural]

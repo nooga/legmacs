@@ -1,0 +1,88 @@
+;; legmacs.modes.repl: driven through real dispatch, one chord at a time
+;; (self-insert, auto-pairing, and RET all matter here -- the "is the
+;; current input complete" check has to work correctly *with*
+;; electric-pair-mode in the loop, not around it), exactly like a real
+;; keystroke-by-keystroke REPL session would be.
+
+(ns test.repl-mode-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as d]
+            [legmacs.modes.repl :as repl]))
+
+(bindings/install!)
+
+(defn- type-text [state text]
+  (reduce d/dispatch state (map str (seq text))))
+
+(deftest new-repl-state-basics
+  (testing "let-go-mode plus the :repl minor mode, named *repl*, point after the banner's prompt"
+    (let [s (repl/new-repl-state)]
+      (is (= :let-go (:mode s)))
+      (is (contains? (set (:minor-modes s)) :repl))
+      (is (= "*repl*" (:buffer-name s)))
+      (is (= (last (:lines s)) repl/prompt))
+      (is (= (dec (count (:lines s))) (:cursor-row s)))
+      (is (= (count repl/prompt) (:cursor-col s))))))
+
+(deftest evaluating-a-complete-expression
+  (testing "prints the result right after it, then a fresh blank prompt"
+    (let [s (-> (repl/new-repl-state) (type-text "(+ 1 2)") (d/dispatch "RET"))]
+      (is (= ["=> (+ 1 2)" "3" "" repl/prompt] (take-last 4 (:lines s))))
+      (is (= (dec (count (:lines s))) (:cursor-row s)))
+      (is (= (count repl/prompt) (:cursor-col s)))))
+
+  (testing "a form using something defined earlier in the same session"
+    (let [s (-> (repl/new-repl-state)
+                (type-text "(def x 10)") (d/dispatch "RET")
+                (type-text "(* x 2)") (d/dispatch "RET"))]
+      (is (= "20" (nth (:lines s) (- (count (:lines s)) 3)))))))
+
+(deftest incomplete-input-continues-instead-of-evaluating
+  (testing "an unclosed form inserts a newline and indents, no result printed"
+    (let [s (-> (repl/new-repl-state) (type-text "(defn f [x]") (d/dispatch "RET"))]
+      (is (= "=> (defn f [x]" (nth (:lines s) (- (count (:lines s)) 2))))
+      (is (not (string/starts-with? (last (:lines s)) repl/prompt))
+          "still mid-form -- the last line is an indented continuation, not a fresh prompt")))
+
+  (testing "finishing it across further RETs eventually evaluates the whole thing"
+    (let [s (-> (repl/new-repl-state)
+                (type-text "(defn f [x]") (d/dispatch "RET")
+                (type-text "(* x x)") (d/dispatch "RET")
+                (d/dispatch ")") (d/dispatch "RET")
+                (type-text "(f 5)") (d/dispatch "RET"))]
+      (is (string/includes? (string/join "\n" (:lines s)) "#'core/f"))
+      (is (= "25" (nth (:lines s) (- (count (:lines s)) 3)))))))
+
+(deftest eval-errors-print-in-the-transcript-not-just-the-echo-area
+  (testing "a compile/runtime error becomes an \"Error: ...\" line, and still gets a fresh prompt"
+    (let [s (-> (repl/new-repl-state) (type-text "no-such-thing-at-all") (d/dispatch "RET"))]
+      (is (string/starts-with? (nth (:lines s) (- (count (:lines s)) 3)) "Error: "))
+      (is (= repl/prompt (last (:lines s)))))))
+
+(deftest blank-ret-on-an-empty-prompt-just-advances
+  (testing "no evaluation happens, just a fresh prompt line"
+    (let [before (repl/new-repl-state)
+          s (d/dispatch before "RET")]
+      (is (= (conj (:lines before) repl/prompt) (:lines s))))))
+
+(deftest ret-elsewhere-in-the-transcript-is-an-ordinary-let-go-ret
+  (testing "editing earlier text doesn't try to re-evaluate it"
+    (let [s (-> (repl/new-repl-state)
+                (type-text "(+ 1 2)") (d/dispatch "RET")
+                (assoc :cursor-row 4 :cursor-col (count "=> (+ 1 2)")))
+          before-line-count (count (:lines s))
+          s2 (d/dispatch s "RET")]
+      (is (= (inc before-line-count) (count (:lines s2))))
+      (is (not (string/includes? (string/join "\n" (:lines s2)) "Error"))))))
+
+(deftest read-only-repl-buffer-refuses-to-evaluate
+  (testing "RET on the last line reports itself instead of evaluating or editing"
+    (let [s (-> (repl/new-repl-state) (type-text "(+ 1 2)") (assoc :read-only? true))
+          lines-before (:lines s)
+          s2 (d/dispatch s "RET")]
+      (is (= lines-before (:lines s2)))
+      (is (= "Buffer is read-only" (:message s2))))))

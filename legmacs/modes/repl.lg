@@ -1,0 +1,158 @@
+;; legmacs.modes.repl — a persistent *repl* buffer: legmacs's own REPL,
+;; evaluating let-go code live in the editor's own process (see
+;; legmacs.modes.letgo's docstring on what that means -- same deal here).
+;; Where let-go-mode's C-x C-e/C-j eval whatever's already in a normal
+;; buffer, this is a proper interactive transcript: type an expression
+;; after the "=> " prompt and press RET.
+;;
+;; It's plain let-go-mode (major mode :let-go) for content -- highlighting,
+;; auto-pairing, paren-matching, auto-indent are exactly what a normal .lg
+;; buffer gets, for free -- plus one minor mode, :repl, that shadows RET:
+;;   - a complete top-level form -> evaluate it (load-string, so a form
+;;     spanning several typed expressions works the same as eval-buffer),
+;;     print the result, and open a fresh prompt right after it
+;;   - an incomplete one (an open bracket -- ls/depth-at > 0) -> insert a
+;;     newline and auto-indent instead, exactly like ordinary let-go-mode,
+;;     so a multi-line form can keep being typed
+;;   - RET anywhere but the last line is just an ordinary let-go-mode RET;
+;;     editing earlier transcript text doesn't try to re-evaluate it
+;; Everything else -- self-insert, "(", ")", DEL pairing -- falls through
+;; to let-go-mode untouched, since :repl's keymap only binds RET.
+;;
+;; current-input reads up to *point*, not to the end of the buffer --
+;; electric-pair-mode means there can be auto-inserted, not-yet-consumed
+;; closing brackets sitting after point (e.g. having typed "(defn f [x]"
+;; and stopped there: the opening "(" already auto-closed itself, so the
+;; line's full text is "(defn f [x])" even though the user hasn't typed a
+;; body yet). Checking completeness against the full line would call that
+;; complete the moment the first bracket auto-closes, which is almost
+;; always. Reading only up to point keeps this asking "how much has the
+;; user actually typed" instead. Submitting truncates back to point first
+;; (truncate-to-point), discarding whatever auto-paired leftovers sat
+;; after it -- they were never real input. The ordinary case (point at the
+;; true end because typing the form's own closing bracket keystrokes made
+;; auto-pair's skip-over consume every auto-inserted one already) is
+;; unaffected either way.
+;;
+;; Known simplification: the "=> " prompt is just text, not a protected
+;; region -- backspacing through it (or otherwise mangling the last
+;; prompt line) makes current-input fall back to treating the whole last
+;; line as raw input rather than erroring. Also, an unterminated string
+;; (unlike an open bracket) doesn't make ls/depth-at register as
+;; incomplete, so RET on one reports a read error immediately instead of
+;; waiting for more input -- retype it rather than trying to close the
+;; string on a following line.
+
+(ns legmacs.modes.repl
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.modes :as modes]
+            [legmacs.modes.letgo :as letgo]
+            [legmacs.lisp-syntax :as ls]))
+
+(def prompt "=> ")
+
+(def ^:private banner
+  [";; *repl* -- legmacs's own let-go REPL, running in the editor's own process."
+   ";; RET evaluates a complete form and prints its result right after it;"
+   ";; an incomplete one (an open bracket) just gets a newline to keep typing."
+   ""
+   prompt])
+
+(defn- format-result [v]
+  (try (pr-str v) (catch e (str "#<unprintable " (ex-message e) ">"))))
+
+(defn- last-row [state] (dec (count (:lines state))))
+
+(defn- at-last-line? [state] (= (:cursor-row state) (last-row state)))
+
+(defn- prompt-start-row
+  "The most recent line (searching backward from the end) that begins
+   with the prompt -- where the input currently being typed starts.
+   Falls back to the last line itself if none does (see the prompt-
+   mangling simplification above)."
+  [lines]
+  (loop [row (dec (count lines))]
+    (cond
+      (neg? row) (dec (count lines))
+      (string/starts-with? (nth lines row) prompt) row
+      :else (recur (dec row)))))
+
+(defn- current-input
+  "Everything typed since the prompt, up to point -- not to the end of the
+   line/buffer; see this namespace's docstring on why that matters once
+   electric-pair-mode is in the picture."
+  [state]
+  (let [lines (:lines state)
+        start (prompt-start-row lines)
+        raw-first (nth lines start)
+        prompt-len (if (string/starts-with? raw-first prompt) (count prompt) 0)
+        row (:cursor-row state), col (:cursor-col state)]
+    (if (= start row)
+      (subs raw-first prompt-len col)
+      (let [first-line (subs raw-first prompt-len)
+            middle (subvec lines (inc start) row)
+            last-line (subs (nth lines row) 0 col)]
+        (string/join "\n" (concat [first-line] middle [last-line]))))))
+
+(defn- truncate-to-point
+  "Drop everything after point on its line, and any lines after it --
+   the auto-paired leftovers current-input already excluded from what got
+   evaluated (see this namespace's docstring)."
+  [state]
+  (let [{:keys [lines cursor-row cursor-col]} state
+        line (nth lines cursor-row)]
+    (assoc state :lines (conj (subvec lines 0 cursor-row) (subs line 0 cursor-col)))))
+
+(defn- append-lines
+  "Append `new-lines` to the buffer as one undo step, landing point at the
+   end of the last one."
+  [state new-lines]
+  (let [state (buf/push-undo state)
+        lines* (vec (concat (:lines state) new-lines))]
+    (assoc state
+           :lines lines* :modified? true
+           :cursor-row (dec (count lines*)) :cursor-col (count (last new-lines))
+           :goal-col nil)))
+
+(defn- repl-eval-text [text]
+  (try [:ok (format-result (load-string text))]
+       (catch e [:error (ex-message e)])))
+
+(defcommand repl-return
+  "RET in the *repl* buffer -- see this namespace's docstring for the full
+   evaluate/continue/passthrough decision."
+  [state]
+  (cond
+    (not (at-last-line? state)) (letgo/newline-and-indent state)
+    (not (buf/writable? state)) (assoc state :message "Buffer is read-only")
+    :else
+    (let [input (current-input state)]
+      (cond
+        (string/blank? input) (append-lines (truncate-to-point state) [prompt])
+        (pos? (ls/depth-at input (count input))) (letgo/newline-and-indent state)
+        :else
+        (let [[status text] (repl-eval-text input)
+              printed (if (= status :ok) text (str "Error: " text))]
+          (-> state
+              (update :repl-history (fnil conj []) input)
+              truncate-to-point
+              (append-lines (vec (concat (string/split printed "\n") ["" prompt])))))))))
+
+(def keymap (atom {}))
+(km/bind-key! keymap "RET" :repl-return)
+
+(modes/register-minor-mode! :repl keymap
+  "repl: RET evaluates the current input instead of just inserting a newline")
+
+(defn new-repl-state
+  "A fresh *repl* buffer state: let-go-mode (highlighting, auto-pairing,
+   paren-matching, auto-indent all come from it) plus the :repl minor mode,
+   point left ready to type right after the banner's prompt."
+  []
+  (-> (buf/new-state nil banner)
+      (modes/switch-to-mode :let-go)
+      (modes/enable-minor-mode :repl)
+      (assoc :buffer-name "*repl*")
+      (assoc :cursor-row (dec (count banner)) :cursor-col (count prompt))))
