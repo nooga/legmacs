@@ -25,8 +25,8 @@
 (defcommand move-end-of-line "Move point to the end of the line." [state] (buf/move-line-end state))
 (defcommand forward-word "Move point forward one word." [state] (buf/move-word-forward state))
 (defcommand backward-word "Move point backward one word." [state] (buf/move-word-backward state))
-(defcommand beginning-of-buffer "Move point to the start of the buffer." [state] (buf/move-buffer-start state))
-(defcommand end-of-buffer "Move point to the end of the buffer." [state] (buf/move-buffer-end state))
+(defcommand beginning-of-buffer "Move point to the start of the buffer." [state] (buf/move-buffer-start (buf/push-mark state)))
+(defcommand end-of-buffer "Move point to the end of the buffer." [state] (buf/move-buffer-end (buf/push-mark state)))
 (defcommand forward-paragraph "Move point past the current paragraph." [state] (buf/move-paragraph-forward state))
 (defcommand backward-paragraph "Move point to before the current paragraph." [state] (buf/move-paragraph-backward state))
 
@@ -50,6 +50,7 @@
              (let [n (try (parse-long (string/trim input)) (catch e nil))]
                (if n
                  (-> state
+                     buf/push-mark
                      (assoc :cursor-row (buf/clamp (dec n) 0 (dec (buf/line-count state)))
                             :goal-col nil)
                      buf/clamp-cursor)
@@ -199,6 +200,13 @@
   [state]
   (-> state (assoc :mark [(:cursor-row state) (:cursor-col state)]) (set-message "Mark set")))
 
+(defcommand pop-mark
+  "Jump point back to the most recent mark-ring entry (see legmacs.buffer/
+   push-mark), unwinding one long-range jump -- goto-line, landing on a
+   swiper match, beginning/end-of-buffer. Repeated presses walk further
+   back through jump history."
+  [state] (buf/pop-mark state))
+
 (defcommand kill-region
   "Kill (cut) the text between point and mark."
   [state]
@@ -311,11 +319,15 @@
   "Incremental regexp search, ivy/swiper-style: type a pattern and every
    matching line appears in a live list below, with point following the
    selected match. C-s/C-n (and C-r/C-p) step through matches, RET stays
-   put, C-g returns to where you started."
+   put, C-g returns to where you started. Landing on a match (RET) pushes
+   where point started onto the mark ring, so pop-mark can undo the jump."
   [state]
   (let [origin (select-keys state [:cursor-row :cursor-col :scroll-row :scroll-col])]
     (mb/open state "swiper: "
-             (fn [state _input] (set-message state ""))
+             (fn [state _input]
+               (-> state
+                   (buf/push-mark-at (:cursor-row origin) (:cursor-col origin))
+                   (set-message "")))
              {:list-kind :swiper
               :on-cancel (fn [state] (merge state origin))
               :on-change (fn [state input]

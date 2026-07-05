@@ -10,6 +10,9 @@
 (defn- type-text [state text]
   (reduce mb/insert-char state (seq text)))
 
+(defn- type-input [state s]
+  (reduce (fn [st ch] (mb/insert-char st (str ch))) state (seq s)))
+
 (deftest movement-commands-delegate-to-buffer
   (testing "forward-char / next-line move the cursor"
     (let [s (buf/new-state nil ["ab" "cd"])
@@ -228,6 +231,36 @@
           s (mb/submit (type-text (c/goto-line s) "wat"))]
       (is (= 0 (:cursor-row s)))
       (is (string/includes? (:message s) "Not a line number")))))
+
+(deftest jump-commands-push-the-mark-ring-so-pop-mark-can-undo-them
+  (testing "goto-line pushes point's pre-jump position; pop-mark returns to it"
+    (let [s (assoc (buf/new-state nil ["a" "b" "c" "d"]) :cursor-row 0 :cursor-col 0)
+          s (mb/submit (type-text (c/goto-line s) "3"))]
+      (is (= 2 (:cursor-row s)))
+      (is (= 0 (:cursor-row (c/pop-mark s))))))
+
+  (testing "a cancelled/garbage goto-line doesn't push anything to jump back to"
+    (let [s (buf/new-state nil ["a" "b"])
+          s (mb/submit (type-text (c/goto-line s) "wat"))]
+      (is (= "No previous mark to jump back to" (:message (c/pop-mark s))))))
+
+  (testing "beginning-of-buffer / end-of-buffer push the mark too"
+    (let [s (assoc (buf/new-state nil ["a" "b" "c"]) :cursor-row 1 :cursor-col 0)
+          s (c/end-of-buffer s)]
+      (is (= 2 (:cursor-row s)))
+      (is (= 1 (:cursor-row (c/pop-mark s))))))
+
+  (testing "landing on a swiper match pushes where the search started, not the match"
+    (let [s (assoc (buf/new-state nil ["a" "foo" "b" "foo"]) :cursor-row 0 :cursor-col 0)
+          s (mb/submit (type-input (c/swiper s) "foo"))]
+      (is (= 1 (:cursor-row s)))
+      (is (= 0 (:cursor-row (c/pop-mark s))))))
+
+  (testing "cancelling swiper restores the origin itself, so there's nothing new to pop"
+    (let [s (assoc (buf/new-state nil ["a" "foo"]) :cursor-row 0 :cursor-col 0)
+          s (mb/cancel (type-input (c/swiper s) "foo"))]
+      (is (= 0 (:cursor-row s)))
+      (is (= "No previous mark to jump back to" (:message (c/pop-mark s)))))))
 
 (deftest replace-string-replaces-from-point
   (testing "all occurrences from point forward are replaced, count reported, undoable"

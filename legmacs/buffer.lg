@@ -43,6 +43,7 @@
    :undo-stack ()
    :redo-stack ()
    :mark nil
+   :mark-ring ()
    :expand-stack ()
    :clipboard ""
    :quit? false})
@@ -440,6 +441,40 @@
           (-> state push-undo
               (assoc :lines lines* :cursor-row sr :cursor-col sc :mark nil :modified? true)))))
     state)))
+
+;; --- mark ring (jump history) -------------------------------------------
+;;
+;; A back-stack of pre-jump positions, separate from :mark (which is the
+;; region's other endpoint, set explicitly with C-SPC). Long-range jumps
+;; (goto-line, swiper, beginning/end-of-buffer) push the position point is
+;; about to leave; pop-mark is the "take me back" that unwinds them.
+
+(def mark-ring-limit 16)
+
+(defn push-mark-at
+  "Push [row col] onto the mark ring, bounded to mark-ring-limit entries."
+  [state row col]
+  (-> state
+      (update :mark-ring #(cons [row col] %))
+      (update :mark-ring #(if (> (count %) mark-ring-limit) (take mark-ring-limit %) %))))
+
+(defn push-mark
+  "Push point's current position onto the mark ring -- call this on the
+   state a jump is about to move point away from."
+  [state]
+  (push-mark-at state (:cursor-row state) (:cursor-col state)))
+
+(defn pop-mark
+  "Jump point back to the most recently pushed mark-ring entry, removing
+   it (clamped in case edits since have shortened the buffer). A message,
+   no-op otherwise if the ring is empty."
+  [state]
+  (if-let [[row col] (first (:mark-ring state))]
+    (-> state
+        (assoc :cursor-row row :cursor-col col :goal-col nil)
+        (update :mark-ring rest)
+        clamp-cursor)
+    (assoc state :message "No previous mark to jump back to")))
 
 ;; --- word kills (built on word motion + the region primitives) ---------
 

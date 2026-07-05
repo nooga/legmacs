@@ -161,3 +161,44 @@
       (is (= ["foo bar"] (:lines (buf/kill-word s))))
       (is (= ["foo bar"] (:lines (buf/backward-kill-word s))))
       (is (= "" (:clipboard (buf/kill-word s)))))))
+
+(deftest mark-ring
+  (testing "pop-mark jumps back to the last pushed position and consumes it"
+    (let [s (-> (buf/new-state nil ["a" "b" "c"])
+                (assoc :cursor-row 0 :cursor-col 0)
+                buf/push-mark
+                (assoc :cursor-row 2 :cursor-col 1)
+                buf/pop-mark)]
+      (is (= [0 0] [(:cursor-row s) (:cursor-col s)]))
+      (is (= () (:mark-ring s)))))
+
+  (testing "repeated pops walk further back through jump history, most recent first"
+    (let [s (-> (buf/new-state nil ["a" "b" "c"])
+                (assoc :cursor-row 0 :cursor-col 0) buf/push-mark
+                (assoc :cursor-row 1 :cursor-col 0) buf/push-mark
+                (assoc :cursor-row 2 :cursor-col 0))
+          s1 (buf/pop-mark s)
+          s2 (buf/pop-mark s1)]
+      (is (= [1 0] [(:cursor-row s1) (:cursor-col s1)]))
+      (is (= [0 0] [(:cursor-row s2) (:cursor-col s2)]))))
+
+  (testing "an empty ring is a no-op with a message, point unmoved"
+    (let [s (buf/pop-mark (assoc (buf/new-state nil ["a"]) :cursor-col 0))]
+      (is (= [0 0] [(:cursor-row s) (:cursor-col s)]))
+      (is (= "No previous mark to jump back to" (:message s)))))
+
+  (testing "bounded to mark-ring-limit entries -- oldest pushes fall off"
+    (let [s (reduce (fn [s i] (buf/push-mark (assoc s :cursor-row 0 :cursor-col i)))
+                     (buf/new-state nil ["x"])
+                     (range (+ 5 buf/mark-ring-limit)))]
+      (is (= buf/mark-ring-limit (count (:mark-ring s))))
+      (is (= (dec (+ 5 buf/mark-ring-limit)) (second (first (:mark-ring s))))
+          "newest push is still on top")))
+
+  (testing "clamped if the buffer has shrunk since the mark was pushed"
+    (let [s (-> (buf/new-state nil ["a" "b" "c"])
+                (assoc :cursor-row 2 :cursor-col 0)
+                buf/push-mark
+                (assoc :lines ["a"] :cursor-row 0 :cursor-col 0)
+                buf/pop-mark)]
+      (is (= 0 (:cursor-row s))))))
