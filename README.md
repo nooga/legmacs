@@ -10,7 +10,7 @@ configuring legmacs are the same activity.
 
 ![legmacs](legmacs.gif)
 
-It's small. About 4,000 lines of Lisp for the whole editor, bundled modes
+It's small. About 4,500 lines of Lisp for the whole editor, bundled modes
 included. For that, it does a lot more than I expected it would when I
 started:
 
