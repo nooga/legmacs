@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-run: pick an existing tag in the "Use workflow from" ref
+  # dropdown to (re)build and attach assets for a tag whose release is
+  # incomplete (e.g. one created by hand before this workflow ran).
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -60,14 +64,25 @@ jobs:
           (cd dist && shasum -a 256 *.tar.gz > checksums.txt)
           ls -la dist
 
-      - name: Create GitHub release
+      # Idempotent: if the release already exists (created by hand, or a
+      # previous run of this workflow), attach/overwrite its assets instead of
+      # failing. `gh release create` errors out on an existing tag, which
+      # would strip the built binaries and skip the Homebrew step below.
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/checksums.txt \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME exists; uploading assets."
+            gh release upload "$GITHUB_REF_NAME" \
+              dist/*.tar.gz dist/checksums.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              dist/*.tar.gz dist/checksums.txt \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
 
       # Cross-repo push needs a PAT (the default GITHUB_TOKEN can't write to
       # nooga/homebrew-tap). Add GORELEASER_PAT as a repo/org secret with
