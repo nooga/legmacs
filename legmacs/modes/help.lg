@@ -16,6 +16,7 @@
 (ns legmacs.modes.help
   (:require [string]
             [legmacs.buffer :as buf]
+            [legmacs.path :as path]
             [legmacs.modes :as modes]))
 
 (def keymap (atom {}))
@@ -27,7 +28,8 @@
   [state name lines]
   (let [help-buf (-> (buf/new-state nil (vec lines))
                      (modes/switch-to-mode :help)
-                     (assoc :buffer-name name :read-only? true))]
+                     (assoc :buffer-name name :read-only? true
+                            :default-directory (path/default-directory state)))]
     (assoc state :buffer-command {:op :help :name name :state help-buf})))
 
 (defn- entry-spans

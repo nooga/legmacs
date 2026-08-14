@@ -77,6 +77,7 @@
     (first (commands/new-file-state path))
     (-> (buf/new-state nil scratch-banner)
         (modes/switch-to-mode :let-go)
+        (assoc :default-directory (os/cwd))
         (assoc :cursor-row (dec (count scratch-banner))))))
 
 (defn- load-user-config! []

@@ -122,6 +122,22 @@
 
 (defn- send [ws cmd] (bufs/put-current ws (assoc (bufs/current ws) :buffer-command cmd)))
 
+(deftest append-named-creates-reuses-and-accumulates-output
+  (let [first-state (assoc (buf/new-state nil ["; pwd" "/tmp"])
+                           :buffer-name "/tmp/+Errors")
+        second-state (assoc (buf/new-state nil ["; echo hi" "hi"])
+                            :buffer-name "/tmp/+Errors")
+        ws (bufs/new-workspace (buf/new-state nil ["source"]))
+        ws (send ws {:op :append-named :name "/tmp/+Errors" :state first-state})
+        output-id (:current ws)
+        ws (send ws {:op :append-named :name "/tmp/+Errors" :state second-state})]
+    (is (= output-id (:current ws)))
+    (is (= 2 (count (:order ws))))
+    (is (= ["; pwd" "/tmp" "" "; echo hi" "hi"]
+           (:lines (bufs/current ws))))
+    (is (= 4 (:cursor-row (bufs/current ws))))
+    (is (= 2 (:cursor-col (bufs/current ws))))))
+
 (deftest split-adds-a-window-on-the-same-buffer
   (testing "C-x 2's op leaves focus in the original window, both showing the buffer"
     (let [ws (bufs/new-workspace (buf/new-state "a.txt" ["one" "two"]))

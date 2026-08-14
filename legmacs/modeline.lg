@@ -109,7 +109,7 @@
 ;; here is privileged. Remove or replace any of them from init.lg with
 ;; remove-modeline-segment!/register-modeline-segment!.
 
-(defn- buffer-label [state] (or (:filename state) "*scratch*"))
+(defn- buffer-label [state] (or (:buffer-name state) (:filename state) "*scratch*"))
 
 (defn- buffer-segment
   "A colored badge: dusty indigo when saved, warm red when there are

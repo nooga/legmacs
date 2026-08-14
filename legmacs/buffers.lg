@@ -26,7 +26,7 @@
 ;; showing it resumes there). Window commands are just more :buffer-command
 ;; ops: {:op :split :dir :below}, {:op :other-window}, {:op :delete-window},
 ;; {:op :delete-other-windows}. The buffer-switching ops (:switch,
-;; :open-new, :next, :prev, :help) now mean "in the active window";
+;; :open-new, :next, :prev, :help, :append-named) now mean "in the active window";
 ;; :kill also re-points any window that showed the killed buffer.
 ;;
 ;; :current (the active buffer id) is kept in sync with the active
@@ -180,6 +180,22 @@
          (update :next-id inc))
      id]))
 
+(defn- appended-buffer-state
+  "Append `addition`'s text to an existing generated buffer, separated by a
+   blank line, and leave point at the end.  Process output is not a user edit:
+   the existing buffer's modified and undo state are deliberately preserved."
+  [existing addition]
+  (let [old-lines (:lines existing)
+        new-lines (:lines addition)
+        old-lines (if (= [""] old-lines) [] old-lines)
+        lines (vec (concat old-lines (when (seq old-lines) [""]) new-lines))
+        row (dec (count lines))]
+    (assoc existing
+           :lines lines
+           :cursor-row row
+           :cursor-col (count (nth lines row))
+           :goal-col nil)))
+
 (defn- apply-buffer-command
   "Apply one :buffer-command to the workspace. The buffer-switching ops
    act on the active window; the window ops reshape the tree itself."
@@ -189,6 +205,20 @@
       :switch (set-window-buffer workspace awin (:id cmd))
       :open-new (let [[ws id] (add-buffer workspace (:state cmd))]
                   (set-window-buffer ws awin id))
+      ;; A named, editable output buffer that accumulates blocks over time.
+      ;; The Acme extension uses this for directory-scoped +Errors buffers,
+      ;; but the operation is intentionally generic process-output plumbing.
+      :append-named
+      (if-let [existing (some (fn [id]
+                                (when (= (:name cmd)
+                                         (:buffer-name (get-in workspace [:buffers id])))
+                                  id))
+                              (:order workspace))]
+        (-> workspace
+            (update-in [:buffers existing] appended-buffer-state (:state cmd))
+            (set-window-buffer awin existing))
+        (let [[ws id] (add-buffer workspace (:state cmd))]
+          (set-window-buffer ws awin id)))
       ;; after the kill, every window that showed the dead buffer gets
       ;; re-pointed at whatever buffer kill-buffer-op picked as current
       ;; (or the fresh fallback) -- a window is never left on a buffer
