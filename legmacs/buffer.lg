@@ -32,6 +32,7 @@
    :scroll-col 0
    :goal-col nil
    :filename filename
+   :default-directory nil
    :buffer-name nil
    :modified? false
    :message nil

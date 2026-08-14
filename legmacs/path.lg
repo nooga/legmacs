@@ -1,0 +1,77 @@
+;; legmacs.path — small path/context helpers shared by file-oriented
+;; commands and optional extensions.  The filesystem operations themselves
+;; stay in their callers; this namespace only answers "what directory gives
+;; this buffer's text meaning?" and joins paths using the host separator.
+
+(ns legmacs.path
+  (:require [string]
+            [os]))
+
+(defn absolute?
+  "True when `path` is absolute on the current host.  Plan 9 and Unix use a
+   leading separator.  The drive-letter case keeps this helper sensible if
+   let-go gains Windows terminal support later."
+  [path]
+  (and (string? path) (seq path)
+       (or (string/starts-with? path os/file-separator)
+           (and (= os/file-separator (str (char 92)))
+                (> (count path) 2)
+                (= (int (nth path 1)) 58)))))
+
+(defn strip-trailing-separators
+  "Remove trailing separators without turning the filesystem root into an
+   empty string."
+  [path]
+  (loop [p path]
+    (if (and (> (count p) 1) (string/ends-with? p os/file-separator))
+      (recur (subs p 0 (dec (count p))))
+      p)))
+
+(defn join
+  "Join `dir` and `child`, preserving an already-absolute child.  This is a
+   deliberately textual join: the host filesystem remains responsible for
+   interpreting `.` and `..`."
+  [dir child]
+  (cond
+    (absolute? child) child
+    (string/blank? dir) child
+    (string/ends-with? dir os/file-separator) (str dir child)
+    :else (str dir os/file-separator child)))
+
+(defn absolute-path
+  "Interpret a relative path in the editor process's current directory."
+  [path]
+  (if (absolute? path) path (join (os/cwd) path)))
+
+(defn dirname
+  "The textual parent directory of `path`, or nil when it has no separator."
+  [path]
+  (let [path (strip-trailing-separators path)]
+    (when-let [i (string/last-index-of path os/file-separator)]
+      (if (= i 0) os/file-separator (subs path 0 i)))))
+
+(defn directory-of
+  "The absolute directory containing `filename`."
+  [filename]
+  (or (dirname (absolute-path filename)) (os/cwd)))
+
+(defn default-directory
+  "The directory context for `state`: an explicit per-buffer value wins,
+   then the containing directory of its file, then the process directory."
+  [state]
+  (or (:default-directory state)
+      (when-let [filename (:filename state)] (directory-of filename))
+      (os/cwd)))
+
+(defn resolve
+  "Interpret `target` in `state`'s directory context."
+  [state target]
+  (if (absolute? target) target (join (default-directory state) target)))
+
+(defn display-directory
+  "A directory name ending in a separator, matching Acme's visual convention."
+  [dir]
+  (let [dir (strip-trailing-separators dir)]
+    (if (string/ends-with? dir os/file-separator)
+      dir
+      (str dir os/file-separator))))

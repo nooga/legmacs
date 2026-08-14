@@ -8,6 +8,7 @@
   (:require [string]
             [os]
             [legmacs.buffer :as buf]
+            [legmacs.path :as path]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
@@ -419,7 +420,15 @@
 (defn write-buffer-to [state path]
   (spit path (buf/join-lines (:lines state)))
   (-> state
-      (assoc :filename path :modified? false)
+      ;; Saving a named/generated buffer turns it into an ordinary file
+      ;; buffer.  In particular, saving an editable Acme directory listing
+      ;; must not leave the directory's display name or generated-kind marker
+      ;; attached to the newly written file.
+      (assoc :filename path
+             :default-directory (path/directory-of path)
+             :buffer-name nil
+             :modified? false)
+      (dissoc :directory-buffer?)
       (set-message (str "Wrote " path))))
 
 (defcommand save-buffer
@@ -464,9 +473,14 @@
    file with. [state message] -- message says whether it was loaded or
    is a new file, for callers that want to show it."
   [path]
-  (if-let [content (try (slurp path) (catch e nil))]
-    [(with-auto-mode (buf/new-state path (buf/split-lines content)) path) (str "Loaded " path)]
-    [(with-auto-mode (buf/new-state path [""]) path) (str "New file " path)]))
+  (let [directory (path/directory-of path)]
+    (if-let [content (try (slurp path) (catch e nil))]
+      [(assoc (with-auto-mode (buf/new-state path (buf/split-lines content)) path)
+              :default-directory directory)
+       (str "Loaded " path)]
+      [(assoc (with-auto-mode (buf/new-state path [""]) path)
+              :default-directory directory)
+       (str "New file " path)])))
 
 (defcommand find-file
   "Open a file in a new buffer, or switch to it if it's already open --
@@ -530,7 +544,10 @@
                (if-let [existing (some #(when (= (:name %) name) %) (:buffer-list state))]
                  (assoc state :buffer-command {:op :switch :id (:id existing)})
                  (assoc state :buffer-command
-                        {:op :open-new :state (assoc (buf/new-state nil [""]) :buffer-name name)}))))
+                        {:op :open-new
+                         :state (assoc (buf/new-state nil [""])
+                                       :buffer-name name
+                                       :default-directory (path/default-directory state))}))))
            {:submit-selected? true
             :completer (fn [input]
                          (completion/fuzzy-filter input (map :name (:buffer-list state))))}))
@@ -544,7 +561,10 @@
   [state]
   (if-let [existing (some #(when (= (:name %) "*repl*") %) (:buffer-list state))]
     (assoc state :buffer-command {:op :switch :id (:id existing)})
-    (assoc state :buffer-command {:op :open-new :state (repl/new-repl-state)})))
+    (assoc state :buffer-command
+           {:op :open-new
+            :state (assoc (repl/new-repl-state)
+                          :default-directory (path/default-directory state))})))
 
 (defcommand list-buffers
   "Show every open buffer: name, modified flag, mode."
@@ -559,7 +579,9 @@
   [state]
   (let [do-kill (fn [state]
                   (assoc state :buffer-command
-                         {:op :kill :id (:current-buffer-id state) :fallback (buf/new-state nil [""])}))]
+                         {:op :kill :id (:current-buffer-id state)
+                          :fallback (assoc (buf/new-state nil [""])
+                                           :default-directory (path/default-directory state))}))]
     (if (:modified? state)
       (ask-yes-or-no state "Buffer modified; kill anyway? (y/n) " do-kill (fn [state] (set-message state "")))
       (do-kill state))))
@@ -714,7 +736,8 @@
   [state name lines]
   (let [buf (-> (buf/new-state nil (vec lines))
                 (modes/switch-to-mode :help)
-                (assoc :buffer-name name :read-only? true))]
+                (assoc :buffer-name name :read-only? true
+                       :default-directory (path/default-directory state)))]
     (assoc state :buffer-command {:op :help :name name :state buf})))
 
 (defcommand describe-bindings
