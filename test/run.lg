@@ -24,6 +24,7 @@
             [test.lisp-syntax-test]
             [test.buffers-test]
             [test.windows-test]
-            [test.kbd-macro-test]))
+            [test.kbd-macro-test]
+            [test.acme-extension-test]))
 
 (run-tests)
