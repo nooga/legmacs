@@ -103,6 +103,35 @@
              :else
              (recur (inc i) stack pairs spans nil))))))))
 
+(defn ends-in-string?
+  "Does a line entered with in-string? = `in?` still have a string open at
+   its end? The same rules `scan` applies -- backslash escapes, ; comments,
+   \\c character literals -- with none of its bookkeeping (no spans, pairs
+   or stack), because that's all a caller threading state from line to line
+   needs, and it's the one thing that has to stay cheap: legmacs.render's
+   highlighter carry runs it over every line above the viewport, every
+   frame (see legmacs.modes.letgo/highlight-carry)."
+  [line in?]
+  (let [chars (vec (seq line))
+        n (count chars)]
+    (loop [i 0, in? in?]
+      (if (>= i n)
+        in?
+        (let [ch (nth chars i)]
+          (cond
+            in? (cond
+                  (= ch \\) (recur (+ i 2) true)
+                  (= ch \") (recur (inc i) false)
+                  :else (recur (inc i) true))
+            ;; a comment runs to end of line, and nothing in it can open a
+            ;; string, so the answer is already known
+            (= ch \;) false
+            (= ch \") (recur (inc i) true)
+            ;; character literal: the character after \ is part of it even
+            ;; when it's a quote (\"), so it can't open a string either
+            (= ch \\) (recur (+ i 2) false)
+            :else (recur (inc i) false)))))))
+
 (defn matching
   "Given a full scan (scan text, no upto) and an offset, the matching
    bracket's offset, or nil if `offset` isn't on a matched bracket."

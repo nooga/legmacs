@@ -106,3 +106,49 @@
     (is (ps/close-bracket? go-spec \)))
     (is (not (ps/open-bracket? go-spec \x)))
     (is (= \) (ps/close-for go-spec \()))))
+
+(def py-spec
+  {:line-comments ["#"]
+   :multiline-strings [{:open "\"\"\"" :close "\"\"\"" :escape? true}]
+   :string-delims ["\"" "'"]})
+
+(def raw-go-spec
+  (assoc go-spec
+         :string-delims ["\"" "'"]
+         :multiline-strings [{:open "`" :close "`" :escape? false}]))
+
+(deftest multiline-strings-hide-structure-across-lines
+  (testing "brackets inside a Go raw string are text, not structure"
+    (let [text "func f() {\n\tq := `a ( b [ c`\n}"
+          s (ps/scan text raw-go-spec)]
+      ;; the { still matches its }, and the ( inside the raw string doesn't
+      ;; leave anything on the stack
+      (is (= (string/last-index-of text "}") (ps/matching s (string/index-of text "{"))))
+      (is (empty? (:stack s)))))
+
+  (testing "an unclosed raw string reports itself as still open at point"
+    (let [text "q := `open\nstill open"
+          s (ps/scan text (count text) raw-go-spec)]
+      (is (true? (:in-string? s)))))
+
+  (testing "a triple-quoted docstring's brackets are text too"
+    (let [text "def f():\n    \"\"\"a ( b\n    c )\"\"\"\n    return (1)"
+          s (ps/scan text py-spec)]
+      ;; only def f()'s pair and return (1)'s -- the ( ) inside the
+      ;; docstring never reach the bracket stack
+      (is (= 2 (count (filter (fn [[k v]] (< k v)) (:pairs s)))))
+      (is (nil? (ps/matching s (string/index-of text "( b")))))))
+
+(deftest a-plain-string-delimiter-stops-at-end-of-line
+  (testing "one stray quote doesn't swallow the rest of the buffer"
+    (let [text "s = \"oops\nfunc f() { }\n"
+          s (ps/scan text go-spec)]
+      ;; the { } on the next line still matches -- it isn't string content
+      (is (= (string/index-of text "}") (ps/matching s (string/index-of text "{"))))
+      (is (false? (:in-string? s)))))
+
+  (testing "point inside the unterminated string is still reported as inside it"
+    (let [text "s = \"oops\nfunc f() { }\n"
+          upto (string/index-of text "oops")
+          s (ps/scan text upto go-spec)]
+      (is (true? (:in-string? s))))))

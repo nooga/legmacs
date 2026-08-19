@@ -34,14 +34,37 @@
 (defn- scan-string-span
   "From an opening delimiter `q` at `i`, honoring backslash escapes, capped
    at `len`. [end terminated?] -- terminated? is false when the string runs
-   off the end of `len` still open (see :in-string? below)."
+   off the end of `len` still open (see :in-string? below). A newline ends
+   one of these too: languages here that really do have multi-line string
+   literals declare them under :multiline-strings, so a plain delimiter
+   left unclosed at end of line is a typo, and stopping there keeps this
+   scanner's idea of what sits inside a string identical to the
+   highlighter's (legmacs.modes.prog) instead of letting one stray quote
+   swallow the rest of the file."
   [chars len i q]
   (loop [j (inc i)]
     (cond
       (>= j len) [len false]
+      (= \newline (nth chars j)) [j true]
       (and (= \\ (nth chars j)) (< (inc j) len)) (recur (+ j 2))
       (= q (nth chars j)) [(inc j) true]
       :else (recur (inc j)))))
+
+(defn- find-marker
+  "Index just past `close` at or after `i`, honoring backslash escapes when
+   `escape?`; nil if it doesn't occur before `len`."
+  [text chars len i close escape?]
+  (loop [j i]
+    (cond
+      (>= j len) nil
+      (and escape? (= \\ (nth chars j))) (recur (+ j 2))
+      (at? text j close) (+ j (count close))
+      :else (recur (inc j)))))
+
+(defn- multiline-at
+  "The :multiline-strings entry whose :open marker sits at `i`, or nil."
+  [text i entries]
+  (some (fn [m] (when (at? text i (:open m)) m)) entries))
 
 (defn scan
   "One pass over `text`, stopping at `upto` (whole string by default),
@@ -59,8 +82,9 @@
    closes one early), so they don't need a matching flag."
   ([text spec] (scan text (count text) spec))
   ([text upto spec]
-   (let [{:keys [line-comments block-comment string-delims brackets]} spec
+   (let [{:keys [line-comments block-comment string-delims multiline-strings brackets]} spec
          line-comments (or line-comments [])
+         multiline-strings (or multiline-strings [])
          string-chars (set (mapcat seq (or string-delims [])))
          brackets (or brackets default-brackets)
          closers (into {} (map (fn [[o c]] [c o]) brackets))
@@ -88,6 +112,17 @@
              (let [nl (string/index-of text "\n" i)
                    end (min len (or nl len))]
                (recur end stack pairs (conj spans {:type :comment :start i :end end})))
+
+             ;; Before the single-character delimiters, for the same reason
+             ;; legmacs.modes.prog's scanner checks them first: a multi-line
+             ;; opener is often a run of them (Python's triple quote).
+             (multiline-at text i multiline-strings)
+             (let [m (multiline-at text i multiline-strings)
+                   end (find-marker text chars len (+ i (count (:open m))) (:close m) (:escape? m))]
+               (if end
+                 (recur end stack pairs (conj spans {:type :string :start i :end end}))
+                 {:pairs pairs :stack stack :in-string? true :in-comment? false
+                  :spans (conj spans {:type :string :start i :end len})}))
 
              (contains? string-chars ch)
              (let [[end terminated?] (scan-string-span chars len i ch)]

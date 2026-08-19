@@ -2,15 +2,15 @@
 ;; just a per-line syntax highlighter (see legmacs.modes/register-mode!)
 ;; registered for .md files.
 ;;
-;; Same simplification legmacs.modes.letgo's highlighter accepts (see its
-;; comment, and the README): scanned one line at a time, with no state
-;; carried across lines. That's cheap for everything here except fenced
-;; code blocks, which are inherently multi-line -- only the ``` delimiter
-;; lines themselves are recognized, the code inside isn't (and neither are
-;; indented -- 4-space/tab -- code blocks, which need the same cross-line
-;; context). Getting that right needs the kind of continuation state Emacs
-;; tracks via syntax-table text properties; not worth it for a lightweight
-;; highlighter.
+;; Scanned one line at a time, with one bit of state carried across lines
+;; (see legmacs.modes/register-mode!'s :highlight-line): whether we're
+;; inside a ``` fenced code block. That's what keeps the body of a fence
+;; colored as code, and -- just as important -- keeps the inline scanner
+;; off it, so the asterisks and underscores in a shell command or a
+;; snippet of source don't read as emphasis. Indented (4-space/tab) code
+;; blocks still aren't recognized: telling one from a lazy list
+;; continuation needs to look at the paragraph around it, which is more
+;; context than a line-at-a-time scanner has.
 
 (ns legmacs.modes.markdown
   (:require [string]
@@ -123,9 +123,34 @@
                   (or (list-marker-span line) [])
                   (scan-inline line))))
 
+(defn highlight-line-carry
+  "The multi-line-aware form: `carry` is :fenced between a ``` line and the
+   next one. A fence delimiter is code either way, so both ends of the
+   block color themselves the same as their body."
+  [carry line]
+  (cond
+    (fence-line? line)
+    {:spans [{:style :md-code :start 0 :end (count line)}]
+     :carry (when-not carry :fenced)}
+
+    carry
+    {:spans [{:style :md-code :start 0 :end (count line)}] :carry carry}
+
+    :else {:spans (highlight-line line) :carry nil}))
+
+(defn highlight-carry
+  "The cheap :highlight-carry half: only a fence line can open or close a
+   block, so every other line hands the carry straight through."
+  [carry line]
+  (if (string/includes? line "```")
+    (:carry (highlight-line-carry carry line))
+    carry))
+
 (modes/register-mode! :markdown keymap
                        (str "markdown-mode: syntax highlighting for headers, emphasis, "
                             "inline code, links, blockquotes, lists, and code fences")
-                       {:highlighter highlight-line})
+                       {:highlighter highlight-line
+                        :highlight-line highlight-line-carry
+                        :highlight-carry highlight-carry})
 (modes/register-auto-mode! ".md" :markdown)
 (modes/register-auto-mode! ".markdown" :markdown)

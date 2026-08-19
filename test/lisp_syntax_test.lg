@@ -108,3 +108,17 @@
       (is (= [(string/index-of text "(b") (inc (string/index-of text "d)"))] outer))
       (is (= [0 (dec (count text))] top))
       (is (nil? (apply ls/enclosing-pair s (pair->region top)))))))
+
+(deftest ends-in-string-is-the-cheap-half-of-scan
+  (testing "it answers exactly what a full scan's :in-string? would"
+    (doseq [line ["(def s \"open" "closed \"x\" here" "; \" in a comment"
+                  "(= ch \\\")" "no quotes at all" "\"a\" \"b" "trailing backslash \\"]]
+      (is (= (:in-string? (ls/scan line)) (ls/ends-in-string? line false)))))
+
+  (testing "entered inside a string, it looks for the closing quote"
+    (is (true? (ls/ends-in-string? "still string content" true)))
+    (is (false? (ls/ends-in-string? "end\") (inc x)" true)))
+    ;; an escaped quote doesn't close it
+    (is (true? (ls/ends-in-string? "not the end \\\" no" true)))
+    ;; ...and a ; inside string content is just text, not a comment
+    (is (true? (ls/ends-in-string? "a ; b" true)))))

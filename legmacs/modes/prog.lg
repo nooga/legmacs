@@ -1,21 +1,39 @@
 ;; legmacs.modes.prog — highlight-only major modes for common programming
-;; languages, all driven by one spec-based per-line scanner. A language is
-;; just a data map (comment markers, string delimiters, keyword/type/
-;; constant word sets); register-prog-mode! turns it into a registered
-;; mode plus its auto-mode suffixes. A user's init.lg can add a language
-;; the exact same way:
+;; languages, all driven by one spec-based scanner. A language is just a
+;; data map (comment markers, string delimiters, keyword/type/constant
+;; word sets, and a few optional knobs below); register-prog-mode! turns
+;; it into a registered mode plus its auto-mode suffixes. A user's init.lg
+;; can add a language the exact same way:
 ;;
 ;;   (prog/register-prog-mode! :zig "zig-mode"
 ;;     {:line-comments ["//"] :string-delims ["\""]
 ;;      :keywords #{"fn" "pub" "const" ...}}
 ;;     [".zig"])
 ;;
-;; Same simplification legmacs.modes.markdown documents: one line at a
-;; time, no state carried across lines. Strings and /* */ comments that
-;; close on their own line work; a multi-line construct highlights only
-;; on the line where it opens (the opener runs to end-of-line), not on
-;; its continuation lines. Cheap, predictable, and good enough for
-;; reading code -- not a parser.
+;; Scanning is per line, but *not* memoryless: make-line-scanner returns
+;; (fn [carry line] -> {:spans ... :carry ...}), where the carry describes a
+;; construct still open at end of line -- a block comment, or a multi-line
+;; string (Go's backticks, Python's triple quotes, a JS template literal).
+;; legmacs.render threads that carry down the buffer, so those constructs
+;; stay colored across every line they cover, including when the line that
+;; opened one is scrolled off the top of the screen. Nothing else carries:
+;; a single-quote/double-quote string still ends at end of line, since an
+;; unterminated one is far more often a typo than a real multi-line string
+;; in the languages that don't have :multiline-strings.
+;;
+;; Spec keys, all optional:
+;;   :line-comments      ["//" ...]   comment to end of line
+;;   :block-comment      ["/*" "*/"]  may span lines
+;;   :string-delims      ["\"" ...]   single-char, \-escapable, end at EOL
+;;   :multiline-strings  [{:open "`" :close "`" :escape? false} ...]
+;;   :keywords/:types/:constants   word sets -> :keyword/:type/:keyword-literal
+;;   :preprocessor       #{"define" ...}  C-style #directives at line start
+;;   :var-sigils         ["$" ...]    $name/${name}/$(name)/$@ -> :variable
+;;   :functions?         true         name immediately before ( -> :function
+;;   :markup-tags?       true         <tag / </tag -> :keyword (HTML, XML)
+;;
+;; Still not a parser: no nesting, no heredocs, no per-language grammar
+;; beyond the above. Cheap, predictable, and good enough for reading code.
 
 (ns legmacs.modes.prog
   (:require [string]
@@ -60,54 +78,229 @@
         (recur (inc j))
         j))))
 
-(defn make-highlighter
-  "Build a per-line :highlighter (see legmacs.modes/register-mode!) from a
-   language spec map:
-     :line-comments  [\"//\" ...]  comment-to-end-of-line markers
-     :block-comment  [\"/*\" \"*/\"]  optional; closes-same-line or runs to EOL
-     :string-delims  [\"\\\"\" ...]  one-char string delimiters, \\-escapable
-     :keywords / :types / :constants  word sets, painted :keyword / :type /
-                                      :keyword-literal respectively"
-  [{:keys [line-comments block-comment string-delims keywords types constants]}]
+(defn- find-close
+  "Index just past the `close` marker at or after `i`, honoring backslash
+   escapes when `escape?`. nil when the marker isn't on this line -- which
+   is exactly the \"still open, carry it to the next line\" case."
+  [line chars n i close escape?]
+  (loop [j i]
+    (cond
+      (>= j n) nil
+      (and escape? (= \\ (nth chars j))) (recur (+ j 2))
+      (at? line j close) (+ j (count close))
+      :else (recur (inc j)))))
+
+(defn- multiline-at
+  "The :multiline-strings entry whose :open marker sits at `i`, or nil."
+  [line i entries]
+  (some (fn [m] (when (at? line i (:open m)) m)) entries))
+
+(defn- blank-before?
+  "True if everything left of `i` on the line is whitespace -- what makes a
+   `#` a preprocessor directive rather than an operator."
+  [chars i]
+  (loop [j 0]
+    (or (>= j i)
+        (and (contains? #{\space \tab} (nth chars j)) (recur (inc j))))))
+
+(def ^:private var-special
+  "Characters that form a one-character variable name after a sigil: shell's
+   $? $! $* $@ $$ $0-$9, rc's and make's $#/$@."
+  #{\? \! \* \@ \$ \# \- \0 \1 \2 \3 \4 \5 \6 \7 \8 \9})
+
+(defn- scan-var
+  "Index just past a variable reference whose `k`-character sigil starts at
+   `i` -- $name, ${name}, $(name), $@ -- or nil if the sigil is just a
+   literal character here (a bare $ at end of line, `$ ` in a Makefile
+   recipe)."
+  [line chars n i k]
+  (let [j (+ i k)]
+    (cond
+      (>= j n) nil
+      (contains? #{\{ \(} (nth chars j))
+      (or (find-close line chars n (inc j) (if (= \{ (nth chars j)) "}" ")") false) n)
+      (word-char? (nth chars j)) (scan-word chars n j)
+      ;; rc's $#list (count) and $"list (flatten): an operator between the
+      ;; sigil and the name it applies to, all one reference
+      (and (contains? #{\# \"} (nth chars j)) (< (inc j) n) (word-char? (nth chars (inc j))))
+      (scan-word chars n (inc j))
+      (contains? var-special (nth chars j)) (inc j)
+      :else nil)))
+
+(defn- scan-tag
+  "Index just past the name of a markup tag opening at `i` (which is on the
+   `<`), counting the `/` of a closing tag, or nil if what follows isn't a
+   tag name -- so a bare `a < b` comparison stays plain."
+  [line chars n i]
+  (let [j (if (and (< (inc i) n) (= \/ (nth chars (inc i)))) (+ i 2) (inc i))]
+    (when (and (< j n) (word-char? (nth chars j)))
+      (scan-word chars n j))))
+
+(defn- scan-directive
+  "For a `#` at `i` that opens a line, {:end e :word w} covering `#` plus
+   the directive word after it (`#  define` included), or nil when that word
+   isn't one of `directives`."
+  [line chars n i directives]
+  (let [ws (loop [j (inc i)]
+             (if (and (< j n) (contains? #{\space \tab} (nth chars j))) (recur (inc j)) j))]
+    (when (and (< ws n) (word-char? (nth chars ws)))
+      (let [e (scan-word chars n ws)
+            w (subs line ws e)]
+        (when (contains? directives w) {:end e :word w})))))
+
+(def ^:private include-directives #{"include" "import" "include_next"})
+
+(defn- angle-include
+  "The <stdio.h> after a #include, as [start end] -- an argument, not a
+   pair of comparisons -- or nil. It has to be the very next thing on the
+   line, so a `#include \"x.h\"` whose trailing comment mentions <angles>
+   doesn't pick that up instead."
+  [line chars n i]
+  (let [lt (loop [j i]
+             (if (and (< j n) (contains? #{\space \tab} (nth chars j))) (recur (inc j)) j))]
+    (when (and (< lt n) (= \< (nth chars lt)))
+      (when-let [gt (string/index-of line ">" lt)]
+        [lt (inc gt)]))))
+
+(defn- resume-carry
+  "Continue a construct left open by the previous line: its span on this
+   line, where scanning picks up afterwards, and the carry that survives."
+  [carry line chars n]
+  (if-let [end (find-close line chars n 0 (:close carry) (:escape? carry))]
+    {:spans [{:style (:style carry) :start 0 :end end}] :i end :carry nil}
+    {:spans [{:style (:style carry) :start 0 :end n}] :i n :carry carry}))
+
+(defn make-line-scanner
+  "Build (fn [carry line] -> {:spans [...] :carry carry'}) from a language
+   spec (see this namespace's header for the keys). `carry` is nil for a
+   line that starts in ordinary code, and otherwise the block comment or
+   multi-line string still open from the line before."
+  [{:keys [line-comments block-comment string-delims multiline-strings
+           keywords types constants preprocessor var-sigils functions?
+           markup-tags?]}]
   (let [keywords (or keywords #{})
         types (or types #{})
         constants (or constants #{})
-        [block-open block-close] block-comment]
-    (fn [line]
+        line-comments (or line-comments [])
+        string-delims (or string-delims [])
+        multiline-strings (or multiline-strings [])
+        var-sigils (or var-sigils [])
+        directives (or preprocessor #{})
+        [block-open block-close] block-comment
+        ;; First-character sets, so the common case (a character that opens
+        ;; nothing) costs one set lookup instead of an at? per marker.
+        string-chars (set (mapcat seq string-delims))
+        ml-firsts (set (map (fn [m] (first (seq (:open m)))) multiline-strings))
+        comment-firsts (set (map (fn [m] (first (seq m))) line-comments))
+        sigil-firsts (set (map (fn [m] (first (seq m))) var-sigils))
+        block-first (when block-open (first (seq block-open)))]
+    (fn [carry line]
       (let [n (count line)
-            chars (vec (seq line))]
-        (loop [i 0, spans []]
-          (if (>= i n)
-            spans
-            (cond
-              ;; Checked before line-comments: a language whose block-open
-              ;; marker starts with its line-comment marker (Lua's "--[["
-              ;; vs "--") needs the longer, more specific one to win.
-              (and block-open (at? line i block-open))
-              (if-let [close (string/index-of line block-close (+ i (count block-open)))]
-                (let [end (+ close (count block-close))]
-                  (recur end (conj spans {:style :comment :start i :end end})))
-                (conj spans {:style :comment :start i :end n}))
+            chars (vec (seq line))
+            resumed (when carry (resume-carry carry line chars n))]
+        (if (and resumed (:carry resumed))
+          {:spans (:spans resumed) :carry (:carry resumed)}
+          (loop [i (if resumed (:i resumed) 0)
+                 spans (if resumed (:spans resumed) [])]
+            (if (>= i n)
+              {:spans spans :carry nil}
+              (let [ch (nth chars i)]
+                (cond
+                  ;; Checked before line-comments: a language whose block-open
+                  ;; marker starts with its line-comment marker (Lua's "--[["
+                  ;; vs "--") needs the longer, more specific one to win.
+                  (and block-first (= ch block-first) (at? line i block-open))
+                  (if-let [close (find-close line chars n (+ i (count block-open)) block-close false)]
+                    (recur close (conj spans {:style :comment :start i :end close}))
+                    {:spans (conj spans {:style :comment :start i :end n})
+                     :carry {:style :comment :close block-close :escape? false}})
 
-              (some #(at? line i %) line-comments)
-              (conj spans {:style :comment :start i :end n})
+                  ;; Before :string-delims, since a multi-line opener is
+                  ;; routinely a run of them (Python's \"\"\").
+                  (and (contains? ml-firsts ch) (multiline-at line i multiline-strings))
+                  (let [m (multiline-at line i multiline-strings)]
+                    (if-let [close (find-close line chars n (+ i (count (:open m)))
+                                               (:close m) (:escape? m))]
+                      (recur close (conj spans {:style :string :start i :end close}))
+                      {:spans (conj spans {:style :string :start i :end n})
+                       :carry {:style :string :close (:close m) :escape? (:escape? m)}}))
 
-              (some #(at? line i %) string-delims)
-              (let [end (scan-string chars n i (nth chars i))]
-                (recur end (conj spans {:style :string :start i :end end})))
+                  (and (= ch \#) (seq directives) (blank-before? chars i)
+                       (scan-directive line chars n i directives))
+                  (let [{:keys [end word]} (scan-directive line chars n i directives)
+                        spans (conj spans {:style :preproc :start i :end end})]
+                    (if-let [[lt gt] (and (contains? include-directives word)
+                                          (angle-include line chars n end))]
+                      (recur gt (conj spans {:style :string :start lt :end gt}))
+                      (recur end spans)))
 
-              (word-char? (nth chars i))
-              (let [end (scan-word chars n i)
-                    word (subs line i end)
-                    style (cond
-                            (digit? (nth chars i)) :number
-                            (contains? keywords word) :keyword
-                            (contains? types word) :type
-                            (contains? constants word) :keyword-literal
-                            :else nil)]
-                (recur end (if style (conj spans {:style style :start i :end end}) spans)))
+                  (and (contains? comment-firsts ch) (some (fn [m] (at? line i m)) line-comments))
+                  {:spans (conj spans {:style :comment :start i :end n}) :carry nil}
 
-              :else (recur (inc i) spans))))))))
+                  (contains? string-chars ch)
+                  (let [end (scan-string chars n i ch)]
+                    (recur end (conj spans {:style :string :start i :end end})))
+
+                  (and markup-tags? (= ch \<) (scan-tag line chars n i))
+                  (let [end (scan-tag line chars n i)]
+                    (recur end (conj spans {:style :keyword :start i :end end})))
+
+                  (and (contains? sigil-firsts ch)
+                       (some (fn [sig] (and (at? line i sig) (scan-var line chars n i (count sig))))
+                             var-sigils))
+                  (let [sig (some (fn [sig] (when (and (at? line i sig)
+                                                       (scan-var line chars n i (count sig)))
+                                              sig))
+                                  var-sigils)
+                        end (scan-var line chars n i (count sig))]
+                    (recur end (conj spans {:style :variable :start i :end end})))
+
+                  (word-char? ch)
+                  (let [end (scan-word chars n i)
+                        word (subs line i end)
+                        style (cond
+                                (digit? ch) :number
+                                (contains? keywords word) :keyword
+                                (contains? types word) :type
+                                (contains? constants word) :keyword-literal
+                                (and functions? (< end n) (= \( (nth chars end))) :function
+                                :else nil)]
+                    (recur end (if style (conj spans {:style style :start i :end end}) spans)))
+
+                  :else (recur (inc i) spans))))))))))
+
+(defn make-highlighter
+  "The plain per-line (fn [line] -> spans) view of make-line-scanner, for
+   a caller that has no carry to thread (and for a language with no
+   multi-line constructs, where that's all there ever was)."
+  [spec]
+  (let [scan (make-line-scanner spec)]
+    (fn [line] (:spans (scan nil line)))))
+
+(defn- carry-markers
+  "Every marker that can open or close a carried construct under `spec`.
+   A line containing none of them cannot change the carry -- which is what
+   make-carry-advance uses to skip the rows above the viewport cheaply."
+  [{:keys [block-comment multiline-strings]}]
+  (vec (concat (or block-comment [])
+               (mapcat (fn [m] [(:open m) (:close m)]) (or multiline-strings [])))))
+
+(defn make-carry-advance
+  "Build the :highlight-carry half of the mode (see legmacs.modes/
+   register-mode!): the carry after `line`, without building its spans.
+   Lines with no carry marker on them -- nearly all of them -- pass the
+   carry straight through after one substring search per marker, so
+   scrolling to the bottom of a big file doesn't cost a full re-scan of
+   everything above it."
+  [spec]
+  (let [scan (make-line-scanner spec)
+        markers (carry-markers spec)]
+    (if (empty? markers)
+      (fn [_carry _line] nil)
+      (fn [carry line]
+        (if (some (fn [m] (string/includes? line m)) markers)
+          (:carry (scan carry line))
+          carry)))))
 
 (defn- both-cases
   "Both-case variants of every word in `words`, for languages (SQL,
@@ -129,7 +322,10 @@
    free: no separate call needed to get all three tuned to it."
   [mode-kw doc spec suffixes]
   (modes/register-mode! mode-kw (atom {}) doc
-                         {:highlighter (make-highlighter spec) :syntax-spec spec})
+                         {:highlighter (make-highlighter spec)
+                          :highlight-line (make-line-scanner spec)
+                          :highlight-carry (make-carry-advance spec)
+                          :syntax-spec spec})
   (doseq [suffix suffixes]
     (modes/register-auto-mode! suffix mode-kw))
   mode-kw)
@@ -139,7 +335,9 @@
 (register-prog-mode! :go "go-mode: syntax highlighting for Go"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
-   :string-delims ["\"" "'" "`"]
+   :string-delims ["\"" "'"]
+   :multiline-strings [{:open "`" :close "`" :escape? false}]
+   :functions? true
    :keywords #{"break" "case" "chan" "const" "continue" "default" "defer"
                "else" "fallthrough" "for" "func" "go" "goto" "if" "import"
                "interface" "map" "package" "range" "return" "select"
@@ -153,7 +351,9 @@
 (register-prog-mode! :javascript "javascript-mode: syntax highlighting for JavaScript/TypeScript"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
-   :string-delims ["\"" "'" "`"]
+   :string-delims ["\"" "'"]
+   :multiline-strings [{:open "`" :close "`" :escape? true}]
+   :functions? true
    :keywords #{"async" "await" "break" "case" "catch" "class" "const"
                "continue" "debugger" "default" "delete" "do" "else" "enum"
                "export" "extends" "finally" "for" "function" "if"
@@ -169,7 +369,12 @@
 
 (register-prog-mode! :python "python-mode: syntax highlighting for Python"
   {:line-comments ["#"]
+   ;; Checked before :string-delims, so a docstring opens one triple-quoted
+   ;; span instead of three empty ones.
+   :multiline-strings [{:open "\"\"\"" :close "\"\"\"" :escape? true}
+                       {:open " :close " :escape? true}]
    :string-delims ["\"" "'"]
+   :functions? true
    :keywords #{"and" "as" "assert" "async" "await" "break" "class"
                "continue" "def" "del" "elif" "else" "except" "finally"
                "for" "from" "global" "if" "import" "in" "is" "lambda"
@@ -184,6 +389,10 @@
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
    :string-delims ["\"" "'"]
+   :preprocessor #{"define" "undef" "include" "include_next" "if" "ifdef"
+                   "ifndef" "elif" "elifdef" "elifndef" "else" "endif"
+                   "pragma" "error" "warning" "line" "embed" "import"}
+   :functions? true
    :keywords #{"auto" "break" "case" "catch" "class" "const" "constexpr"
                "continue" "default" "delete" "do" "else" "enum" "extern"
                "final" "for" "goto" "if" "inline" "namespace" "new"
@@ -200,6 +409,8 @@
 (register-prog-mode! :shell "shell-mode: syntax highlighting for shell scripts"
   {:line-comments ["#"]
    :string-delims ["\"" "'"]
+   :var-sigils ["$"]
+   :functions? true
    :keywords #{"alias" "break" "case" "continue" "coproc" "declare" "do"
                "done" "elif" "else" "esac" "exit" "export" "fi" "for"
                "function" "if" "in" "local" "readonly" "return" "select"
@@ -207,11 +418,31 @@
    :constants #{"true" "false"}}
   [".sh" ".bash" ".zsh"])
 
+(register-prog-mode! :rc "rc-mode: syntax highlighting for the plan 9 shell"
+  {:line-comments ["#"]
+   ;; rc quotes with '' only, and escapes a quote by doubling it -- which
+   ;; falls out of scanning correctly anyway: 'it''s' reads as two adjacent
+   ;; string spans covering exactly the same characters.
+   :string-delims ["'"]
+   ;; $x, $#x (count), $"x (flattened), ${x}, $x(1)
+   :var-sigils ["$"]
+   ;; No :functions? here: rc calls commands without parentheses, and the
+   ;; parenthesis that does show up follows a *list* (x=(a b c)), which is
+   ;; the opposite of a call.
+   :keywords #{"builtin" "case" "cd" "echo" "eval" "exec" "exit" "flag"
+               "fn" "for" "if" "in" "not" "rfork" "shift" "switch"
+               "wait" "whatis" "while"}}
+  [".rc" "rcmain"])
+
 (register-prog-mode! :rust "rust-mode: syntax highlighting for Rust"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
    ;; no ' delimiter: a lifetime ('a) would swallow the rest of the line
    :string-delims ["\""]
+   ;; r#"..."# before r"..." : longest opener wins, first match in order
+   :multiline-strings [{:open "r#\"" :close "\"#" :escape? false}
+                       {:open "r\"" :close "\"" :escape? false}]
+   :functions? true
    :keywords #{"as" "async" "await" "break" "const" "continue" "crate"
                "dyn" "else" "enum" "extern" "fn" "for" "if" "impl" "in"
                "let" "loop" "match" "mod" "move" "mut" "pub" "ref"
@@ -247,6 +478,8 @@
    ;; simplification as everything else here.
    :block-comment ["--[[" "]]"]
    :string-delims ["\"" "'"]
+   :multiline-strings [{:open "[[" :close "]]" :escape? false}]
+   :functions? true
    :keywords #{"and" "break" "do" "else" "elseif" "end" "for" "function"
                "goto" "if" "in" "local" "not" "or" "repeat" "return"
                "then" "until" "while"}
@@ -256,6 +489,9 @@
 (register-prog-mode! :ruby "ruby-mode: syntax highlighting for Ruby"
   {:line-comments ["#"]
    :string-delims ["\"" "'"]
+   ;; @@class before @instance: first match in order wins
+   :var-sigils ["@@" "@" "$"]
+   :functions? true
    :keywords #{"and" "attr_accessor" "attr_reader" "attr_writer" "begin"
                "break" "case" "class" "def" "do" "else" "elsif" "end"
                "ensure" "for" "if" "in" "lambda" "module" "next" "not"
@@ -292,19 +528,22 @@
 
 (register-prog-mode! :css "css-mode: syntax highlighting for CSS"
   {:block-comment ["/*" "*/"]
-   :string-delims ["\"" "'"]}
+   :string-delims ["\"" "'"]
+   :functions? true}
   [".css"])
 
-(register-prog-mode! :html "html-mode: syntax highlighting for HTML"
+(register-prog-mode! :html "html-mode: syntax highlighting for HTML, XML and SVG"
   {:block-comment ["<!--" "-->"]
-   :string-delims ["\"" "'"]}
-  [".html" ".htm"])
+   :string-delims ["\"" "'"]
+   :markup-tags? true}
+  [".html" ".htm" ".xhtml" ".xml" ".svg"])
 
 (register-prog-mode! :zig "zig-mode: syntax highlighting for Zig"
   {;; no block comments in Zig -- only //, plus doc-comment variants ///
    ;; and //! that this still catches since they all start with "//"
    :line-comments ["//"]
    :string-delims ["\"" "'"]
+   :functions? true
    :keywords #{"align" "allowzero" "and" "asm" "async" "await" "break"
                "catch" "comptime" "const" "continue" "defer" "else" "enum"
                "errdefer" "error" "export" "extern" "fn" "for" "if"
@@ -324,7 +563,9 @@
 (register-prog-mode! :java "java-mode: syntax highlighting for Java"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
+   :multiline-strings [{:open "\"\"\"" :close "\"\"\"" :escape? true}]
    :string-delims ["\"" "'"]
+   :functions? true
    :keywords #{"abstract" "assert" "break" "case" "catch" "class" "const"
                "continue" "default" "do" "else" "enum" "extends" "final"
                "finally" "for" "goto" "if" "implements" "import"
@@ -341,7 +582,9 @@
 (register-prog-mode! :kotlin "kotlin-mode: syntax highlighting for Kotlin"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
+   :multiline-strings [{:open "\"\"\"" :close "\"\"\"" :escape? false}]
    :string-delims ["\"" "'"]
+   :functions? true
    :keywords #{"as" "break" "class" "companion" "const" "constructor"
                "continue" "data" "do" "else" "enum" "for" "fun" "if"
                "import" "in" "infix" "init" "inline" "inner" "interface"
@@ -357,7 +600,9 @@
 (register-prog-mode! :swift "swift-mode: syntax highlighting for Swift"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
+   :multiline-strings [{:open "\"\"\"" :close "\"\"\"" :escape? true}]
    :string-delims ["\""]
+   :functions? true
    :keywords #{"as" "associatedtype" "break" "case" "catch" "class"
                "continue" "default" "defer" "deinit" "do" "else" "enum"
                "extension" "fallthrough" "fileprivate" "for" "func"
@@ -375,7 +620,13 @@
 (register-prog-mode! :csharp "csharp-mode: syntax highlighting for C#"
   {:line-comments ["//"]
    :block-comment ["/*" "*/"]
+   ;; @"..." verbatim strings really do span lines; "..." doesn't
+   :multiline-strings [{:open "@\"" :close "\"" :escape? false}]
    :string-delims ["\"" "'"]
+   :preprocessor #{"define" "undef" "if" "elif" "else" "endif" "line"
+                   "error" "warning" "region" "endregion" "pragma"
+                   "nullable"}
+   :functions? true
    :keywords #{"abstract" "as" "async" "await" "base" "break" "case"
                "catch" "checked" "class" "const" "continue" "default"
                "delegate" "do" "else" "enum" "event" "explicit" "extern"
@@ -396,6 +647,8 @@
   {:line-comments ["//" "#"]
    :block-comment ["/*" "*/"]
    :string-delims ["\"" "'"]
+   :var-sigils ["$"]
+   :functions? true
    :keywords #{"abstract" "and" "array" "as" "break" "callable" "case"
                "catch" "class" "clone" "const" "continue" "declare"
                "default" "do" "echo" "else" "elseif" "empty" "extends"
@@ -412,6 +665,7 @@
 (register-prog-mode! :makefile "makefile-mode: syntax highlighting for Makefiles"
   {:line-comments ["#"]
    :string-delims ["\"" "'"]
+   :var-sigils ["$"]
    :keywords #{"ifeq" "ifneq" "ifdef" "ifndef" "else" "endif" "include"
                "define" "endef" "export" "unexport" "override" "vpath"}}
   ["Makefile" "makefile" "GNUmakefile" ".mk"])

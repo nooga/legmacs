@@ -20,12 +20,14 @@
 
 ;; --- syntax highlighting -------------------------------------------------
 ;;
-;; Scanned one line at a time (not full-buffer-aware), so a string literal
-;; spanning multiple lines will mis-highlight at the line boundary -- the
-;; same simplification most lightweight highlighters make; getting it
-;; exactly right needs carrying scan state between lines (Emacs does this
-;; via syntax-table text properties). Paren *matching* below doesn't have
-;; this limitation since it scans the whole buffer.
+;; Scanned one line at a time, but with a carry (see legmacs.modes/
+;; register-mode!'s :highlight-line): a string literal left open at end of
+;; line hands `:string` to the next line, which colors itself as string
+;; content up to the closing quote. That's the only construct in let-go
+;; that crosses a line -- comments end at the newline and character
+;; literals are a couple of characters -- so :string is the whole carry
+;; vocabulary here. Paren *matching* below never had the limitation, since
+;; it scans the whole buffer.
 
 (def special-forms
   #{"def" "defn" "defn-" "defmacro" "defcommand" "defcommand!" "defmethod" "defmulti"
@@ -72,9 +74,13 @@
   [text]
   (and (> (count text) 1) (= \: (nth text 0))))
 
-(defn highlight-line [line]
-  (let [scanned (ls/scan line)
-        covered? (fn [pos] (some (fn [{:keys [start end]}] (and (<= start pos) (< pos end))) (:spans scanned)))
+(defn- highlight-scanned
+  "highlight-line's body, over an already-computed scan of `line` -- the
+   carry-aware wrapper below needs the same scan for its own answer, and
+   scanning twice per visible line per frame is the one cost worth avoiding
+   here."
+  [line scanned]
+  (let [covered? (fn [pos] (some (fn [{:keys [start end]}] (and (<= start pos) (< pos end))) (:spans scanned)))
         span-highlights (map (fn [{:keys [type start end]}] {:style type :start start :end end}) (:spans scanned))
         words (tokenize-words line)
         ;; :spans now also covers character literals (legmacs.lisp-syntax/
@@ -92,6 +98,59 @@
                                          (filter (fn [[s _e text]] (and (keyword-token? text) (plain? s))))
                                          (map (fn [[s e _text]] {:style :keyword-literal :start s :end e})))]
     (concat span-highlights keyword-highlights number-highlights keyword-literal-highlights)))
+
+(defn highlight-line
+  "Syntax spans for one line read on its own (no carry) -- the plain
+   :highlighter view, still what most callers and the tests want."
+  [line]
+  (highlight-scanned line (ls/scan line)))
+
+(defn- shift-spans [spans k]
+  (mapv (fn [sp] (assoc sp :start (+ k (:start sp)) :end (+ k (:end sp)))) spans))
+
+(defn- string-close
+  "Index just past the quote that closes a string carried in from the
+   previous line, or nil if this line doesn't close it. Backslash escapes
+   count, so an escaped quote doesn't end the string."
+  [line]
+  (let [chars (vec (seq line)), n (count chars)]
+    (loop [j 0]
+      (cond
+        (>= j n) nil
+        (= \\ (nth chars j)) (recur (+ j 2))
+        (= \" (nth chars j)) (inc j)
+        :else (recur (inc j))))))
+
+(defn highlight-line-carry
+  "The :highlight-line form of the above: `carry` is :string when the
+   previous line ended inside an unterminated string literal, nil
+   otherwise. A carried string colors from column 0 to its closing quote,
+   and the rest of the line is then highlighted as ordinary code."
+  [carry line]
+  (if carry
+    (if-let [end (string-close line)]
+      (let [rest-line (subs line end)
+            scanned (ls/scan rest-line)]
+        {:spans (concat [{:style :string :start 0 :end end}]
+                        (shift-spans (highlight-scanned rest-line scanned) end))
+         :carry (when (:in-string? scanned) :string)})
+      {:spans [{:style :string :start 0 :end (count line)}] :carry :string})
+    (let [scanned (ls/scan line)]
+      {:spans (highlight-scanned line scanned)
+       :carry (when (:in-string? scanned) :string)})))
+
+(defn highlight-carry
+  "The cheap :highlight-carry half, run over every line above the viewport
+   on every frame. A line with no quote on it can neither open nor close a
+   string, so it hands the carry straight through after one (native)
+   substring search; anything else goes to legmacs.lisp-syntax/
+   ends-in-string?, which answers the same question a full scan would
+   without building the spans and bracket tables nobody is going to look
+   at here."
+  [carry line]
+  (if (string/includes? line "\"")
+    (when (ls/ends-in-string? line (boolean carry)) :string)
+    carry))
 
 ;; --- paren matching --------------------------------------------------
 ;;
@@ -344,6 +403,8 @@
                        (str "let-go-mode: C-x C-e eval-last-sexp, C-j eval-print-last-sexp, "
                             "C-c C-e eval-buffer, RET auto-indents, C-c e/u expand/contract-region")
                        {:highlighter highlight-line
+                        :highlight-line highlight-line-carry
+                        :highlight-carry highlight-carry
                         :after-command update-paren-match})
 (modes/register-auto-mode! ".lg" :let-go)
 ;; let-go is a Clojure dialect, and shares its reader syntax closely enough

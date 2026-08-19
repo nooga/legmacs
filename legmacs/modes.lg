@@ -29,6 +29,13 @@
                :on-enter (fn [state] -> state)   -- entering the mode
                :on-exit  (fn [state] -> state)   -- leaving a minor mode
                :highlighter (fn [line-text] -> [{:start :end :style} ...])
+               :highlight-line (fn [carry line-text]
+                                 -> {:spans [...] :carry carry'})
+                 -- multi-line-aware alternative to :highlighter (see
+                    line-highlighter below)
+               :highlight-carry (fn [carry line-text] -> carry')
+                 -- cheap state-only version of the above, for lines above
+                    the viewport
                :after-command (fn [state] -> state)
                :status (fn [state] -> string)    -- left mode-line lighter
                :status-right (fn [state] -> string) -- right-aligned lighter
@@ -58,12 +65,28 @@
                       per-line syntax spans in that line's own column
                       space; legmacs.render calls this fresh per frame,
                       only for visible lines
+     :highlight-line (fn [carry line-text] -> {:spans [...] :carry c'}),
+                      the same thing for a language with constructs that
+                      cross line boundaries (a string or block comment
+                      opened on an earlier line): `carry` is whatever the
+                      previous line returned (nil on the first line), and
+                      is entirely private to the mode -- render only
+                      threads it. Takes precedence over :highlighter
+     :highlight-carry (fn [carry line-text] -> c'), the state-only half of
+                      :highlight-line, used for the lines *above* the
+                      viewport (whose spans nobody needs). Optional: it
+                      defaults to running :highlight-line and dropping the
+                      spans, but a mode that can cheaply answer whether a
+                      line can change the carry at all should say so here:
+                      that answer is what keeps scrolling deep into a big
+                      file from costing a full re-scan of everything above
      :after-command  (fn [state] -> state), runs after every dispatched
                       command while this mode is active (paren-matching,
                       anything else that needs recomputing after an edit)"
   ([mode-kw keymap doc] (register-mode! mode-kw keymap doc {}))
   ([mode-kw keymap doc opts]
    (swap! registry assoc mode-kw (merge {:on-enter nil :on-exit nil :highlighter nil
+                                         :highlight-line nil :highlight-carry nil
                                          :after-command nil :status nil :status-right nil
                                          :suppress-self-insert? nil :syntax-spec nil}
                                          opts
@@ -96,6 +119,33 @@
 
 (defn mode-highlighter [mode-kw]
   (:highlighter (get @registry mode-kw)))
+
+(defn line-highlighter
+  "`mode-kw`'s highlighter normalized to the multi-line-aware shape
+   (fn [carry line] -> {:spans [...] :carry c'}), or nil if it has no
+   highlighter at all. A mode declaring the plain per-line :highlighter is
+   lifted into it with a carry that stays nil -- so legmacs.render threads
+   carries the same way for every mode and stateless modes (markdown, help)
+   need no changes."
+  [mode-kw]
+  (let [entry (get @registry mode-kw)]
+    (cond
+      (:highlight-line entry) (:highlight-line entry)
+      (:highlighter entry) (let [h (:highlighter entry)]
+                             (fn [_carry line] {:spans (h line) :carry nil}))
+      :else nil)))
+
+(defn carry-advance
+  "`mode-kw`'s (fn [carry line] -> carry') for lines whose spans aren't
+   needed: its own :highlight-carry if it declares one, else :highlight-line
+   with the spans thrown away, else a constant nil (nothing to carry)."
+  [mode-kw]
+  (let [entry (get @registry mode-kw)]
+    (cond
+      (:highlight-carry entry) (:highlight-carry entry)
+      (:highlight-line entry) (let [h (:highlight-line entry)]
+                                (fn [carry line] (:carry (h carry line))))
+      :else (fn [_carry _line] nil))))
 
 (defn mode-after-command [mode-kw]
   (:after-command (get @registry mode-kw)))

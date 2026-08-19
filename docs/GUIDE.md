@@ -174,6 +174,19 @@ rendering (`:highlighter`, a pure per-line syntax colorer) and into every
 keystroke (`:after-command`, e.g. to keep a matched-paren highlight current);
 see [`legmacs/modes.lg`](../legmacs/modes.lg)'s `register-mode!`.
 
+A language with constructs that cross line boundaries declares
+`:highlight-line` instead: `(fn [carry line] -> {:spans ... :carry ...})`,
+where `carry` is whatever the previous line returned (`nil` at the top of the
+buffer) and is entirely private to the mode -- `legmacs.render` only threads
+it down the buffer. That's what keeps a block comment, a raw string or a
+markdown code fence colored on every line it covers, including when the line
+that opened it has scrolled off the top of the screen. Since the carry has to
+be folded from the first line of the buffer to the top of the viewport, a
+mode should also declare `:highlight-carry` -- the same answer without the
+spans, and free to shortcut: "no backtick on this line, so nothing can have
+changed" is one substring search, versus tokenizing a line nobody is looking
+at.
+
 A buffer can *also* have any number of **minor modes** layered on top of its
 major mode. They're the same registry entry (`register-minor-mode!`), the
 only difference being where the buffer holds them: the major mode lives in a
@@ -256,11 +269,11 @@ scanner, [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg), that finds
 brackets, strings, and comments in one pass, correctly skipping character
 literals (`\(`, `\"`, `\\`, ...) so they don't get mistaken for real
 structure. Paren matching and expand-region scan the whole buffer, so they
-work correctly across line breaks; the per-line syntax highlighter doesn't
-carry state between lines, so a string literal that spans multiple lines
-will mis-highlight at the boundary (a limitation most lightweight
-highlighters share; getting it exactly right needs the kind of continuation
-state Emacs tracks via syntax-table text properties).
+work correctly across line breaks. The highlighter reads one line at a time,
+but carries a single bit between them (`:highlight-line`, above) -- whether a
+string literal was left open -- which is the only construct in let-go that
+crosses a line, so a multi-line string stays colored to its closing quote no
+matter how far above the screen it started.
 
 See [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) for all of the
 above. Registering your own mode from `legmacs-init.lg`, with or without
@@ -273,27 +286,31 @@ works): ATX headers (`#` through `######`), `**bold**`/`__bold__`,
 correctly doesn't count, markdown's own rule, unlike `*`), `` `inline
 code` ``, `[links](url)`/`![images](url)`, `>` blockquotes, `-`/`*`/`+`/`1.`
 list markers, and `---`/`***`/`___` horizontal rules; see
-[`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg). Like
-let-go-mode's highlighter, it's per-line with no state carried across lines,
-so only a fenced-code-block's ` ``` ` delimiter lines are recognized, not
-the code between them (the same limitation, for the same reason, as the
-multi-line string case above).
+[`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg). Fenced code
+blocks are the one thing it carries state for: everything between two
+` ``` ` lines is colored as code, and -- just as important -- the inline
+scanner stands down there, so
+the asterisks and underscores in a shell command or a code snippet don't read
+as emphasis. Indented (4-space) code blocks still aren't recognized: telling
+one from a lazy list continuation needs more context than a line at a time.
 
-### The language pack (Go, JS/TS, Python, C, shell, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, Makefile)
+### The language pack (Go, JS/TS, Python, C, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, Makefile)
 
 Beyond the two hand-written modes, one spec-driven scanner
 ([`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg)) provides major modes
 for the usual suspects: **go-mode** (`.go`), **javascript-mode**
 (`.js`/`.jsx`/`.mjs`/`.cjs`/`.ts`/`.tsx`), **python-mode** (`.py`),
 **c-mode** (`.c`/`.h`/`.cpp`/`.hpp`/`.cc`/...), **shell-mode**
-(`.sh`/`.bash`/`.zsh`), **rust-mode** (`.rs`), **json-mode** (`.json`),
+(`.sh`/`.bash`/`.zsh`), **rc-mode** (`.rc`/`rcmain`, the plan 9 shell:
+`''`-quoted strings, and `$x`/`$#x`/`$"x` variable forms), **rust-mode**
+(`.rs`), **json-mode** (`.json`),
 **yaml-mode** (`.yaml`/`.yml`), **toml-mode** (`.toml`), **lua-mode**
 (`.lua`), **ruby-mode** (`.rb`), **sql-mode** (`.sql`, keywords
 case-insensitive), **dockerfile-mode** (`Dockerfile`/`.dockerfile`, also
-case-insensitive), **css-mode** (`.css`), **html-mode** (`.html`/`.htm`,
-comments-and-strings only, like css-mode -- neither has a keyword
-vocabulary this scanner's word-based classification applies to, HTML's
-structure being tags and attributes rather than keywords), **zig-mode**
+case-insensitive), **css-mode** (`.css`), **html-mode**
+(`.html`/`.htm`/`.xhtml`/`.xml`/`.svg` -- comments, quoted attribute
+values, and tag names, since HTML's structure is tags rather than the
+keyword vocabulary this scanner's word-based classification expects), **zig-mode**
 (`.zig`, no block comments, just `//`/`///`/`//!` line comments),
 **java-mode** (`.java`), **kotlin-mode** (`.kt`/`.kts`), **swift-mode**
 (`.swift`), **csharp-mode** (`.cs`), **php-mode** (`.php`, both `//` and
@@ -320,9 +337,19 @@ a registered mode plus its filename associations. Adding your own from
 any mode: `(legmacs.modes/register-auto-mode! ".ext" :mode-kw)` maps a
 filename suffix to a major mode, consulted whenever a file is opened.)
 
-Same per-line simplification as the other highlighters: strings and `/* */`
-comments that close on their own line are exact; a multi-line construct
-highlights on the line where it opens and not on its continuation lines.
+Beyond those word sets the spec has a few optional knobs:
+`:multiline-strings` (`[{:open "`" :close "`" :escape? false} ...]`, for Go's
+raw strings, Python's and Swift's triple quotes, JS template literals, Lua's
+`[[ ]]`, C#'s `@"..."`), `:preprocessor` (a set of C-style `#directive`
+names, recognized only at the head of a line -- an `#include`'s `<header>`
+comes out as a string rather than two comparisons), `:var-sigils`
+(`["$"]`-style prefixes, so `$HOME`, `${PATH}`, `$(uname)` and rc's `$#argv`
+read as one variable reference), and `:functions?` (a name sitting
+immediately before a `(` is a call site). A block comment or a multi-line
+string stays colored across every line it covers; a plain `"` or `'` string
+still ends at end of line, since in the languages without
+`:multiline-strings` an unclosed quote is a typo far more often than a
+literal, and one stray quote shouldn't repaint the rest of the file.
 `:block-comment` is always checked before `:line-comments`, so a language
 whose block-open marker starts with its own line-comment marker (Lua's
 `--[[` is prefixed by its `--`) still opens a block comment rather than a
@@ -516,12 +543,12 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/completion.lg`](../legmacs/completion.lg) | Fuzzy (subsequence) matching and scoring, plus the completers it feeds: command names, filesystem paths. (The older extend-to-common-prefix policy still lives here too.) |
 | [`legmacs/commands.lg`](../legmacs/commands.lg) | The built-in commands, defined with `defcommand`. |
 | [`legmacs/bindings.lg`](../legmacs/bindings.lg) | The default keymap, defined with `bind-key!`. |
-| [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a per-line highlighter, an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
+| [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a line highlighter (stateless, or carrying state across lines for multi-line constructs), an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
-| [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules). Registered for `.md`/`.markdown` files. |
-| [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven per-line scanner (comments, strings, keyword/type/constant sets) behind major modes for Go, JS/TS, Python, C/C++, shell, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
+| [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
+| [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |
 | [`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg) | Three generic minor modes -- `:paren-match`, `:electric-pair`, `:auto-indent` -- driven by whatever `:syntax-spec` the buffer's major mode declares; no-op (plain newline/self-insert) when it has none. `legmacs.modes/switch-to-mode` auto-enables all three for any major mode with a spec, so the whole language pack gets them by default. |
 | [`legmacs/modes/crutch.lg`](../legmacs/modes/crutch.lg) | CRUTCH: vi-style modal editing as a bundled minor mode (`M-x crutch-mode`). A worked example of the minor-mode/`:keymap`-fn/`:suppress-self-insert?` machinery. |

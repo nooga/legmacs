@@ -81,7 +81,9 @@ exact same functions — there's no privileged built-in path.
 global bindings — `legmacs.dispatch` walks *all* applicable keymaps in
 parallel at each chord, not one keymap chosen up front. A mode can also
 supply `:highlighter` (pure per-line syntax coloring, called fresh every
-frame for visible lines only) and `:after-command` (runs after every
+frame for visible lines only) or, for a language with constructs that
+cross line boundaries, `:highlight-line` + `:highlight-carry` (see the
+highlighting paragraph below), and `:after-command` (runs after every
 dispatch while that mode is active — used for paren-matching). `legmacs/
 lisp_syntax.lg` is a single-pass bracket/string/comment scanner shared by
 paren-matching, auto-indent, expand-region, and auto-pairing in
@@ -141,6 +143,26 @@ left-aligned `:status`). `legmacs/modes/keycast.lg` is a pure *observer*
 minor mode built on exactly those two: empty keymap, `:after-command` logs
 `:last-chord`, `:status-right` renders the log — a good template for any
 "watch keystrokes / show HUD" feature.
+
+**Highlighting carries state across lines, and render is what threads
+it.** A mode's `:highlight-line` is `(fn [carry line] -> {:spans :carry})`;
+the carry is opaque to render and private to the mode (prog: the block
+comment or multi-line string still open; let-go: `:string`; markdown:
+`:fenced`). `render/rows-highlight-spans` folds the carry from line 0 down
+to the top of the viewport, then styles the visible rows in order -- which
+is why highlight spans are computed once per window per frame in
+`window-frame` and handed to `text-row`, instead of each row deriving its
+own. Folding the prefix is only affordable because of `:highlight-carry`,
+the state-only half: it answers "could this line change anything?" with a
+native substring search (`legmacs.modes.prog/make-carry-advance`, and
+`legmacs.lisp-syntax/ends-in-string?` for let-go, which is the cheap
+scan-free version of the same question `scan` answers) and hands the carry
+straight through when not. Skipping that -- deriving the carry by running
+the full scanner over every line above the viewport -- costs ~10x and
+shows up as lag scrolling deep into a large file. A plain stateless
+`:highlighter` still works and is auto-lifted into the same shape by
+`legmacs.modes/line-highlighter`, so a mode with nothing to carry (help,
+repl) needs no changes.
 
 **`legmacs.render` is a per-column fg/bg span compositor**, not a
 single-highlight hack — region selection, paren-match, and syntax colors

@@ -101,7 +101,8 @@
 
   (testing "a bare \"--\" (no following [[) is still an ordinary line comment"
     (let [lua-hl (:highlighter (get @modes/registry :lua))]
-      (is (= [{:style :comment :start 9 :end 23}] (lua-hl "print(x) -- not a block"))))))
+      (is (= [{:style :function :start 0 :end 5} {:style :comment :start 9 :end 23}]
+             (lua-hl "print(x) -- not a block"))))))
 
 (deftest sql-keywords-are-case-insensitive
   (testing "both SELECT and select are tagged :keyword"
@@ -127,17 +128,27 @@
       (is (= [{:style :comment :start 0 :end 15}] (css-hl "/* a comment */")))
       (is (= [{:style :string :start 9 :end 13}] (css-hl "content: \"hi\";"))))))
 
-(deftest html-has-no-keywords-just-comments-and-attribute-strings
-  (testing "html-mode tags <!-- --> comments and quoted attribute values, no tag/word classification"
+(deftest html-tags-comments-and-attribute-strings
+  (testing "html-mode tags <!-- --> comments, tag names, and quoted attribute values"
     (let [html-hl (:highlighter (get @modes/registry :html))]
       (is (= [{:style :comment :start 0 :end 18}] (html-hl "<!-- a comment -->")))
-      (is (= [{:style :string :start 8 :end 11}] (html-hl "<a href=\"x\">"))))))
+      (is (= [{:style :keyword :start 0 :end 2} {:style :string :start 8 :end 11}
+              {:style :keyword :start 12 :end 15}]
+             (html-hl "<a href=\"x\"></a>")))))
+
+  (testing "a < that isn't a tag is left alone"
+    (let [html-hl (:highlighter (get @modes/registry :html))]
+      (is (empty? (html-hl "a < b and c > d")))))
+
+  (testing "XML and SVG open into the same mode"
+    (is (= :html (modes/mode-for-filename "icon.svg")))
+    (is (= :html (modes/mode-for-filename "pom.xml")))))
 
 (deftest zig-java-kotlin-swift-csharp-php-makefile-basics
   (testing "zig-mode: keywords, types, and /// doc comments (a \"//\" prefix, no block comments)"
     (let [zig-hl (:highlighter (get @modes/registry :zig))]
       (is (= [{:style :keyword :start 0 :end 3} {:style :keyword :start 4 :end 6}
-              {:style :type :start 14 :end 18}]
+              {:style :function :start 7 :end 11} {:style :type :start 14 :end 18}]
              (zig-hl "pub fn main() void {")))
       (is (= [{:style :comment :start 0 :end 15}] (zig-hl "/// doc comment")))))
 
@@ -148,13 +159,15 @@
 
   (testing "kotlin-mode: fun/val keywords, true as a constant"
     (let [kotlin-hl (:highlighter (get @modes/registry :kotlin))]
-      (is (= [{:style :keyword :start 0 :end 3} {:style :keyword :start 13 :end 16}
+      (is (= [{:style :keyword :start 0 :end 3} {:style :function :start 4 :end 8}
+              {:style :keyword :start 13 :end 16}
               {:style :keyword-literal :start 21 :end 25}]
              (kotlin-hl "fun main() { val x = true }")))))
 
   (testing "swift-mode: func/return keywords, Int type"
     (let [swift-hl (:highlighter (get @modes/registry :swift))]
-      (is (= [{:style :keyword :start 0 :end 4} {:style :type :start 14 :end 17}
+      (is (= [{:style :keyword :start 0 :end 4} {:style :function :start 5 :end 8}
+              {:style :type :start 14 :end 17}
               {:style :keyword :start 20 :end 26} {:style :number :start 27 :end 28}]
              (swift-hl "func foo() -> Int { return 1 }")))))
 
@@ -184,3 +197,127 @@
     (let [ruby-hl (:highlighter (get @modes/registry :ruby))]
       (is (some #(= {:style :keyword :start 0 :end 3} %) (ruby-hl "def foo; end")))
       (is (some #(= {:style :keyword-literal :start 0 :end 3} %) (ruby-hl "nil"))))))
+
+;; --- multi-line constructs (the carry) ---------------------------------
+
+(defn- scan-lines
+  "Run a line scanner down `lines` the way legmacs.render threads it, and
+   collect [spans ...] per line."
+  [scanner lines]
+  (loop [ls lines, carry nil, out []]
+    (if (empty? ls)
+      out
+      (let [res (scanner carry (first ls))]
+        (recur (rest ls) (:carry res) (conj out (:spans res)))))))
+
+(def go-scan (:highlight-line (get @modes/registry :go)))
+
+(deftest block-comments-span-lines
+  (testing "a /* opened on one line keeps coloring until its */ arrives"
+    (let [rows (scan-lines go-scan ["x := 1 /* open" "middle" "done */ y := 2"])]
+      (is (= {:style :comment :start 7 :end 14} (last (nth rows 0))))
+      (is (= [{:style :comment :start 0 :end 6}] (nth rows 1)))
+      (is (= {:style :comment :start 0 :end 7} (first (nth rows 2))))))
+
+  (testing "the carry survives an arbitrary number of lines"
+    (let [rows (scan-lines go-scan (concat ["/* open"] (repeat 20 "body") ["*/"]))]
+      (is (every? (fn [r] (= :comment (:style (first r)))) rows)))))
+
+(deftest raw-strings-span-lines
+  (testing "a Go backtick string colors every line it covers"
+    (let [rows (scan-lines go-scan ["q := `SELECT" "  FROM t" "`" "z := 1"])]
+      (is (= [{:style :string :start 5 :end 12}] (nth rows 0)))
+      (is (= [{:style :string :start 0 :end 8}] (nth rows 1)))
+      (is (= [{:style :string :start 0 :end 1}] (nth rows 2)))
+      (is (= [{:style :number :start 5 :end 6}] (nth rows 3)))))
+
+  (testing "a plain \" string still stops at end of line -- only the
+            delimiters a language really can continue are carried"
+    (let [rows (scan-lines go-scan ["s := \"oops" "func f() {"])]
+      (is (= [{:style :string :start 5 :end 10}] (nth rows 0)))
+      (is (= {:style :keyword :start 0 :end 4} (first (nth rows 1)))))))
+
+(deftest python-docstrings-span-lines
+  (testing "a triple-quoted string is one span per line, not three empty ones"
+    (let [py (:highlight-line (get @modes/registry :python))
+          rows (scan-lines py ["def f():" "    \"\"\"Does a thing." "    over two lines.\"\"\"" "    return 1"])]
+      (is (= [{:style :keyword :start 0 :end 3} {:style :function :start 4 :end 5}] (nth rows 0)))
+      (is (= [{:style :string :start 4 :end 20}] (nth rows 1)))
+      (is (= [{:style :string :start 0 :end 22}] (nth rows 2)))
+      (is (= {:style :keyword :start 4 :end 10} (first (nth rows 3)))))))
+
+(deftest carry-advance-agrees-with-the-full-scan
+  (testing ":highlight-carry is just the cheap half -- same answer, no spans"
+    (let [advance (:highlight-carry (get @modes/registry :go))
+          lines ["x := 1 /* open" "middle" "done */ q := `raw" "still raw" "` z := 2"]]
+      (is (= (loop [ls lines, carry nil, out []]
+               (if (empty? ls) out (recur (rest ls) (:carry (go-scan carry (first ls)))
+                                          (conj out (:carry (go-scan carry (first ls)))))))
+             (loop [ls lines, carry nil, out []]
+               (if (empty? ls) out (recur (rest ls) (advance carry (first ls))
+                                          (conj out (advance carry (first ls)))))))))))
+
+;; --- the newer token classes -------------------------------------------
+
+(deftest c-preprocessor-directives
+  (testing "#directives at the head of a line are their own style"
+    (let [c-hl (:highlighter (get @modes/registry :c))]
+      (is (= {:style :preproc :start 0 :end 7} (first (c-hl "#define MAX 10"))))
+      (is (= {:style :preproc :start 2 :end 10} (first (c-hl "  # define X"))))))
+
+  (testing "an #include's <header> is an argument, not two comparisons"
+    (let [c-hl (:highlighter (get @modes/registry :c))]
+      (is (= [{:style :preproc :start 0 :end 8} {:style :string :start 9 :end 18}]
+             (c-hl "#include <stdio.h>")))
+      ;; it has to be the next thing on the line: angle brackets anywhere
+      ;; else (here, in a trailing comment) aren't an argument
+      (is (= [{:style :preproc :start 0 :end 8} {:style :string :start 9 :end 18}
+              {:style :comment :start 19 :end 34}]
+             (c-hl "#include \"local.h\" // see <angles>")))
+      (is (= [{:style :preproc :start 0 :end 3}] (c-hl "#if X < Y")))))
+
+  (testing "a # that isn't the first thing on the line stays plain"
+    (let [c-hl (:highlighter (get @modes/registry :c))]
+      (is (empty? (c-hl "x = a # b"))))))
+
+(deftest shell-variable-references
+  (testing "$name, ${name}, $(cmd) and $? all read as one variable"
+    (let [sh (:highlighter (get @modes/registry :shell))]
+      (is (= [{:style :variable :start 5 :end 10}] (sh "echo $HOME")))
+      (is (= [{:style :variable :start 0 :end 7}] (sh "${PATH}")))
+      (is (= [{:style :variable :start 0 :end 8}] (sh "$(uname)")))
+      (is (= [{:style :variable :start 0 :end 2}] (sh "$?")))))
+
+  (testing "a bare $ with nothing to name is left alone"
+    (let [sh (:highlighter (get @modes/registry :shell))]
+      ;; the one span here is the number 5 (whose token swallows the
+      ;; trailing $, same as any other word character) -- no :variable
+      (is (empty? (filter (fn [sp] (= :variable (:style sp))) (sh "cost is 5$")))))))
+
+(deftest call-sites-are-highlighted
+  (testing "an unclassified name immediately before ( reads as a function"
+    (let [gohl (:highlighter (get @modes/registry :go))]
+      (is (= [{:style :function :start 0 :end 6}] (gohl "printf(x)")))
+      (is (= [{:style :keyword :start 0 :end 2}] (gohl "if (x)")))
+      (is (empty? (gohl "printf x")))))
+
+  (testing "a language that doesn't ask for it (no :functions?) gets none"
+    (is (empty? (go-hl "printf(x)")))))
+
+(deftest rc-mode-basics
+  (testing "the plan 9 shell claims .rc files"
+    (is (= :rc (modes/mode-for-filename "install.rc")))
+    (is (= :rc (modes/mode-for-filename "rcmain"))))
+
+  (testing "keywords, ' strings, # comments, and rc's variable forms"
+    (let [rc (:highlighter (get @modes/registry :rc))]
+      (is (= [{:style :comment :start 0 :end 9}] (rc "#!/bin/rc")))
+      (is (= [{:style :keyword :start 0 :end 2} {:style :keyword :start 11 :end 15}
+              {:style :string :start 16 :end 23}]
+             (rc "fn usage { echo 'usage'; }")))
+      (is (= [{:style :variable :start 0 :end 7}] (rc "$#files")))
+      (is (= [{:style :variable :start 0 :end 6}] (rc "$\"argv")))))
+
+  (testing "rc has no call syntax, so x=(a b c) doesn't invent a function"
+    (let [rc (:highlighter (get @modes/registry :rc))]
+      (is (empty? (rc "x=(a b c)"))))))
