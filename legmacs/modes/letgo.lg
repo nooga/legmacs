@@ -4,10 +4,18 @@
 ;; This works because let-go's `eval`/`read-string`/`load-string` (see
 ;; pkg/compiler/eval.go) compile and run an already-read form *in whatever
 ;; namespace is current* -- and that's legmacs.main the whole time legmacs
-;; is running (nothing after main.lg's own `ns` form ever calls `in-ns`), so
-;; code typed here sees exactly the aliases main.lg set up: `buf/`, `keys/`,
-;; `km/`, `dispatch/`, `render/`, plus all of clojure.core unqualified. It's
-;; not a sandboxed toy evaluator -- it's the running editor's own namespace.
+;; is running, so code typed here sees exactly the aliases main.lg set up:
+;; `buf/`, `keys/`, `km/`, `dispatch/`, `render/`, plus all of clojure.core
+;; unqualified. It's not a sandboxed toy evaluator -- it's the running
+;; editor's own namespace.
+;;
+;; Which is also why `preserving-ns` below exists: that invariant isn't
+;; free. `load-string`ing a buffer that opens with `(ns foo)` -- every real
+;; .lg file does -- relocates the current namespace permanently, and one
+;; C-c C-e would otherwise cost you every alias above for the rest of the
+;; session -- the next C-x C-e fails with "Can't resolve ... in this
+;; context". eval-buffer puts it back; C-x C-e deliberately doesn't, so an
+;; explicit `(in-ns 'foo)` still moves you.
 
 (ns legmacs.modes.letgo
   (:require [string]
@@ -308,11 +316,33 @@
   (run-eval state (fn [state _form result]
                      (buf/insert-string state (str "\n" (format-result result))))))
 
+(defn preserving-ns
+  "Run `thunk`, then put the current namespace back where it was.
+
+   Loading a file that opens with an `(ns ...)` form *switches the running
+   namespace and never switches back* -- and since legmacs evaluates in its
+   own live namespace, that would leave every alias the editor set up
+   (`buf/`, `km/`, `dispatch/`, `render/`) unresolvable for the rest of the
+   session: one C-c C-e on any ordinary .lg file and C-x C-e stops
+   working. Emacs's load-file doesn't relocate you either.
+
+   Deliberately *not* applied to C-x C-e / C-j: `(in-ns 'foo)` typed and
+   evaluated on purpose should still move you, and so should the *repl*
+   buffer, where relocating is the point.
+
+   Written the long way round because let-go's `finally` can't propagate an
+   exception -- see CLAUDE.md."
+  [thunk]
+  (let [saved (ns-name *ns*)
+        outcome (try {:ok (thunk)} (catch e {:err e}))]
+    (in-ns saved)
+    (if (contains? outcome :err) (throw (:err outcome)) (:ok outcome))))
+
 (defcommand eval-buffer
   "Evaluate the entire buffer, top to bottom, as one `load-string`."
   [state]
   (try
-    (let [result (load-string (buf/buffer-text state))]
+    (let [result (preserving-ns (fn [] (load-string (buf/buffer-text state))))]
       (assoc state :message (str "=> " (format-result result))))
     (catch e (assoc state :message (str "Eval error: " (ex-message e))))))
 
