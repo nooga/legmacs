@@ -242,6 +242,19 @@ every-cell-written-no-clear frame invariant. The flat single-state
 `render/frame` still exists and must stay byte-identical to a one-window
 workspace frame — there's a test asserting exactly that.
 
+**Vibe (`C-c C-v`) is a `:pending-task` client.** `legmacs/vibe.lg`
+(`(vibe "...")` / `C-c C-v`) is the thing that waits on a network
+round-trip. `vibe-replace` does no I/O: it sets `:message "vibing..."`
+plus `:pending-task (vibe-task start end)` and returns, so it's as pure
+and testable as any other command. The task `eval`s the form (in
+`legmacs.main`, same as `C-x C-e`) with the call site parked in
+`vibe/current-context`, then splices the returned string over the form as
+one undo step. Two guards there are load-bearing: `resolve-vibe`
+re-checks that a `(vibe` form still opens at `start` before touching the
+buffer, and it refuses to splice a non-string result (let-go's `eval`
+*returns* compile errors as an `#error` value instead of raising them, so
+a typo'd prompt would otherwise be pasted into your code).
+
 Full per-file breakdown and the complete default keymap are in
 [README.md](README.md); read it before making structural changes.
 
@@ -266,6 +279,17 @@ Full per-file breakdown and the complete default keymap are in
   `term/write` work fine on a plain pipe, no pty required; only
   `term/size` and `raw-mode!` need a real terminal, and `render/frame`
   takes explicit cols/rows so you can sidestep that too.
+- **`load-string`ing text that opens with `(ns foo)` relocates the current
+  namespace permanently — including from inside a function call.** Since
+  legmacs evaluates in its own live namespace (`legmacs.main`), one
+  `eval-buffer` on any ordinary `.lg` file would otherwise leave `buf/`,
+  `km/`, `dispatch/`, `render/` and `vibe` unresolvable for the rest of the
+  session — the next `C-x C-e` fails with "Can't resolve ... in this
+  context". `legmacs.modes.letgo/preserving-ns` (`(ns-name *ns*)` before,
+  `in-ns` after, via the reify-outcome pattern so it survives a throw)
+  wraps `eval-buffer` for exactly this. `C-x C-e`/`C-j` and the `*repl*`
+  buffer are deliberately left unwrapped: an explicit `(in-ns 'foo)` there
+  *should* move you.
 - **`(def x (load-string "..."))` as a script's own top-level form breaks
   resolving the *next* top-level form.** Reproducible with plain `lg -e`,
   nothing legmacs-specific, and doesn't affect legmacs itself since
@@ -341,6 +365,27 @@ Full per-file breakdown and the complete default keymap are in
   caret notation *with a char-index → display-column map*, and everything
   positional (highlight spans, cursor placement, `:scroll-col` — which is
   a display column) must go through that mapping, not raw char indices.
+- **`finally` can't be used for cleanup that has to survive an exception.**
+  A let-go `try` whose only trailing clause is `finally` *swallows* the
+  in-flight exception and returns it as an ordinary value (so the caller
+  sees a successful-looking `#error` instead of a raised one), and a
+  `catch` that rethrows skips the `finally` entirely. Neither shape both
+  propagates and cleans up. Reify the outcome instead — `(let [outcome
+  (try {:ok (f)} (catch e {:err e}))] (cleanup!) (if (contains? outcome
+  :err) (throw (:err outcome)) (:ok outcome)))` — as `legmacs.vibe/
+  with-context` does. `main.lg`'s `(try (run ws) (finally
+  (shutdown-terminal!)))` is fine only because it doesn't need the
+  exception afterwards.
+- **`json/write-json` mangles string map keys.** `{"a" 1}` serializes as
+  `{"\"a\"": 1}` — the key gets quoted twice. Keyword keys are correct, so
+  build request bodies with keywords (`{:max_tokens 5}`, underscores and
+  all); `legmacs.vibe`'s provider `:body` functions do exactly that.
+  `json/read-json` is fine either way; it takes `{:keywords? true}` (not
+  `:keywordize`) if you want keyword keys back.
+- **A thrown plain string has no `ex-message`.** `(throw "boom")` is caught
+  as the bare string, where `(ex-message e)` is nil and `(str e)` is the
+  message; a real error object is the other way round. Use `(or (ex-message
+  e) (str e))` for anything that catches both.
 - Ctrl-Space is sent as a NUL byte (0x00) by terminals, and BEL (0x07,
   also literally Ctrl-G) doubles as `term/read-key`'s SIGWINCH wake-up —
   `legmacs.keys` has to special-case both; see its docstrings before

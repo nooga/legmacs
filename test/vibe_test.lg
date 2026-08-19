@@ -1,0 +1,174 @@
+(ns test.vibe-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            ;; :refer too, mirroring main.lg: resolve-vibe `eval`s the
+            ;; form in whatever namespace is current, so `vibe` has to
+            ;; resolve here for the error-path test to reach the real fn.
+            [legmacs.vibe :as vibe :refer [vibe]]))
+
+;; Nothing here touches the network: the interesting parts of legmacs.vibe
+;; (finding the call site, building the prompt, splicing the answer back)
+;; are pure, and the one impure function is exercised only on the paths
+;; that fail before any HTTP happens.
+
+(deftest parse-config-is-forgiving
+  (testing "the expected shape"
+    (is (= {:key "sk-x" :model "gpt-5.6-luna"}
+           (vibe/parse-config "{:key \"sk-x\" :model \"gpt-5.6-luna\"}"))))
+
+  (testing "comments and whitespace, since it's a file people hand-edit"
+    (is (= {:key "sk-x"}
+           (vibe/parse-config "\n;; my key\n{:key \"sk-x\"}\n"))))
+
+  (testing "no file at all"
+    (is (= {} (vibe/parse-config nil))))
+
+  (testing "a blank or half-finished file is no config, not a crash"
+    (is (= {} (vibe/parse-config "   \n")))
+    (is (= {} (vibe/parse-config "{:key \"sk-x\"")))
+    (is (= {} (vibe/parse-config "[:not :a :map]")))))
+
+(deftest api-key-prefers-the-config-file
+  (let [provider (:openai vibe/providers)]
+    (testing "vibe.edn's :key wins"
+      (is (= "sk-from-file" (vibe/api-key {:key "sk-from-file"} provider))))
+
+    (testing "an empty :key falls through rather than being sent as a key"
+      ;; OPENAI_API_KEY may or may not be set in whatever shell runs the
+      ;; suite, so only assert the thing that's true either way.
+      (is (not= "" (vibe/api-key {:key ""} provider))))))
+
+(deftest strip-fences-peels-one-outer-fence
+  (testing "a plain reply is returned as-is, just trimmed"
+    (is (= "(+ 1 2)" (vibe/strip-fences "  (+ 1 2)\n"))))
+
+  (testing "a fence with a language tag"
+    (is (= "(+ 1 2)" (vibe/strip-fences "```clojure\n(+ 1 2)\n```"))))
+
+  (testing "a fence with no language tag"
+    (is (= "(+ 1 2)" (vibe/strip-fences "```\n(+ 1 2)\n```"))))
+
+  (testing "prose before the fence is left alone -- that reply wasn't just code"
+    (is (string/starts-with? (vibe/strip-fences "Sure!\n```\n(+ 1 2)\n```")
+                             "Sure!"))))
+
+(deftest find-vibe-form-locates-the-call-site
+  (let [text "(defn f [] (vibe \"a thing\"))"
+        open (string/index-of text "(vibe")
+        ;; the text ends "))" -- the inner close (the vibe form's own) is
+        ;; the second-to-last char, the outer one closes the defn.
+        end (dec (count text))]
+
+    (testing "point inside the form"
+      (is (= [open end] (vibe/find-vibe-form text (+ open 3)))))
+
+    (testing "point on the opening paren"
+      (is (= [open end] (vibe/find-vibe-form text open))))
+
+    (testing "point just past the closing paren, like C-x C-e"
+      (is (= [open end] (vibe/find-vibe-form text end))))
+
+    (testing "point outside the form entirely"
+      (is (nil? (vibe/find-vibe-form text 2)))))
+
+  (testing "the innermost (vibe ...) wins when they nest"
+    (let [text "(vibe (str (vibe \"inner\")))"
+          inner (string/index-of text "(vibe \"inner\")")
+          [s _e] (vibe/find-vibe-form text (+ inner 2))]
+      (is (= inner s))))
+
+  (testing "a form spanning lines"
+    (let [text "(vibe\n  \"multi\n   line\")"]
+      (is (= [0 (count text)] (vibe/find-vibe-form text 3)))))
+
+  (testing "a name that merely starts with vibe is not a vibe call"
+    (is (nil? (vibe/find-vibe-form "(vibes \"x\")" 3)))
+    (is (nil? (vibe/find-vibe-form "(vibe-later \"x\")" 3))))
+
+  (testing "an unbalanced form has no match to splice over"
+    (is (nil? (vibe/find-vibe-form "(vibe \"x\"" 3)))))
+
+(deftest context-text-marks-the-call-site
+  (let [text "(defn f [] (vibe \"a thing\"))"
+        [s e] (vibe/find-vibe-form text 14)]
+    (testing "the call is swapped for the marker, the rest survives verbatim"
+      (is (= (str "(defn f [] " vibe/marker ")")
+             (vibe/context-text text s e))))))
+
+(deftest user-message-carries-the-file-and-the-column
+  (let [msg (vibe/user-message "make it go" {:text (str "  " vibe/marker)
+                                             :filename "foo.lg"
+                                             :column 2})]
+    (is (string/includes? msg "make it go"))
+    (is (string/includes? msg "foo.lg"))
+    (is (string/includes? msg vibe/marker))
+    (is (string/includes? msg "column 2")))
+
+  (testing "no buffer context (a bare REPL call) says so instead of lying"
+    (let [msg (vibe/user-message "make it go" nil)]
+      (is (string/includes? msg "make it go"))
+      (is (not (string/includes? msg vibe/marker))))))
+
+(deftest splice-offsets-replaces-across-lines-in-one-undo-step
+  (let [s (buf/new-state nil ["(defn f []" "  (vibe \"x\"))"])
+        text (buf/buffer-text s)
+        [start end] (vibe/find-vibe-form text 15)
+        s* (vibe/splice-offsets s start end "(+ 1\n     2)")]
+
+    (testing "the replacement lands in place of the form"
+      (is (= ["(defn f []" "  (+ 1" "     2))"] (:lines s*))))
+
+    (testing "point ends up right after the inserted code"
+      (is (= 2 (:cursor-row s*)))
+      (is (= 7 (:cursor-col s*))))
+
+    (testing "one undo restores the whole thing"
+      (is (= ["(defn f []" "  (vibe \"x\"))"] (:lines (buf/undo s*)))))
+
+    (testing "the buffer is marked modified"
+      (is (:modified? s*))))
+
+  (testing "a read-only buffer refuses the splice"
+    (let [s (assoc (buf/new-state nil ["(vibe \"x\")"]) :read-only? true)
+          s* (vibe/splice-offsets s 0 10 "42")]
+      (is (= ["(vibe \"x\")"] (:lines s*)))
+      (is (= "Buffer is read-only" (:message s*))))))
+
+(deftest vibe-replace-records-the-request-without-performing-it
+  (testing "point in a vibe form arms :pending-task for main.lg to run"
+    (let [s (-> (buf/new-state nil ["(vibe \"a thing\")"])
+                (assoc :cursor-col 8))
+          s* (vibe/vibe-replace s)]
+      (is (= "vibing..." (:message s*)))
+      (is (fn? (:pending-task s*)))
+      (is (= ["(vibe \"a thing\")"] (:lines s*)))))
+
+  (testing "nowhere near a vibe form"
+    (let [s* (vibe/vibe-replace (buf/new-state nil ["(+ 1 2)"]))]
+      (is (nil? (:pending-task s*)))
+      (is (string/includes? (:message s*) "No (vibe"))))))
+
+(deftest resolve-vibe-fails-safely
+  (testing "a request whose form has since moved is dropped, not misapplied"
+    (let [s (buf/new-state nil ["(+ 1 2)"])
+          s* (vibe/resolve-vibe s 0 7)]
+      (is (= ["(+ 1 2)"] (:lines s*)))
+      (is (string/includes? (:message s*) "moved"))))
+
+  (testing "an error during the call is reported, not raised"
+    ;; :provider :nope makes vibe throw before it can reach the network.
+    (let [saved @vibe/config]
+      (try
+        (swap! vibe/config assoc :provider :nope)
+        (let [s (buf/new-state nil ["(vibe \"a thing\")"])
+              s* (vibe/resolve-vibe s 0 16)]
+          (is (= ["(vibe \"a thing\")"] (:lines s*)))
+          (is (string/includes? (:message s*) "vibe error"))
+          (is (string/includes? (:message s*) "unknown vibe provider")))
+        (finally (reset! vibe/config saved))))))
+
+(deftest context-is-cleared-after-use
+  (testing "with-context always puts the atom back, even when the body throws"
+    (try (vibe/with-context {:text "x"} (fn [] (throw "boom"))) (catch e nil))
+    (is (nil? @vibe/current-context))))

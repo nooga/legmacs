@@ -28,6 +28,7 @@
             [test.buffers-test]
             [test.windows-test]
             [test.kbd-macro-test]
-            [test.acme-extension-test]))
+            [test.acme-extension-test]
+            [test.vibe-test]))
 
 (run-tests)
