@@ -270,6 +270,22 @@ Full per-file breakdown and the complete default keymap are in
   control-byte strings with `(char code)` at runtime rather than writing
   the escape literally in source; follow that pattern rather than typing
   a unicode string escape for a control character directly into a file.
+- **Don't return an `fn` literal from a conditional branch if it captures a
+  local.** let-go's AOT Go-lowering (see `build/`) hoists such a closure out
+  of the `if`/`when`/`cond` and emits it as the enclosing function's
+  unconditional `return`, leaving an empty `if {} else {}` behind -- every
+  branch then returns that one closure, sometimes over a variable the taken
+  branch never set. It is silent: `go build` only catches the cases where a
+  dead temporary survives ("declared and not used"), and the CI native-build
+  smoke step is the only thing that looks. Upstream bug:
+  nooga/let-go#766. Non-capturing closures are fine (they get lifted to
+  top-level fns). Until it's fixed, build each closure in its own small
+  named function so the branches contain *calls*, not `fn` forms -- see
+  `legmacs.modes/lifted-highlighter` and
+  `legmacs.modes.prog/marker-gated-advance`. To check a suspicious lowering:
+  `./build.sh`, then look for `if vm.IsTruthy(...) {\n} else {\n}` followed
+  by `return rt.BoxNativeFn(` in the generated file (the same pattern with a
+  `v = vm.NIL` after it is just a `cond`'s `:else nil`, and is fine).
 - **`count` and `subs` on a *string* are O(n), and `string/index-of` from
   an offset is too.** let-go strings are indexed by rune, so all three walk
   the string from the beginning; on a 96KB buffer `(count text)` measured

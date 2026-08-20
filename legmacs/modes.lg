@@ -120,6 +120,29 @@
 (defn mode-highlighter [mode-kw]
   (:highlighter (get @registry mode-kw)))
 
+;; The three shapes below are built by their own tiny functions rather than
+;; by `fn` literals sitting in the branches of the two lookups that follow.
+;; That reads about the same, and it stays correct through let-go's AOT
+;; Go-lowering (see build/), which mis-hoists a closure literal out of a
+;; conditional and returns it from every branch -- silently, unless Go
+;; happens to notice the dead temporary it leaves behind.
+
+(defn- lifted-highlighter
+  "A plain per-line highlighter in the multi-line-aware shape: same spans,
+   a carry that stays nil."
+  [h]
+  (fn [_carry line] {:spans (h line) :carry nil}))
+
+(defn- spans-dropping-advance
+  "The state-only half derived from a mode's own :highlight-line."
+  [h]
+  (fn [carry line] (:carry (h carry line))))
+
+(defn- no-carry
+  "The advance for a mode with nothing to carry across lines."
+  [_carry _line]
+  nil)
+
 (defn line-highlighter
   "`mode-kw`'s highlighter normalized to the multi-line-aware shape
    (fn [carry line] -> {:spans [...] :carry c'}), or nil if it has no
@@ -129,11 +152,8 @@
    need no changes."
   [mode-kw]
   (let [entry (get @registry mode-kw)]
-    (cond
-      (:highlight-line entry) (:highlight-line entry)
-      (:highlighter entry) (let [h (:highlighter entry)]
-                             (fn [_carry line] {:spans (h line) :carry nil}))
-      :else nil)))
+    (or (:highlight-line entry)
+        (when-let [h (:highlighter entry)] (lifted-highlighter h)))))
 
 (defn carry-advance
   "`mode-kw`'s (fn [carry line] -> carry') for lines whose spans aren't
@@ -141,11 +161,9 @@
    with the spans thrown away, else a constant nil (nothing to carry)."
   [mode-kw]
   (let [entry (get @registry mode-kw)]
-    (cond
-      (:highlight-carry entry) (:highlight-carry entry)
-      (:highlight-line entry) (let [h (:highlight-line entry)]
-                                (fn [carry line] (:carry (h carry line))))
-      :else (fn [_carry _line] nil))))
+    (or (:highlight-carry entry)
+        (when-let [h (:highlight-line entry)] (spans-dropping-advance h))
+        no-carry)))
 
 (defn mode-after-command [mode-kw]
   (:after-command (get @registry mode-kw)))

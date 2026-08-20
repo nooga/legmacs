@@ -291,22 +291,36 @@
   (vec (concat (or block-comment [])
                (mapcat (fn [m] [(:open m) (:close m)]) (or multiline-strings [])))))
 
+(defn- nothing-to-carry
+  "The advance for a language with no multi-line constructs at all."
+  [_carry _line]
+  nil)
+
+(defn- marker-gated-advance
+  "The advance for a language that has them: a substring search per marker,
+   and the real scan only when one of them is actually on the line."
+  [scan markers]
+  (fn [carry line]
+    (if (some (fn [m] (string/includes? line m)) markers)
+      (:carry (scan carry line))
+      carry)))
+
 (defn make-carry-advance
   "Build the :highlight-carry half of the mode (see legmacs.modes/
    register-mode!): the carry after `line`, without building its spans.
    Lines with no carry marker on them -- nearly all of them -- pass the
    carry straight through after one substring search per marker, so
    scrolling to the bottom of a big file doesn't cost a full re-scan of
-   everything above it."
+   everything above it.
+
+   The two shapes are separate functions, not `fn` literals in this `if`'s
+   branches, for the reason legmacs.modes documents at lifted-highlighter:
+   let-go's AOT Go-lowering hoists a closure literal out of a conditional."
   [spec]
-  (let [scan (make-line-scanner spec)
-        markers (carry-markers spec)]
+  (let [markers (carry-markers spec)]
     (if (empty? markers)
-      (fn [_carry _line] nil)
-      (fn [carry line]
-        (if (some (fn [m] (string/includes? line m)) markers)
-          (:carry (scan carry line))
-          carry)))))
+      nothing-to-carry
+      (marker-gated-advance (make-line-scanner spec) markers))))
 
 (defn- both-cases
   "Both-case variants of every word in `words`, for languages (SQL,
