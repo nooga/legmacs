@@ -54,7 +54,8 @@ legmacs [file...]
 ```
 
 That's a self-contained native binary, no runtime to install. Prebuilt
-tarballs for macOS and Linux (amd64/arm64) are on the
+tarballs for macOS and Linux (amd64/arm64), and for Plan 9 / 9front
+(amd64/arm), are on the
 [releases page](https://github.com/nooga/legmacs/releases/latest).
 
 ## Run from source

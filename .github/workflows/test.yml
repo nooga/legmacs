@@ -45,3 +45,19 @@ jobs:
       # same path release.yml ships. Guards against a build break landing on main.
       - name: Native build smoke
         run: ./build.sh
+
+      # The release targets the host build above can't speak for: Plan 9 has no
+      # termios (let-go's runtime drives /dev/consctl there instead), and
+      # plan9/arm is the only 32-bit target we ship, where an int-size mistake
+      # would show up. Cross-compiling both on every PR keeps them from
+      # breaking silently until release day. The AOT tree build.sh just
+      # generated is host-independent, so this is only a `go build`.
+      - name: Cross-compile smoke (plan 9)
+        run: |
+          set -euo pipefail
+          for target in plan9/amd64 plan9/arm; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "==> $os/$arch"
+            (cd build && GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+               go build -trimpath -ldflags "-s -w" -o "$RUNNER_TEMP/legmacs_${os}_${arch}" .)
+          done
