@@ -53,7 +53,13 @@ jobs:
           # with it (writes into the dir) instead of producing a file.
           stage="$RUNNER_TEMP/legmacs-stage"
           mkdir -p "$stage"
-          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+          # Plan 9 / 9front alongside the Unix targets: let-go's runtime has a
+          # real Plan 9 terminal layer (/dev/consctl raw mode, $COLS/$LINES for
+          # size), so legmacs runs there natively. Go's plan9 port covers 386,
+          # amd64 and arm (32-bit); we ship the two let-go ships, and there is
+          # no plan9/arm64 upstream to ship.
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 \
+                        plan9/amd64 plan9/arm; do
             os="${target%/*}"; arch="${target#*/}"
             echo "==> $os/$arch"
             (cd build && GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
