@@ -144,6 +144,22 @@ minor mode built on exactly those two: empty keymap, `:after-command` logs
 `:last-chord`, `:status-right` renders the log — a good template for any
 "watch keystrokes / show HUD" feature.
 
+**Indentation is one pure function plus data.** `legmacs.indent/
+indent-column` answers "what column should this line start at" for a
+language spec, and everything electric (RET, TAB, typing a closer, opening
+a bracket pair out into a block -- all in `legmacs.modes.structural`) is a
+call to it plus `set-line-indent`. Rules live in the language's own spec
+under `:indent`: `:style :absolute` counts bracket depth (C-likes, and
+self-correcting), `:style :relative` reads the previous non-blank line and
+adjusts by keyword rules (shell/Ruby/Lua, and Python's offside rule via
+`:open-suffix [":"]`), `:fn` is the escape hatch. Adding a language's
+indentation should mean adding data to its spec, not code here.
+let-go-mode deliberately doesn't go through the rule engine -- Lisp aligns
+under the enclosing form's first argument (`legmacs.modes.letgo/
+indent-column-for`), which is a different shape of answer, not a different
+rule set -- but it does share `legmacs.indent`'s edit half, so TAB behaves
+identically everywhere.
+
 **Highlighting carries state across lines, and render is what threads
 it.** A mode's `:highlight-line` is `(fn [carry line] -> {:spans :carry})`;
 the carry is opaque to render and private to the mode (prog: the block
@@ -254,6 +270,30 @@ Full per-file breakdown and the complete default keymap are in
   control-byte strings with `(char code)` at runtime rather than writing
   the escape literally in source; follow that pattern rather than typing
   a unicode string escape for a control character directly into a file.
+- **`count` and `subs` on a *string* are O(n), and `string/index-of` from
+  an offset is too.** let-go strings are indexed by rune, so all three walk
+  the string from the beginning; on a 96KB buffer `(count text)` measured
+  ~35us. A scanner that calls any of them once per character is therefore
+  quadratic in file size, which is not a subtle slowdown: one RET in a
+  commented 4,000-line Go file took **61 seconds** before
+  `legmacs.prog-syntax` was moved onto a char vector (`(vec (seq text))`
+  once, `nth` after that, markers pre-converted to char vectors, and the
+  next newline found by walking rather than by `string/index-of`). The same
+  keystroke is ~65ms now, ~10ms in a 700-line file. Any new whole-buffer
+  scan must follow that shape: convert once, pass the length in, never
+  reach for a string operation inside the loop. Per-*line* code can be
+  relaxed about it (lines are short), but that's the only exception.
+- **A per-keystroke pass shouldn't build what nobody reads.** `scan` in
+  both syntax namespaces returns a bracket-pair map and a span vector; the
+  things that run on every key press want one integer or one stack, so
+  they have their own lean passes instead (`prog-syntax/open-stack-at` and
+  `depth-at`, `lisp-syntax/open-stack-at*`, `match-for-closer` and
+  `point-in-string-or-comment-at?` in both, `lisp-syntax/ends-in-string?`
+  for the highlighter carry). They're pinned to `scan`'s answers by tests
+  in `test/prog_syntax_test.lg` -- keep it that way when changing either
+  side, since two scanners that disagree about where a string ends is
+  exactly the class of bug that produces "auto-pairing works except in
+  this one file."
 - **Reducing over an empty `(map f (concat ...))` calls the reducing fn
   once with nil.** let-go laziness bug: `(reduce f init (map g (concat
   [] [])))` invokes `f` with a nil element even though `seq`/`count`/`vec`

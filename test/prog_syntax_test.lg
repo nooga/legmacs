@@ -152,3 +152,62 @@
           upto (string/index-of text "oops")
           s (ps/scan text upto go-spec)]
       (is (true? (:in-string? s))))))
+
+;; --- the lean passes (what runs on every keystroke) ---------------------
+;;
+;; open-stack-at, depth-at, match-for-closer and
+;; point-in-string-or-comment-at? all answer questions `scan` can answer
+;; too, without building its bracket-pair map and span vector. These pin
+;; them to the same answers.
+
+(deftest open-stack-at-matches-scans-stack
+  (testing "same brackets, same order, on code with strings and comments in it"
+    (doseq [text ["func f() { if (x) { y[0]"
+                  "a { b // ) } \n c ("
+                  "s := \"({[\" ; ("
+                  "/* { ( */ {"
+                  "plain code, no brackets"]]
+      (is (= (:stack (ps/scan text (count text) go-spec))
+             (:stack (ps/open-stack-at text (count text) go-spec)))
+          text)))
+
+  (testing "depth-at agrees with counting that stack"
+    (doseq [text ["func f() { if (x) {" "{}{}{" "\"({\" (" "// {\n{"]]
+      (is (= (count (:stack (ps/scan text (count text) go-spec)))
+             (ps/depth-at text (count text) go-spec))))))
+
+(deftest match-for-closer-agrees-with-the-full-scan
+  (testing "a closer's match is the bracket it closes"
+    (let [text "func f() { g(x); }"]
+      (is (= (string/index-of text "(")
+             (ps/match-for-closer text (string/index-of text ")") go-spec)))
+      (is (= (string/index-of text "{")
+             (ps/match-for-closer text (string/last-index-of text "}") go-spec)))))
+
+  (testing "a closer inside a string or comment closes nothing"
+    (let [text "f(\"a)b\")"]
+      ;; the ) inside the string
+      (is (nil? (ps/match-for-closer text 4 go-spec)))
+      ;; ...but the real one still matches
+      (is (= 1 (ps/match-for-closer text 7 go-spec))))
+    (is (nil? (ps/match-for-closer "x // )" 5 go-spec))))
+
+  (testing "a closer with nothing open in front of it"
+    (is (nil? (ps/match-for-closer ")" 0 go-spec))))
+
+  (testing "the wrong kind of closer doesn't match"
+    (is (nil? (ps/match-for-closer "(]" 1 go-spec)))))
+
+(deftest point-in-string-or-comment-at?-matches-the-scan-based-check
+  (testing "the same answer as point-in-string-or-comment? over a full scan"
+    (doseq [[text offset] [["\"foo" 4] ["/* foo" 6] ["// foo" 6] ["(foo)" 5]
+                           ["\"done\" " 7] ["x // c\ny" 8] ["a \"b" 3]]]
+      (is (= (boolean (ps/point-in-string-or-comment? (ps/scan text offset go-spec) offset))
+             (boolean (ps/point-in-string-or-comment-at? text offset go-spec)))
+          (str (pr-str text) " @" offset))))
+
+  (testing "point right after a string's closing quote is code again"
+    (is (not (ps/point-in-string-or-comment-at? "s := \"x\"" 8 go-spec))))
+
+  (testing "point inside an unterminated string is not"
+    (is (ps/point-in-string-or-comment-at? "s := \"x" 7 go-spec))))

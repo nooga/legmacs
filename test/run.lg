@@ -15,6 +15,7 @@
             [test.prog-mode-test]
             [test.prog-syntax-test]
             [test.structural-mode-test]
+            [test.indent-test]
             [test.comment-test]
             [test.completion-test]
             [test.swiper-test]

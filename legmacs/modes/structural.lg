@@ -23,11 +23,10 @@
 
 (ns legmacs.modes.structural
   (:require [legmacs.buffer :as buf]
+            [legmacs.indent :as indent]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.modes :as modes]
             [legmacs.prog-syntax :as ps]))
-
-(def indent-width-default 2)
 
 (defn- spec-for [state] (modes/mode-syntax-spec (:mode state)))
 
@@ -49,11 +48,17 @@
           point (cond
                   (and after (ps/open-bracket? spec after)) offset
                   (and before (ps/close-bracket? spec before)) (dec offset)
-                  :else nil)]
+                  :else nil)
+          ;; the closer case -- the one that fires the instant you type a
+          ;; bracket -- only needs the innermost open bracket in front of
+          ;; point, so it skips the full scan (see ps/match-for-closer)
+          match (when point
+                  (if (ps/close-bracket? spec (char-at text point))
+                    (ps/match-for-closer text point spec)
+                    (ps/matching (ps/scan text spec) point)))]
       (assoc state :paren-match
-             (when point
-               (when-let [match (ps/matching (ps/scan text spec) point)]
-                 [(buf/row-col-of state point) (buf/row-col-of state match)]))))
+             (when match
+               [(buf/row-col-of state point) (buf/row-col-of state match)])))
     (assoc state :paren-match nil)))
 
 ;; --- auto-pairing brackets ----------------------------------------------
@@ -63,7 +68,7 @@
         offset (buf/offset-of state (:cursor-row state) (:cursor-col state))]
     {:before (char-at text (dec offset))
      :after (char-at text offset)
-     :in-str-or-comment? (ps/point-in-string-or-comment? (ps/scan text offset spec) offset)}))
+     :in-str-or-comment? (ps/point-in-string-or-comment-at? text offset spec)}))
 
 (defn- insert-pair [state open-ch close-ch]
   (if-let [spec (spec-for state)]
@@ -74,12 +79,29 @@
           (update :cursor-col dec)))
     (buf/insert-string state (str open-ch))))
 
+(defn- reindent-after-close
+  "Typing a closing bracket pulls its line back to the level of the line
+   that opened it -- but only when the closer is the first thing on the
+   line, so the `}` in `f() {}` doesn't move anything. This is the one
+   indentation rule that has to fire mid-line: by the time you press RET,
+   the closer is already in the wrong place."
+  [state spec]
+  (let [row (:cursor-row state)
+        line (nth (:lines state) row)
+        before (subs line 0 (max 0 (dec (:cursor-col state))))]
+    (if (indent/blank-line? before)
+      (indent/indent-line state row spec)
+      state)))
+
 (defn- skip-or-insert-close [state close-ch]
   (if-let [spec (spec-for state)]
-    (let [{:keys [after in-str-or-comment?]} (point-info state spec)]
-      (if (and (not in-str-or-comment?) (= after close-ch))
-        (buf/move-right state)
-        (buf/insert-string state (str close-ch))))
+    (let [{:keys [after in-str-or-comment?]} (point-info state spec)
+          state (if (and (not in-str-or-comment?) (= after close-ch))
+                  (buf/move-right state)
+                  (buf/insert-string state (str close-ch)))]
+      ;; a bracket typed inside string or comment text isn't structure, so
+      ;; it doesn't get to move the line it's on either
+      (if in-str-or-comment? state (reindent-after-close state spec)))
     (buf/insert-string state (str close-ch))))
 
 (defcommand structural-insert-paren
@@ -123,19 +145,91 @@
 
 ;; --- auto-indent --------------------------------------------------------
 
+(defn- opening-a-pair?
+  "Is point sitting between a bracket and its own closer (`{|}`), the state
+   electric-pair leaves you in the moment you type an opener? Reads the two
+   characters straight off the line rather than going through point-info,
+   whose in-string?/in-comment? answer would cost a scan of everything above
+   point -- on every RET, in every file."
+  [state spec]
+  (let [line (nth (:lines state) (:cursor-row state) "")
+        col (:cursor-col state)
+        chars (vec (seq line))
+        before (when (pos? col) (nth chars (dec col) nil))
+        after (nth chars col nil)]
+    (boolean (and before after (= after (ps/close-for spec before))))))
+
 (defcommand structural-newline-and-indent
-  "RET in auto-indent-mode: insert a newline, then indent it by paren depth
-   -- depth*indent-width spaces (see legmacs.modes.letgo/newline-and-indent,
-   generalized; :indent-width defaults to 2, overridable per :syntax-spec).
-   Plain newline when the active major mode has no :syntax-spec."
+  "RET in auto-indent-mode: open a new line and indent it by the major
+   mode's rules (see legmacs.indent). Pressing it between a bracket and its
+   closer (`{|}`, where electric-pair leaves you) opens the block out into
+   three lines, with the closer back at the opener's level and point on the
+   indented body line in between. Plain newline when the active major mode
+   has no :syntax-spec."
   [state]
   (if-let [spec (spec-for state)]
-    (let [state (buf/insert-newline state)
-          text (buf/text-before-cursor state)
-          depth (ps/depth-at text (count text) spec)
-          width (or (:indent-width spec) indent-width-default)]
-      (buf/insert-string state (apply str (repeat (* width depth) \space))))
+    (let [row (:cursor-row state)]
+      (if (opening-a-pair? state spec)
+        (let [state (buf/insert-newline (buf/insert-newline state))
+              body-row (inc row)
+              close-row (+ row 2)
+              ;; the closer first: the body line is still blank, so it is
+              ;; skipped as a base line either way, and this keeps the
+              ;; :relative styles reading the opener's line for both
+              state (indent/indent-line state close-row spec)
+              col (indent/indent-column state body-row spec)]
+          (-> (indent/set-line-indent state body-row col)
+              (assoc :cursor-row body-row :cursor-col col)))
+        (let [state (buf/insert-newline state)
+              new-row (inc row)
+              col (indent/indent-column state new-row spec)]
+          (-> (indent/set-line-indent state new-row col)
+              (assoc :cursor-row new-row :cursor-col col)))))
     (buf/insert-newline state)))
+
+(defn dedent-closing-word
+  "The word-language half of \"typing a closer re-indents its line\": in a
+   language whose blocks are words rather than brackets (:style :relative),
+   a line whose entire content is a block-closing or mid-block word --
+   Lua's `end`, shell's `fi`, Python's `else:` -- snaps back to where that
+   word belongs the moment you finish typing it, exactly the way a `}`
+   does in Go.
+
+   Deliberately narrow: it only fires on a printable keystroke (:last-chord
+   is one character, so undo and cursor motion never move a line), only
+   while the word is the whole line, and only for words the language
+   actually declared. Type on past it -- `end` into `endpoint` -- and the
+   line stays where the keyword put it until TAB re-indents it."
+  [state]
+  (let [spec (spec-for state)
+        rules (or (:indent spec) {})
+        chord (:last-chord state)
+        row (:cursor-row state)
+        line (nth (:lines state) row "")]
+    (if (and spec
+             (= :relative (:style rules))
+             (= 1 (count (str chord)))
+             (= (:cursor-col state) (count line)))
+      (let [ws (indent/words (indent/code-text line spec))]
+        (if (and (= 1 (count ws))
+                 (or (contains? (:close-words rules) (first ws))
+                     (contains? (:mid-words rules) (first ws))))
+          (indent/indent-line state row spec)
+          state))
+      state)))
+
+(defcommand structural-indent-line
+  "TAB in auto-indent-mode: re-indent the current line to what the major
+   mode's rules say it should be, moving point to the first non-blank
+   character if it was sitting in the leading whitespace (Emacs'
+   indent-for-tab-command). This is what fixes a line the electric rules
+   couldn't see coming -- a keyword-language `end` or `else`, or anything
+   pasted in. Falls back to inserting a tab stop when the major mode has no
+   :syntax-spec."
+  [state]
+  (if-let [spec (spec-for state)]
+    (indent/indent-line state (:cursor-row state) spec)
+    (buf/insert-string state "    ")))
 
 ;; --- registration --------------------------------------------------------
 
@@ -150,6 +244,7 @@
 
 (def auto-indent-keymap (atom {}))
 (km/bind-key! auto-indent-keymap "RET" :structural-newline-and-indent)
+(km/bind-key! auto-indent-keymap "TAB" :structural-indent-line)
 
 (modes/register-minor-mode! :paren-match (atom {})
                              "paren-match: highlights the bracket at point and its match"
@@ -159,4 +254,7 @@
                              "electric-pair: auto-closes (), [], {}")
 
 (modes/register-minor-mode! :auto-indent auto-indent-keymap
-                             "auto-indent: RET indents the new line by paren depth")
+                             (str "auto-indent: RET opens an indented line (and opens out a "
+                                  "bracket pair), TAB re-indents the current one, per the "
+                                  "major mode's :indent rules")
+                             {:after-command dedent-closing-word})

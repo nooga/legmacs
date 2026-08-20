@@ -12,6 +12,7 @@
 (ns legmacs.modes.letgo
   (:require [string]
             [legmacs.buffer :as buf]
+            [legmacs.indent :as indent]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.modes :as modes]
             [legmacs.lisp-syntax :as ls]))
@@ -174,11 +175,17 @@
         point (cond
                 (and after (ls/open-bracket? after)) offset
                 (and before (ls/close-bracket? before)) (dec offset)
-                :else nil)]
+                :else nil)
+        ;; a closer's match is the innermost bracket open in front of it,
+        ;; which costs one lean pass up to point; only the open-bracket case
+        ;; needs the full scan (and its bracket-pair map) to look forward
+        match (when point
+                (if (ls/close-bracket? (char-at text point))
+                  (ls/match-for-closer text point)
+                  (ls/matching (ls/scan text) point)))]
     (assoc state :paren-match
-           (when point
-             (when-let [match (ls/matching (ls/scan text) point)]
-               [(buf/row-col-of state point) (buf/row-col-of state match)])))))
+           (when match
+             [(buf/row-col-of state point) (buf/row-col-of state match)]))))
 
 ;; --- auto-pairing brackets ----------------------------------------------
 ;;
@@ -205,9 +212,7 @@
 (def ^:private open->close-char {\( \) \[ \] \{ \}})
 
 (defn- point-in-string-or-comment? [text offset]
-  (let [scanned (ls/scan text offset)]
-    (or (:in-string? scanned)
-        (some (fn [{:keys [type end]}] (and (= type :comment) (= end offset))) (:spans scanned)))))
+  (ls/point-in-string-or-comment-at? text offset))
 
 (defn- point-info [state]
   (let [text (buf/buffer-text state)
@@ -312,19 +317,90 @@
     (catch e (assoc state :message (str "Eval error: " (ex-message e))))))
 
 ;; --- auto-indent --------------------------------------------------------
+;;
+;; Lisp doesn't indent by nesting depth, it indents by *where the enclosing
+;; form starts*: a continuation line lines up under that form's first
+;; argument, so a multi-line call reads as one call. The exception is forms
+;; with a body rather than an argument list (defn, let, when, try, ...),
+;; whose body is a fixed two columns in from the bracket. That's the whole
+;; rule below, and it's why let-go-mode doesn't use legmacs.indent's
+;; spec-driven rules (which model bracket depth and keyword blocks -- two
+;; things Lisp doesn't have): the shape of the answer is genuinely
+;; different. It shares legmacs.indent's *edit* half, though, so TAB
+;; behaves identically here and in a Go buffer.
 
-(def indent-width 2)
+(def indent-width
+  "Columns a body form's body is indented past its opening bracket."
+  2)
+
+(def ^:private body-form-prefixes ["def" "with-" "when-" "if-"])
+
+(defn- body-form?
+  "Does a form headed by `head` indent its body a flat indent-width, rather
+   than aligning under its first argument? True for the special forms, for
+   anything def-ish, and for the with-/when-/if- families a macro author
+   conventionally gives a body to."
+  [head]
+  (boolean
+   (or (contains? special-forms head)
+       (contains? #{"testing" "binding" "condp" "doto" "future" "delay" "comment"} head)
+       (some (fn [p] (string/starts-with? head p)) body-form-prefixes))))
+
+(def ^:private token-stop?
+  #{\( \) \[ \] \{ \} \" \; \space \tab \,})
+
+(defn- token-at
+  "[start end] of the token beginning at or after column `col` of `line`,
+   or nil if the rest of the line is blank (or only a comment)."
+  [line col]
+  (let [chars (vec (seq line))
+        n (count chars)
+        start (loop [i col]
+                (if (and (< i n) (contains? #{\space \tab \,} (nth chars i))) (recur (inc i)) i))]
+    (when (and (< start n) (not= \; (nth chars start)))
+      [start (loop [i start]
+               (if (and (< i n) (not (contains? token-stop? (nth chars i)))) (recur (inc i)) i))])))
+
+(defn indent-column-for
+  "The column line `row` should start at: aligned to the innermost form
+   still open above it. A `[` or `{` literal aligns one past the bracket, a
+   body form indents indent-width past it, and anything else aligns under
+   the first argument on the opener's own line (falling back to one past
+   the bracket when the opener ends its line)."
+  [state row]
+  (let [text (buf/buffer-text state)
+        offset (buf/offset-of state row 0)]
+    (if-let [[open-ch open-offset] (ls/innermost-open-before text offset)]
+      (let [[open-row open-col] (buf/row-col-of state open-offset)
+            line (nth (:lines state) open-row)]
+        (if (contains? #{\[ \{} open-ch)
+          (inc open-col)
+          (if-let [[head-start head-end] (token-at line (inc open-col))]
+            (if (body-form? (subs line head-start head-end))
+              (+ open-col indent-width)
+              (if-let [[arg-start _] (token-at line head-end)]
+                arg-start
+                (+ open-col indent-width)))
+            (inc open-col))))
+      0)))
 
 (defcommand newline-and-indent
-  "RET in let-go-mode: insert a newline, then indent it by paren depth --
-   depth*indent-width spaces, not column-aligned to the opening form (a
-   simpler rule than real Lisp indenters use, but a lot less code, and
-   still gets the common case -- nested defn/let/if bodies -- right)."
+  "RET in let-go-mode: open a new line, indented to line up with the form
+   it sits inside (see indent-column-for)."
   [state]
-  (let [state (buf/insert-newline state)
-        text (buf/text-before-cursor state)
-        depth (ls/depth-at text (count text))]
-    (buf/insert-string state (apply str (repeat (* indent-width depth) \space)))))
+  (let [row (:cursor-row state)
+        state (buf/insert-newline state)
+        new-row (inc row)
+        col (indent-column-for state new-row)]
+    (-> (indent/set-line-indent state new-row col)
+        (assoc :cursor-row new-row :cursor-col col))))
+
+(defcommand lisp-indent-line
+  "TAB in let-go-mode: re-indent the current line to line up with the form
+   it's inside, moving point to the first non-blank character if it was in
+   the leading whitespace."
+  [state]
+  (indent/set-line-indent state (:cursor-row state) (indent-column-for state (:cursor-row state))))
 
 ;; --- expand-region / contract-region -------------------------------------
 ;;
@@ -389,6 +465,7 @@
 (km/bind-key! keymap "C-j" :eval-print-last-sexp)
 (km/bind-key! keymap "C-c C-e" :eval-buffer)
 (km/bind-key! keymap "RET" :newline-and-indent)
+(km/bind-key! keymap "TAB" :lisp-indent-line)
 (km/bind-key! keymap "C-c e" :expand-region)
 (km/bind-key! keymap "C-c u" :contract-region)
 (km/bind-key! keymap "(" :auto-insert-paren)

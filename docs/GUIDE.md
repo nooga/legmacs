@@ -100,8 +100,10 @@ Files indented with real tabs (Go, Makefiles) display with each tab
 expanded to the next 4-column stop — `(reset! legmacs.render/tab-width 8)`
 in your init changes that — and any other control character in a file
 shows as caret notation (`^[`, `^M`, ...) rather than reaching the
-terminal raw. TAB the key still inserts spaces (`tab-insert`); this is
-about displaying what's already in the file.
+terminal raw. This is about displaying what's already in the file; TAB the
+key inserts spaces (`tab-insert`) in an ordinary buffer, and re-indents the
+current line in one that has a major mode with indent rules (see
+[Indentation](#indentation)).
 
 Completing prompts (`M-x`, `C-x C-f`, `C-x C-s`, `C-x C-w`, `C-x b`) show a
 live, vertico-style vertical list that narrows as you type. Matching is
@@ -218,7 +220,8 @@ forms that aren't also valid let-go:
 | `C-x C-e` | evaluate the s-expression before point, show the result in the echo area |
 | `C-j` | evaluate the s-expression before point, insert the result right there |
 | `C-c C-e` | evaluate the whole buffer |
-| `RET` | newline, auto-indented by paren depth |
+| `RET` | newline, aligned under the form it's inside |
+| `TAB` | re-indent the current line the same way |
 | `C-c e` | expand the selection outward (word → sexp → next sexp up → ...) |
 | `C-c u` | contract the selection back in, undoing the last expand |
 | `(` / `[` / `{` | insert the matching closer too, point left between them |
@@ -262,6 +265,20 @@ closing every bracket you open immediately, "is the input complete" has to
 be judged from the text *before point*, not the whole line -- otherwise
 the auto-inserted closer sitting after point would make every half-typed
 form look finished the moment its first bracket goes in.
+
+Indentation is Lisp's own rule rather than a nesting count: a continuation
+line lines up under the enclosing form's first argument, so a multi-line
+call reads as one call, while forms with a body rather than an argument
+list (`defn`, `let`, `when`, `try`, anything def-ish or `with-`/`when-`/
+`if-`-shaped) indent a flat two columns in from their bracket. `RET` uses
+it, and `TAB` re-indents the line you're on.
+
+```clojure
+(println "a"
+         "b")        ; aligned under the first argument
+(defn foo [x]
+  (inc x))           ; body form: two in from the (
+```
 
 Syntax highlighting (strings, comments, a curated set of special-form
 names), paren matching, auto-indent, and expand-region all share one
@@ -359,7 +376,7 @@ are matched case-insensitively (`register-prog-mode!`'s callers just widen
 `legmacs/modes/prog.lg`) since real-world SQL/Dockerfiles mix casing.
 
 Every language in the pack also gets paren matching, auto-paired brackets,
-and depth-based auto-indent for free -- the same three features
+and auto-indent for free -- the same three features
 let-go-mode has always had, generalized instead of reimplemented per
 language. [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) is a
 full-buffer scanner like `legmacs.lisp-syntax`, but spec-driven (the exact
@@ -379,6 +396,69 @@ older, hand-written versions of all three (built on `legmacs.lisp-syntax`,
 which additionally understands Lisp character literals like `\(` --
 genuinely Lisp-specific structure the generic scanner doesn't model) rather
 than switching to the generic ones.
+
+#### Indentation
+
+`:auto-indent` binds two keys: `RET` opens a new line already indented, and
+`TAB` re-indents the line point is on (moving point to the first non-blank
+character if it was in the leading whitespace, like Emacs'
+`indent-for-tab-command`). Two more moments indent without being asked:
+typing a closing bracket pulls its line back to its opener's level when
+that bracket is the first thing on the line, and pressing `RET` between a
+bracket and its closer -- exactly where auto-pairing leaves point -- opens
+the block out into three lines, with the closer back at the opener's
+level:
+
+```
+func f() {|}      ->      func f() {
+                              |
+                          }
+```
+
+Where a line *should* start is one pure function,
+`legmacs.indent/indent-column`, and the rules it follows are data in the
+language's own spec, under `:indent`. There are two base styles and an
+escape hatch:
+
+- **`:style :absolute`** (the default) -- indentation is bracket nesting
+  depth, counted by `legmacs.prog-syntax` over everything above the line.
+  Right for C, Go, Rust, JS, Java and friends, and self-correcting: one
+  badly indented line doesn't drag the rest of the file with it.
+- **`:style :relative`** -- indentation is the previous non-blank line's own
+  indentation, adjusted by what that line did and what this line starts
+  with. The only thing that works for languages whose blocks aren't
+  brackets: shell's `if`/`then`/`fi`, Ruby's `def`/`end`, Lua's
+  `function`/`end`, and Python, where the indentation *is* the syntax and
+  can only be read off the line above.
+- **`:fn (fn [state row spec] -> column)`** -- full control, for rules that
+  don't fit either.
+
+The rule keys, all optional, all matched against the line with its strings
+and comments blanked out (so an `end` inside a comment closes nothing):
+
+| Key | Meaning |
+|---|---|
+| `:open-first` | the line's **first** word opens a block (Ruby's `if`, which is also a statement modifier at the *end* of a line) |
+| `:open-last` | the line's **last** word opens one (shell's `then`, `do`) |
+| `:open-words` | the word opens one wherever it appears (Lua's `function`, buried behind `local`) |
+| `:open-suffix` | the line's code ends with this literal (Python's and YAML's `:`) |
+| `:close-words` | closes a block wherever it appears, and dedents a line that starts with one (`end`, `fi`, `done`) |
+| `:mid-words` | dedents its own line without changing depth, then opens its body again -- `else`, `elsif`, `when`, a switch's `case` |
+| `:outdent-after` | `:relative` only: a line starting with one of these pulls the *next* line back (Python's `return`, `pass`, `break`) |
+| `:width` | columns per level, overriding the spec's `:indent-width` |
+
+A line opens at most one level, and a line that also closes one (Lua's
+`if x then y() end`) opens none -- which is what stops one-liners from
+dragging everything after them to the right.
+
+So go-mode says `{:mid-words #{"case" "default"}}` and gets gofmt's switch
+layout; python-mode says `{:style :relative :open-suffix [":"] :mid-words
+#{"else" "elif" "except" "finally"} :outdent-after #{"return" "pass" ...}}`
+and gets the offside rule. In a `:relative` language, finishing a closing
+word on a line of its own (`end`, `fi`, `else:`) snaps that line back
+immediately -- the word-language version of typing `}`. Type on past it
+(`end` into `endpoint`) and the line stays where the keyword put it until
+`TAB`; that's the same bargain Emacs' `electric-indent-mode` makes.
 
 ### CRUTCH mode (vi-style modal editing)
 
@@ -544,13 +624,14 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/commands.lg`](../legmacs/commands.lg) | The built-in commands, defined with `defcommand`. |
 | [`legmacs/bindings.lg`](../legmacs/bindings.lg) | The default keymap, defined with `bind-key!`. |
 | [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a line highlighter (stateless, or carrying state across lines for multi-line constructs), an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
+| [`legmacs/indent.lg`](../legmacs/indent.lg) | Where should this line start? One pure function driven by the language's `:indent` rules (bracket depth, or the line above plus keyword rules, or the language's own `:fn`), plus the edit that applies the answer without losing point. |
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |
-| [`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg) | Three generic minor modes -- `:paren-match`, `:electric-pair`, `:auto-indent` -- driven by whatever `:syntax-spec` the buffer's major mode declares; no-op (plain newline/self-insert) when it has none. `legmacs.modes/switch-to-mode` auto-enables all three for any major mode with a spec, so the whole language pack gets them by default. |
+| [`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg) | Three generic minor modes -- `:paren-match`, `:electric-pair`, `:auto-indent` (`RET`, `TAB`, dedent-on-closer, and opening a bracket pair out into a block) -- driven by whatever `:syntax-spec` the buffer's major mode declares; no-op (plain newline/self-insert) when it has none. `legmacs.modes/switch-to-mode` auto-enables all three for any major mode with a spec, so the whole language pack gets them by default. |
 | [`legmacs/modes/crutch.lg`](../legmacs/modes/crutch.lg) | CRUTCH: vi-style modal editing as a bundled minor mode (`M-x crutch-mode`). A worked example of the minor-mode/`:keymap`-fn/`:suppress-self-insert?` machinery. |
 | [`legmacs/modes/keycast.lg`](../legmacs/modes/keycast.lg) | keycast: a right-aligned live keystroke preview (`M-x keycast-mode`). A pure observer minor mode built on `:last-chord` + `:status-right`. |
 | [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (see `C-h`/`describe-bindings`). Highlight-only, like markdown-mode. |

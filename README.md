@@ -10,7 +10,7 @@ configuring legmacs are the same activity.
 
 ![legmacs](legmacs.gif)
 
-It's small. About 5,000 lines of Lisp for the whole editor, bundled modes
+It's small. About 5,300 lines of Lisp for the whole editor, bundled modes
 included. For that, it does a lot more than I expected it would when I
 started:
 
@@ -20,9 +20,14 @@ started:
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
 - syntax highlighting for 20+ languages out of the box, plus paren
-  matching, auto-closing brackets, and depth-based auto-indent for all of
+  matching, auto-closing brackets, and per-language auto-indent for all of
   them (see [Language support](#language-support)) -- and it's a one-call
   `register-prog-mode!` to add your own
+- indentation that knows the language: bracket depth for C-likes, the line
+  above plus keyword rules for shell/Ruby/Lua, the offside rule for Python,
+  align-under-the-form for Lisp. `TAB` re-indents a line, typing a closer
+  pulls its line back, and `RET` between a bracket and its closer opens the
+  block out
 - in-process eval (`C-x C-e` / `C-j`), because it's a Lisp editing a Lisp in
   the very same runtime, so `*scratch*` is a live REPL over the editor
   itself -- and since let-go is close enough to Clojure's reader syntax,

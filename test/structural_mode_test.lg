@@ -79,12 +79,12 @@
       (is (= 1 (:cursor-col s))))))
 
 (deftest auto-indent-generic
-  (testing "indents the new line by paren depth * the spec's :indent-width (go-mode defaults to 2)"
+  (testing "indents the new line by paren depth * the spec's :indent-width (go-mode asks for 4)"
     (let [s (-> (at-end (buf/new-state nil ["func foo() {"]))
                 (modes/switch-to-mode :go)
                 (dispatch/dispatch "RET"))]
-      (is (= ["func foo() {" "  "] (:lines s)))
-      (is (= 2 (:cursor-col s)))))
+      (is (= ["func foo() {" "    "] (:lines s)))
+      (is (= 4 (:cursor-col s)))))
 
   (testing "depth 0 (top level) indents nothing"
     (let [s (-> (at-end (buf/new-state nil ["foo()"]))
@@ -96,7 +96,7 @@
     (let [s (-> (at-end (buf/new-state nil ["func foo() { // {"]))
                 (modes/switch-to-mode :go)
                 (dispatch/dispatch "RET"))]
-      (is (= "  " (nth (:lines s) 1)))))
+      (is (= "    " (nth (:lines s) 1)))))
 
   (testing "RET with no :syntax-spec is a plain newline"
     (modes/register-mode! :test-structural-ai-no-spec (atom {}) "no spec")
@@ -105,3 +105,143 @@
                 (modes/enable-minor-mode :auto-indent)
                 (dispatch/dispatch "RET"))]
       (is (= ["(foo" ""] (:lines s))))))
+
+;; --- the electric half: RET, TAB, and typing a closer -------------------
+
+(defn- type-keys [state ks]
+  (reduce (fn [st k] (dispatch/dispatch st k)) state ks))
+
+(defn- chars-of [text] (vec (map str (seq text))))
+
+(deftest ret-between-a-pair-opens-the-block
+  (testing "RET where electric-pair left point ({|}) splits the pair over three lines"
+    (let [s (-> (at-end (buf/new-state nil ["func f() "]))
+                (modes/switch-to-mode :go)
+                (type-keys ["{" "RET"]))]
+      (is (= ["func f() {" "    " "}"] (:lines s)))
+      ;; point lands on the body line, past its indentation
+      (is (= [1 4] [(:cursor-row s) (:cursor-col s)]))))
+
+  (testing "nested: the inner closer comes back to the inner opener's level"
+    (let [s (-> (at-end (buf/new-state nil ["func f() "]))
+                (modes/switch-to-mode :go)
+                (type-keys (concat ["{" "RET"] (chars-of "if (x) ") ["{" "RET"])))]
+      (is (= ["func f() {" "    if (x) {" "        " "    }" "}"] (:lines s))))))
+
+(deftest typing-a-closer-dedents-its-line
+  (testing "a closing brace alone on a line drops back to its opener's level"
+    (let [s (-> (buf/new-state nil ["func f() {" "    x()" "        "])
+                (assoc :cursor-row 2 :cursor-col 8)
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "}"))]
+      (is (= ["func f() {" "    x()" "}"] (:lines s)))
+      (is (= 1 (:cursor-col s)))))
+
+  (testing "a closer with code before it on the line moves nothing"
+    (let [s (-> (at-end (buf/new-state nil ["func f() {" "    x("]))
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch ")"))]
+      (is (= "    x()" (nth (:lines s) 1)))))
+
+  (testing "a bracket typed inside a string is text, and doesn't re-indent"
+    (let [s (-> (buf/new-state nil ["func f() {" "        s := \"("])
+                (assoc :cursor-row 1 :cursor-col 15)
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch ")"))]
+      (is (= "        s := \"()" (nth (:lines s) 1))))))
+
+(deftest tab-reindents-the-current-line
+  (testing "TAB pulls a mis-indented line to where the rules say it goes"
+    (let [s (-> (buf/new-state nil ["func f() {" "x()"])
+                (assoc :cursor-row 1 :cursor-col 3)
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "TAB"))]
+      (is (= ["func f() {" "    x()"] (:lines s)))
+      (is (= 7 (:cursor-col s)))))
+
+  (testing "point inside the leading whitespace ends up at the first non-blank"
+    (let [s (-> (buf/new-state nil ["func f() {" "            x()"])
+                (assoc :cursor-row 1 :cursor-col 2)
+                (modes/switch-to-mode :go)
+                (dispatch/dispatch "TAB"))]
+      (is (= "    x()" (nth (:lines s) 1)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "TAB with no :syntax-spec still just inserts a tab stop"
+    (modes/register-mode! :test-structural-tab-no-spec (atom {}) "no spec")
+    (let [s (-> (buf/new-state nil ["x"])
+                (assoc :cursor-row 0 :cursor-col 0)
+                (modes/switch-to-mode :test-structural-tab-no-spec)
+                (modes/enable-minor-mode :auto-indent)
+                (dispatch/dispatch "TAB"))]
+      (is (= ["    x"] (:lines s))))))
+
+(deftest per-language-indent-rules
+  (testing "python: a line ending in : opens a block, return closes one"
+    (let [s (-> (at-end (buf/new-state nil ["def f():"]))
+                (modes/switch-to-mode :python)
+                (type-keys (concat ["RET"] (chars-of "return 1") ["RET"] (chars-of "x"))))]
+      (is (= ["def f():" "    return 1" "x"] (:lines s)))))
+
+  (testing "shell: if/then opens, and TAB knows fi closes"
+    (let [s (-> (at-end (buf/new-state nil ["if [ -f x ]; then"]))
+                (modes/switch-to-mode :shell)
+                (type-keys (concat ["RET"] (chars-of "echo hi") ["RET"] (chars-of "fi") ["TAB"])))]
+      (is (= ["if [ -f x ]; then" "  echo hi" "fi"] (:lines s)))))
+
+  (testing "lua: else dedents itself and re-opens its body, end closes"
+    (let [s (-> (at-end (buf/new-state nil ["function f()" "  if x then" "    y()" "  "]))
+                (modes/switch-to-mode :lua)
+                (type-keys (concat (chars-of "else") ["TAB" "RET"] (chars-of "z()")
+                                   ["RET"] (chars-of "end") ["TAB"])))]
+      (is (= ["function f()" "  if x then" "    y()" "  else" "    z()" "  end"]
+             (:lines s)))))
+
+  (testing "ruby: def opens, end closes"
+    (let [s (-> (at-end (buf/new-state nil ["def f"]))
+                (modes/switch-to-mode :ruby)
+                (type-keys (concat ["RET"] (chars-of "puts 1") ["RET"] (chars-of "end") ["TAB"])))]
+      (is (= ["def f" "  puts 1" "end"] (:lines s)))))
+
+  (testing "go: a switch's case labels sit at the switch's own level"
+    (let [s (-> (at-end (buf/new-state nil ["switch x {" "    "]))
+                (modes/switch-to-mode :go)
+                (type-keys (concat (chars-of "case 1:") ["TAB" "RET"] (chars-of "y()"))))]
+      (is (= ["switch x {" "case 1:" "    y()"] (:lines s))))))
+
+(deftest a-closing-word-snaps-its-own-line-back
+  (testing "finishing `end` on a line of its own dedents it, like typing a }"
+    (let [s (-> (at-end (buf/new-state nil ["function f()" "  x()" "  "]))
+                (modes/switch-to-mode :lua)
+                (type-keys (chars-of "end")))]
+      (is (= ["function f()" "  x()" "end"] (:lines s)))))
+
+  (testing "python's else: counts too"
+    (let [s (-> (at-end (buf/new-state nil ["if x:" "    y" "    "]))
+                (modes/switch-to-mode :python)
+                (type-keys (chars-of "else:")))]
+      (is (= ["if x:" "    y" "else:"] (:lines s)))))
+
+  (testing "typing on past the keyword leaves the line where the keyword put it, and TAB fixes it"
+    ;; `end` dedents the moment it's complete; `ending` is no longer a
+    ;; closing word, but nothing pulls the line back on its own -- the same
+    ;; bargain Emacs' electric-indent makes, and why TAB exists
+    (let [s (-> (at-end (buf/new-state nil ["function f()" "  "]))
+                (modes/switch-to-mode :lua)
+                (type-keys (chars-of "ending = 1")))]
+      (is (= "ending = 1" (nth (:lines s) 1)))
+      (is (= "  ending = 1" (nth (:lines (dispatch/dispatch s "TAB")) 1)))))
+
+  (testing "only a printable keystroke moves a line -- not undo, not motion"
+    (let [s (-> (buf/new-state nil ["function f()" "  x()" "  end"])
+                (modes/switch-to-mode :lua)
+                (assoc :cursor-row 2 :cursor-col 5)
+                (dispatch/dispatch "C-a")
+                (dispatch/dispatch "C-e"))]
+      (is (= "  end" (nth (:lines s) 2)))))
+
+  (testing "a bracket language is unaffected: it has closers of its own"
+    (let [s (-> (at-end (buf/new-state nil ["func f() {" "    "]))
+                (modes/switch-to-mode :go)
+                (type-keys (chars-of "end")))]
+      (is (= "    end" (nth (:lines s) 1))))))

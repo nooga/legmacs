@@ -31,6 +31,9 @@
 ;;   :var-sigils         ["$" ...]    $name/${name}/$(name)/$@ -> :variable
 ;;   :functions?         true         name immediately before ( -> :function
 ;;   :markup-tags?       true         <tag / </tag -> :keyword (HTML, XML)
+;;   :indent-width       4            columns per level
+;;   :indent             {...}        how this language indents -- see
+;;                                    legmacs.indent for the rule vocabulary
 ;;
 ;; Still not a parser: no nesting, no heredocs, no per-language grammar
 ;; beyond the above. Cheap, predictable, and good enough for reading code.
@@ -40,9 +43,12 @@
             [legmacs.modes :as modes]))
 
 (defn- at?
-  "True if `line` has the literal substring `s` starting at index `i`."
-  [line i s]
-  (and (<= (+ i (count s)) (count line))
+  "True if `line`, whose length is `n`, has the literal substring `s`
+   starting at index `i`. `n` is passed in rather than counted here because
+   this runs once per character per marker, and let-go's `count` on a
+   *string* walks it from the start (strings are rune-indexed)."
+  [line n i s]
+  (and (<= (+ i (count s)) n)
        (= s (subs line i (+ i (count s))))))
 
 (defn- word-char? [c]
@@ -87,13 +93,13 @@
     (cond
       (>= j n) nil
       (and escape? (= \\ (nth chars j))) (recur (+ j 2))
-      (at? line j close) (+ j (count close))
+      (at? line n j close) (+ j (count close))
       :else (recur (inc j)))))
 
 (defn- multiline-at
   "The :multiline-strings entry whose :open marker sits at `i`, or nil."
-  [line i entries]
-  (some (fn [m] (when (at? line i (:open m)) m)) entries))
+  [line n i entries]
+  (some (fn [m] (when (at? line n i (:open m)) m)) entries))
 
 (defn- blank-before?
   "True if everything left of `i` on the line is whitespace -- what makes a
@@ -209,7 +215,7 @@
                   ;; Checked before line-comments: a language whose block-open
                   ;; marker starts with its line-comment marker (Lua's "--[["
                   ;; vs "--") needs the longer, more specific one to win.
-                  (and block-first (= ch block-first) (at? line i block-open))
+                  (and block-first (= ch block-first) (at? line n i block-open))
                   (if-let [close (find-close line chars n (+ i (count block-open)) block-close false)]
                     (recur close (conj spans {:style :comment :start i :end close}))
                     {:spans (conj spans {:style :comment :start i :end n})
@@ -217,8 +223,8 @@
 
                   ;; Before :string-delims, since a multi-line opener is
                   ;; routinely a run of them (Python's \"\"\").
-                  (and (contains? ml-firsts ch) (multiline-at line i multiline-strings))
-                  (let [m (multiline-at line i multiline-strings)]
+                  (and (contains? ml-firsts ch) (multiline-at line n i multiline-strings))
+                  (let [m (multiline-at line n i multiline-strings)]
                     (if-let [close (find-close line chars n (+ i (count (:open m)))
                                                (:close m) (:escape? m))]
                       (recur close (conj spans {:style :string :start i :end close}))
@@ -234,7 +240,7 @@
                       (recur gt (conj spans {:style :string :start lt :end gt}))
                       (recur end spans)))
 
-                  (and (contains? comment-firsts ch) (some (fn [m] (at? line i m)) line-comments))
+                  (and (contains? comment-firsts ch) (some (fn [m] (at? line n i m)) line-comments))
                   {:spans (conj spans {:style :comment :start i :end n}) :carry nil}
 
                   (contains? string-chars ch)
@@ -246,9 +252,9 @@
                     (recur end (conj spans {:style :keyword :start i :end end})))
 
                   (and (contains? sigil-firsts ch)
-                       (some (fn [sig] (and (at? line i sig) (scan-var line chars n i (count sig))))
+                       (some (fn [sig] (and (at? line n i sig) (scan-var line chars n i (count sig))))
                              var-sigils))
-                  (let [sig (some (fn [sig] (when (and (at? line i sig)
+                  (let [sig (some (fn [sig] (when (and (at? line n i sig)
                                                        (scan-var line chars n i (count sig)))
                                               sig))
                                   var-sigils)
@@ -345,7 +351,9 @@
    :types #{"any" "bool" "byte" "complex64" "complex128" "error" "float32"
             "float64" "int" "int8" "int16" "int32" "int64" "rune" "string"
             "uint" "uint8" "uint16" "uint32" "uint64" "uintptr"}
-   :constants #{"true" "false" "nil" "iota"}}
+   :constants #{"true" "false" "nil" "iota"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".go"])
 
 (register-prog-mode! :javascript "javascript-mode: syntax highlighting for JavaScript/TypeScript"
@@ -364,7 +372,8 @@
                "protected" "as" "satisfies"}
    :types #{"any" "bigint" "boolean" "never" "number" "object" "symbol"
             "unknown"}
-   :constants #{"true" "false" "null" "undefined" "NaN" "Infinity"}}
+   :constants #{"true" "false" "null" "undefined" "NaN" "Infinity"}
+   :indent {:mid-words #{"case" "default"}}}
   [".js" ".jsx" ".mjs" ".cjs" ".ts" ".tsx"])
 
 (register-prog-mode! :python "python-mode: syntax highlighting for Python"
@@ -382,7 +391,14 @@
                "while" "with" "yield"}
    :types #{"bool" "bytes" "dict" "float" "int" "list" "object" "set"
             "str" "tuple"}
-   :constants #{"True" "False" "None" "self"}}
+   :constants #{"True" "False" "None" "self"}
+   :indent-width 4
+   ;; The one language here whose indentation *is* its syntax: there are no
+   ;; block delimiters to count, so every line is read off the one above it.
+   :indent {:style :relative
+            :open-suffix [":"]
+            :mid-words #{"else" "elif" "except" "finally" "case"}
+            :outdent-after #{"return" "pass" "break" "continue" "raise"}}}
   [".py"])
 
 (register-prog-mode! :c "c-mode: syntax highlighting for C/C++"
@@ -403,7 +419,9 @@
    :types #{"bool" "char" "double" "float" "int" "long" "short" "signed"
             "size_t" "unsigned" "void" "int8_t" "int16_t" "int32_t"
             "int64_t" "uint8_t" "uint16_t" "uint32_t" "uint64_t"}
-   :constants #{"true" "false" "NULL" "nullptr"}}
+   :constants #{"true" "false" "NULL" "nullptr"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".c" ".h" ".cpp" ".hpp" ".cc" ".hh" ".cxx"])
 
 (register-prog-mode! :shell "shell-mode: syntax highlighting for shell scripts"
@@ -415,7 +433,15 @@
                "done" "elif" "else" "esac" "exit" "export" "fi" "for"
                "function" "if" "in" "local" "readonly" "return" "select"
                "shift" "source" "then" "time" "unset" "until" "while"}
-   :constants #{"true" "false"}}
+   :constants #{"true" "false"}
+   ;; if/then/fi and for/do/done are words, not brackets -- but a function
+   ;; body's { } still counts, which the :relative style picks up from the
+   ;; previous line's bracket delta.
+   :indent {:style :relative
+            :open-first #{"if" "for" "while" "until" "case" "select"}
+            :open-last #{"then" "do" "in"}
+            :close-words #{"fi" "done" "esac"}
+            :mid-words #{"else" "elif"}}}
   [".sh" ".bash" ".zsh"])
 
 (register-prog-mode! :rc "rc-mode: syntax highlighting for the plan 9 shell"
@@ -451,7 +477,8 @@
    :types #{"Box" "Option" "Result" "String" "Vec" "bool" "char" "f32"
             "f64" "i8" "i16" "i32" "i64" "i128" "isize" "str" "u8" "u16"
             "u32" "u64" "u128" "usize"}
-   :constants #{"true" "false" "None" "Some" "Ok" "Err"}}
+   :constants #{"true" "false" "None" "Some" "Ok" "Err"}
+   :indent-width 4}
   [".rs"])
 
 (register-prog-mode! :json "json-mode: syntax highlighting for JSON"
@@ -463,7 +490,9 @@
 (register-prog-mode! :yaml "yaml-mode: syntax highlighting for YAML"
   {:line-comments ["#"]
    :string-delims ["\"" "'"]
-   :constants #{"true" "false" "null" "yes" "no" "on" "off"}}
+   :constants #{"true" "false" "null" "yes" "no" "on" "off"}
+   ;; a bare `key:` opens a nested block; `key: value` doesn't
+   :indent {:style :relative :open-suffix [":"]}}
   [".yaml" ".yml"])
 
 (register-prog-mode! :toml "toml-mode: syntax highlighting for TOML"
@@ -481,9 +510,15 @@
    :multiline-strings [{:open "[[" :close "]]" :escape? false}]
    :functions? true
    :keywords #{"and" "break" "do" "else" "elseif" "end" "for" "function"
-               "goto" "if" "in" "local" "not" "or" "repeat" "return"
-               "then" "until" "while"}
-   :constants #{"true" "false" "nil"}}
+               "goto" "if" "in" "local" "not" "or" "repeat" "until"
+               "return" "then" "while"}
+   :constants #{"true" "false" "nil"}
+   ;; matched anywhere on the line, since `local function f()` buries its
+   ;; opener behind `local`; a line that also has an `end` opens nothing.
+   :indent {:style :relative
+            :open-words #{"function" "if" "for" "while" "repeat"}
+            :close-words #{"end" "until"}
+            :mid-words #{"else" "elseif"}}}
   [".lua"])
 
 (register-prog-mode! :ruby "ruby-mode: syntax highlighting for Ruby"
@@ -499,7 +534,16 @@
                "require" "require_relative" "rescue" "retry" "return"
                "self" "super" "then" "unless" "until" "when" "while"
                "yield"}
-   :constants #{"true" "false" "nil"}}
+   :constants #{"true" "false" "nil"}
+   ;; :open-first, not :open-words, for if/unless/while: Ruby's modifier
+   ;; forms (`return x if y`) put the same keyword at the end of a line that
+   ;; opens nothing.
+   :indent {:style :relative
+            :open-first #{"def" "class" "module" "begin" "if" "unless"
+                          "while" "until" "case" "for"}
+            :open-words #{"do"}
+            :close-words #{"end"}
+            :mid-words #{"else" "elsif" "when" "rescue" "ensure"}}}
   [".rb"])
 
 (register-prog-mode! :sql "sql-mode: syntax highlighting for SQL"
@@ -557,7 +601,8 @@
             "c_ulong" "c_ulonglong" "c_ushort" "f16" "f32" "f64" "f128"
             "i8" "i16" "i32" "i64" "i128" "isize" "noreturn" "type" "u8"
             "u16" "u32" "u64" "u128" "usize" "void"}
-   :constants #{"true" "false" "null" "undefined"}}
+   :constants #{"true" "false" "null" "undefined"}
+   :indent-width 4}
   [".zig"])
 
 (register-prog-mode! :java "java-mode: syntax highlighting for Java"
@@ -576,7 +621,9 @@
    :types #{"boolean" "byte" "char" "double" "float" "int" "long" "short"
             "String" "Integer" "Long" "Double" "Float" "Boolean" "Object"
             "List" "Map" "Set"}
-   :constants #{"true" "false" "null"}}
+   :constants #{"true" "false" "null"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".java"])
 
 (register-prog-mode! :kotlin "kotlin-mode: syntax highlighting for Kotlin"
@@ -594,7 +641,8 @@
                "typealias" "val" "var" "vararg" "when" "where" "while"}
    :types #{"Any" "Boolean" "Byte" "Char" "Double" "Float" "Int" "List"
             "Long" "Map" "Set" "Short" "String" "Unit"}
-   :constants #{"true" "false" "null"}}
+   :constants #{"true" "false" "null"}
+   :indent-width 4}
   [".kt" ".kts"])
 
 (register-prog-mode! :swift "swift-mode: syntax highlighting for Swift"
@@ -614,7 +662,9 @@
    :types #{"Any" "AnyObject" "Array" "Bool" "Character" "Dictionary"
             "Double" "Float" "Int" "Int8" "Int16" "Int32" "Int64" "Set"
             "String" "UInt" "Void"}
-   :constants #{"true" "false" "nil"}}
+   :constants #{"true" "false" "nil"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".swift"])
 
 (register-prog-mode! :csharp "csharp-mode: syntax highlighting for C#"
@@ -640,7 +690,9 @@
    :types #{"bool" "byte" "char" "decimal" "double" "float" "int" "long"
             "object" "sbyte" "short" "string" "uint" "ulong" "ushort"
             "void"}
-   :constants #{"true" "false" "null"}}
+   :constants #{"true" "false" "null"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".cs"])
 
 (register-prog-mode! :php "php-mode: syntax highlighting for PHP"
@@ -659,7 +711,9 @@
                "protected" "public" "require" "require_once" "return"
                "static" "switch" "throw" "trait" "try" "unset" "use"
                "var" "while" "xor" "yield"}
-   :constants #{"true" "false" "null"}}
+   :constants #{"true" "false" "null"}
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}}
   [".php"])
 
 (register-prog-mode! :makefile "makefile-mode: syntax highlighting for Makefiles"

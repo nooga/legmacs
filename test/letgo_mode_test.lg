@@ -176,8 +176,61 @@
                      ["\"" "("])]
       (is (= ["\"("] (:lines s))))))
 
+(deftest lisp-indentation-aligns-to-the-open-form
+  (testing "a call's continuation lines align under its first argument"
+    (let [s (at-end (buf/new-state nil ["(println \"a\""]))
+          s (lg-mode/newline-and-indent s)]
+      ;; under the "a", not two in from the paren
+      (is (= 9 (:cursor-col s)))
+      (is (= "         " (nth (:lines s) 1)))))
+
+  (testing "a body form (defn, let, when, ...) indents a flat two columns"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defn foo [x]" ""]) 1)))
+    (is (= 4 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defn foo [x]" "  (let [y 1]" ""]) 2))))
+
+  (testing "def-ish and with-/when-/if- names count as body forms too"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defcommand foo \"doc\"" ""]) 1)))
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(with-open [f x]" ""]) 1))))
+
+  (testing "[ ] and { } literals align one past the bracket"
+    (is (= 9 (lg-mode/indent-column-for
+              (buf/new-state nil ["(def xs [1 2" ""]) 1)))
+    (is (= 1 (lg-mode/indent-column-for
+              (buf/new-state nil ["{:a 1" ""]) 1))))
+
+  (testing "an opener that ends its line has nothing to align to, so body indent"
+    (is (= 2 (lg-mode/indent-column-for (buf/new-state nil ["(foo" ""]) 1))))
+
+  (testing "a comment after the head isn't something to align under"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(foo ; why" ""]) 1))))
+
+  (testing "top level is column 0"
+    (is (= 0 (lg-mode/indent-column-for (buf/new-state nil ["(foo)" ""]) 1)))))
+
+(deftest lisp-indent-line-fixes-a-line-in-place
+  (testing "TAB re-indents the current line, dragging point along with the text"
+    (let [s (-> (buf/new-state nil ["(defn foo [x]" "        (inc x))"])
+                (assoc :cursor-row 1 :cursor-col 10)
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "TAB"))]
+      (is (= ["(defn foo [x]" "  (inc x))"] (:lines s)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "point in the leading whitespace lands on the first non-blank"
+    (let [s (-> (buf/new-state nil ["(defn foo [x]" "(inc x))"])
+                (assoc :cursor-row 1 :cursor-col 0)
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "TAB"))]
+      (is (= "  (inc x))" (nth (:lines s) 1)))
+      (is (= 2 (:cursor-col s))))))
+
 (deftest newline-and-indent-cases
-  (testing "indents the new line by paren depth * 2 spaces"
+  (testing "indents a body form's body two columns in"
     (let [s (at-end (buf/new-state nil ["(defn foo [x]"]))
           s (lg-mode/newline-and-indent s)]
       (is (= ["(defn foo [x]" "  "] (:lines s)))
