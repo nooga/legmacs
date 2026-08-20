@@ -202,6 +202,38 @@
             out (r/frame s 40 12)]
         (is (string/includes? out (get r/fg-color-for :keyword)))))))
 
+(deftest multi-line-highlighter-carries-state-from-above-the-viewport
+  (testing "a construct opened offscreen still colors the visible rows"
+    (let [km (atom {})]
+      ;; a toy language: "<<" opens a block that runs until ">>"
+      (modes/register-mode! :test-render-carry km "carry test"
+                             {:highlight-line
+                              (fn [carry line]
+                                (cond
+                                  (string/includes? line "<<") {:spans [{:start 0 :end (count line) :style :string}]
+                                                                :carry :open}
+                                  (string/includes? line ">>") {:spans [{:start 0 :end (count line) :style :string}]
+                                                                :carry nil}
+                                  carry {:spans [{:start 0 :end (count line) :style :string}] :carry carry}
+                                  :else {:spans [] :carry nil}))})
+      (let [lines (vec (concat ["<< opens here"] (map (fn [i] (str "body " i)) (range 30)) [">> closes"]))
+            s (-> (buf/new-state nil lines)
+                  (modes/switch-to-mode :test-render-carry)
+                  (assoc :cursor-row 20 :cursor-col 0)
+                  (buf/ensure-visible 10 40))
+            rows (r/rows-highlight-spans s 15 3)]
+        ;; row 0 (the opener) is far above the viewport, and rows 15-17 are
+        ;; still inside the block
+        (is (= [{:start 0 :end 7 :style :string}] (nth rows 0)))
+        (is (every? (fn [spans] (= :string (:style (first spans)))) rows))
+        ;; ...and the frame really paints them
+        (is (string/includes? (r/frame s 40 12) (get r/fg-color-for :string))))
+      ;; past the closing line the carry is gone again
+      (let [s (-> (buf/new-state nil ["<< open" ">> close" "plain"])
+                  (modes/switch-to-mode :test-render-carry)
+                  (buf/ensure-visible 10 40))]
+        (is (= [] (nth (r/rows-highlight-spans s 0 3) 2)))))))
+
 (deftest paren-match-is-highlighted
   (testing ":paren-match spans both ends, even on different rows"
     (let [s (-> (buf/new-state nil ["(foo" "bar)"])

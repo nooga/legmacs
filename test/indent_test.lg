@@ -1,0 +1,145 @@
+(ns test.indent-test
+  (:require [test :refer :all]
+            [legmacs.buffer :as buf]
+            [legmacs.indent :as indent]))
+
+(def c-spec
+  {:line-comments ["//"]
+   :block-comment ["/*" "*/"]
+   :string-delims ["\"" "'"]
+   :indent-width 4
+   :indent {:mid-words #{"case" "default"}}})
+
+(def py-spec
+  {:line-comments ["#"]
+   :string-delims ["\"" "'"]
+   :indent-width 4
+   :indent {:style :relative
+            :open-suffix [":"]
+            :mid-words #{"else" "elif" "except" "finally"}
+            :outdent-after #{"return" "pass" "break" "continue" "raise"}}})
+
+(def lua-spec
+  {:line-comments ["--"]
+   :string-delims ["\"" "'"]
+   :indent {:style :relative
+            :open-words #{"function" "if" "for" "while" "repeat"}
+            :close-words #{"end" "until"}
+            :mid-words #{"else" "elseif"}}})
+
+(defn- col [lines row spec]
+  (indent/indent-column (buf/new-state nil (vec lines)) row spec))
+
+(deftest code-text-blanks-strings-and-comments
+  (testing "a keyword or bracket inside a string or comment is not structure"
+    ;; delimiters included: the whole span goes, leaving only code
+    (is (= "x =         " (indent/code-text "x = \"if end\"" lua-spec)))
+    (is (= "f(a)         " (indent/code-text "f(a) -- } end" lua-spec))))
+
+  (testing "columns are preserved, so the blanked line still lines up"
+    (let [line "  y = 'abc' -- z"]
+      (is (= (count line) (count (indent/code-text line lua-spec)))))))
+
+(deftest absolute-style-follows-bracket-depth
+  (testing "each unclosed bracket above the line is one level"
+    (is (= 0 (col ["func f() {" "" "}"] 0 c-spec)))
+    (is (= 4 (col ["func f() {" "" "}"] 1 c-spec)))
+    (is (= 8 (col ["func f() {" "  if (x) {" "" "}"] 2 c-spec))))
+
+  (testing "a line starting with a closing bracket pulls itself back out"
+    (is (= 0 (col ["func f() {" "}"] 1 c-spec)))
+    (is (= 4 (col ["func f() {" "  if (x) {" "}"] 2 c-spec))))
+
+  (testing "a closing bracket that isn't first on the line changes nothing"
+    (is (= 4 (col ["func f() {" "x() }"] 1 c-spec))))
+
+  (testing ":mid-words dedent their own line without opening or closing one"
+    ;; the switch body is one level in; `case` sits back at the switch's own
+    ;; level, and the statements under it are back at the body level
+    (is (= 0 (col ["switch (x) {" "case 1:"] 1 c-spec)))
+    (is (= 4 (col ["switch (x) {" "case 1:" "break;"] 2 c-spec))))
+
+  (testing "brackets inside strings and comments don't count"
+    (is (= 4 (col ["func f() { // {{{" "x"] 1 c-spec)))
+    (is (= 4 (col ["func f() {" "s := \"}}\"" "x"] 2 c-spec)))))
+
+(deftest relative-style-reads-the-line-above
+  (testing "the offside rule: a line ending in : opens a block"
+    (is (= 4 (col ["def f():" ""] 1 py-spec)))
+    (is (= 8 (col ["def f():" "    if x:" ""] 2 py-spec))))
+
+  (testing "a line that doesn't open anything keeps the same indentation"
+    (is (= 4 (col ["def f():" "    x = 1" ""] 2 py-spec))))
+
+  (testing ":outdent-after pulls the *next* line back"
+    (is (= 4 (col ["def f():" "    if x:" "        return 1" ""] 3 py-spec))))
+
+  (testing ":mid-words dedent themselves and then open their own body"
+    (is (= 4 (col ["def f():" "    if x:" "        y" "else:"] 3 py-spec)))
+    ;; `else:` also ends with a colon, so what follows it is indented again
+    (is (= 8 (col ["def f():" "    if x:" "        y" "    else:" ""] 4 py-spec))))
+
+  (testing "blank lines are skipped -- indentation comes from real code above"
+    (is (= 4 (col ["def f():" "    x = 1" "" "" ""] 4 py-spec))))
+
+  (testing "the first line of a buffer has nothing above it, so column 0"
+    (is (= 0 (col ["def f():"] 0 py-spec))))
+
+  (testing "an unclosed bracket on the line above opens a level too"
+    (is (= 4 (col ["foo(a," ""] 1 py-spec)))))
+
+(deftest keyword-blocks
+  (testing "an opening word anywhere on the line opens a block"
+    (is (= 2 (col ["local function f()" ""] 1 lua-spec)))
+    (is (= 4 (col ["local function f()" "  if x then" ""] 2 lua-spec))))
+
+  (testing "a line that also closes one opens nothing -- Lua's one-liners"
+    (is (= 0 (col ["if x then y() end" ""] 1 lua-spec)))
+    (is (= 2 (col ["function f()" "  if x then y() end" ""] 2 lua-spec))))
+
+  (testing "a closing word at the head of a line dedents it"
+    (is (= 0 (col ["function f()" "  x()" "end"] 2 lua-spec))))
+
+  (testing "else dedents itself and re-opens the body under it"
+    (is (= 2 (col ["function f()" "  if x then" "    y()" "else"] 3 lua-spec)))
+    (is (= 4 (col ["function f()" "  if x then" "    y()" "  else" ""] 4 lua-spec)))))
+
+(deftest width-and-the-escape-hatch
+  (testing ":indent's own :width beats the spec's :indent-width"
+    (is (= 3 (col ["func f() {" ""] 1 (assoc c-spec :indent {:width 3}))))
+    (is (= 4 (col ["func f() {" ""] 1 c-spec))))
+
+  (testing "with neither, a level is two columns"
+    (is (= 2 (col ["func f() {" ""] 1 (dissoc c-spec :indent-width :indent)))))
+
+  (testing ":fn takes over completely -- a language whose rules don't fit"
+    (let [spec (assoc c-spec :indent {:fn (fn [_state row _spec] (* 7 row))})]
+      (is (= 21 (col ["a" "b" "c" "d"] 3 spec))))))
+
+(deftest set-line-indent-moves-text-and-point-together
+  (testing "point keeps its place in the line's text"
+    (let [s (-> (buf/new-state nil ["func f() {" "x()"])
+                (assoc :cursor-row 1 :cursor-col 1)
+                (indent/set-line-indent 1 4))]
+      (is (= ["func f() {" "    x()"] (:lines s)))
+      (is (= [1 5] [(:cursor-row s) (:cursor-col s)]))))
+
+  (testing "point sitting inside the old indentation lands on the first non-blank"
+    (let [s (-> (buf/new-state nil ["func f() {" "        x()"])
+                (assoc :cursor-row 1 :cursor-col 3)
+                (indent/set-line-indent 1 4))]
+      (is (= "    x()" (nth (:lines s) 1)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "re-indenting another line leaves point where it was"
+    (let [s (-> (buf/new-state nil ["func f() {" "x()"])
+                (assoc :cursor-row 0 :cursor-col 5)
+                (indent/set-line-indent 1 4))]
+      (is (= [0 5] [(:cursor-row s) (:cursor-col s)]))))
+
+  (testing "a line already indented that way is left completely alone"
+    (let [s (buf/new-state nil ["func f() {" "    x()"])
+          s* (indent/set-line-indent s 1 4)]
+      (is (= (:lines s) (:lines s*)))
+      ;; no edit means no undo entry to step back through
+      (is (= (count (:undo s)) (count (:undo s*)))))))

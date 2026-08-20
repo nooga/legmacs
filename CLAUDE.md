@@ -81,7 +81,9 @@ exact same functions — there's no privileged built-in path.
 global bindings — `legmacs.dispatch` walks *all* applicable keymaps in
 parallel at each chord, not one keymap chosen up front. A mode can also
 supply `:highlighter` (pure per-line syntax coloring, called fresh every
-frame for visible lines only) and `:after-command` (runs after every
+frame for visible lines only) or, for a language with constructs that
+cross line boundaries, `:highlight-line` + `:highlight-carry` (see the
+highlighting paragraph below), and `:after-command` (runs after every
 dispatch while that mode is active — used for paren-matching). `legmacs/
 lisp_syntax.lg` is a single-pass bracket/string/comment scanner shared by
 paren-matching, auto-indent, expand-region, and auto-pairing in
@@ -141,6 +143,42 @@ left-aligned `:status`). `legmacs/modes/keycast.lg` is a pure *observer*
 minor mode built on exactly those two: empty keymap, `:after-command` logs
 `:last-chord`, `:status-right` renders the log — a good template for any
 "watch keystrokes / show HUD" feature.
+
+**Indentation is one pure function plus data.** `legmacs.indent/
+indent-column` answers "what column should this line start at" for a
+language spec, and everything electric (RET, TAB, typing a closer, opening
+a bracket pair out into a block -- all in `legmacs.modes.structural`) is a
+call to it plus `set-line-indent`. Rules live in the language's own spec
+under `:indent`: `:style :absolute` counts bracket depth (C-likes, and
+self-correcting), `:style :relative` reads the previous non-blank line and
+adjusts by keyword rules (shell/Ruby/Lua, and Python's offside rule via
+`:open-suffix [":"]`), `:fn` is the escape hatch. Adding a language's
+indentation should mean adding data to its spec, not code here.
+let-go-mode deliberately doesn't go through the rule engine -- Lisp aligns
+under the enclosing form's first argument (`legmacs.modes.letgo/
+indent-column-for`), which is a different shape of answer, not a different
+rule set -- but it does share `legmacs.indent`'s edit half, so TAB behaves
+identically everywhere.
+
+**Highlighting carries state across lines, and render is what threads
+it.** A mode's `:highlight-line` is `(fn [carry line] -> {:spans :carry})`;
+the carry is opaque to render and private to the mode (prog: the block
+comment or multi-line string still open; let-go: `:string`; markdown:
+`:fenced`). `render/rows-highlight-spans` folds the carry from line 0 down
+to the top of the viewport, then styles the visible rows in order -- which
+is why highlight spans are computed once per window per frame in
+`window-frame` and handed to `text-row`, instead of each row deriving its
+own. Folding the prefix is only affordable because of `:highlight-carry`,
+the state-only half: it answers "could this line change anything?" with a
+native substring search (`legmacs.modes.prog/make-carry-advance`, and
+`legmacs.lisp-syntax/ends-in-string?` for let-go, which is the cheap
+scan-free version of the same question `scan` answers) and hands the carry
+straight through when not. Skipping that -- deriving the carry by running
+the full scanner over every line above the viewport -- costs ~10x and
+shows up as lag scrolling deep into a large file. A plain stateless
+`:highlighter` still works and is auto-lifted into the same shape by
+`legmacs.modes/line-highlighter`, so a mode with nothing to carry (help,
+repl) needs no changes.
 
 **`legmacs.render` is a per-column fg/bg span compositor**, not a
 single-highlight hack — region selection, paren-match, and syntax colors
@@ -232,6 +270,46 @@ Full per-file breakdown and the complete default keymap are in
   control-byte strings with `(char code)` at runtime rather than writing
   the escape literally in source; follow that pattern rather than typing
   a unicode string escape for a control character directly into a file.
+- **Don't return an `fn` literal from a conditional branch if it captures a
+  local.** let-go's AOT Go-lowering (see `build/`) hoists such a closure out
+  of the `if`/`when`/`cond` and emits it as the enclosing function's
+  unconditional `return`, leaving an empty `if {} else {}` behind -- every
+  branch then returns that one closure, sometimes over a variable the taken
+  branch never set. It is silent: `go build` only catches the cases where a
+  dead temporary survives ("declared and not used"), and the CI native-build
+  smoke step is the only thing that looks. Upstream bug:
+  nooga/let-go#766. Non-capturing closures are fine (they get lifted to
+  top-level fns). Until it's fixed, build each closure in its own small
+  named function so the branches contain *calls*, not `fn` forms -- see
+  `legmacs.modes/lifted-highlighter` and
+  `legmacs.modes.prog/marker-gated-advance`. To check a suspicious lowering:
+  `./build.sh`, then look for `if vm.IsTruthy(...) {\n} else {\n}` followed
+  by `return rt.BoxNativeFn(` in the generated file (the same pattern with a
+  `v = vm.NIL` after it is just a `cond`'s `:else nil`, and is fine).
+- **`count` and `subs` on a *string* are O(n), and `string/index-of` from
+  an offset is too.** let-go strings are indexed by rune, so all three walk
+  the string from the beginning; on a 96KB buffer `(count text)` measured
+  ~35us. A scanner that calls any of them once per character is therefore
+  quadratic in file size, which is not a subtle slowdown: one RET in a
+  commented 4,000-line Go file took **61 seconds** before
+  `legmacs.prog-syntax` was moved onto a char vector (`(vec (seq text))`
+  once, `nth` after that, markers pre-converted to char vectors, and the
+  next newline found by walking rather than by `string/index-of`). The same
+  keystroke is ~65ms now, ~10ms in a 700-line file. Any new whole-buffer
+  scan must follow that shape: convert once, pass the length in, never
+  reach for a string operation inside the loop. Per-*line* code can be
+  relaxed about it (lines are short), but that's the only exception.
+- **A per-keystroke pass shouldn't build what nobody reads.** `scan` in
+  both syntax namespaces returns a bracket-pair map and a span vector; the
+  things that run on every key press want one integer or one stack, so
+  they have their own lean passes instead (`prog-syntax/open-stack-at` and
+  `depth-at`, `lisp-syntax/open-stack-at*`, `match-for-closer` and
+  `point-in-string-or-comment-at?` in both, `lisp-syntax/ends-in-string?`
+  for the highlighter carry). They're pinned to `scan`'s answers by tests
+  in `test/prog_syntax_test.lg` -- keep it that way when changing either
+  side, since two scanners that disagree about where a string ends is
+  exactly the class of bug that produces "auto-pairing works except in
+  this one file."
 - **Reducing over an empty `(map f (concat ...))` calls the reducing fn
   once with nil.** let-go laziness bug: `(reduce f init (map g (concat
   [] [])))` invokes `f` with a nil element even though `seq`/`count`/`vec`

@@ -28,6 +28,18 @@
 (def ^:private char-literal-stop?
   #{\( \) \[ \] \{ \} \" \\ \@ \` \~ \; \^ \space \tab \newline \return \,})
 
+(defn- newline-from
+  "Index of the first newline at or after `i` in the char vector `chars`,
+   or `n`. Walks the vector rather than asking string/index-of, which takes
+   a *string* offset: let-go indexes strings by rune, so that call walks the
+   text from the start every time -- once per comment, that turns this
+   linear scan into a quadratic one on a comment-heavy file."
+  [chars n i]
+  (loop [j i]
+    (cond (>= j n) n
+          (= \newline (nth chars j)) j
+          :else (recur (inc j)))))
+
 (defn scan
   "One pass over `text` (flat, newlines and all), stopping at `upto` (the
    whole string by default). Returns:
@@ -69,8 +81,7 @@
          (let [ch (nth chars i)]
            (cond
              (= ch \;)
-             (let [nl (string/index-of text "\n" i)
-                   end (min len (or nl len))]
+             (let [end (newline-from chars len i)]
                (recur end stack pairs (conj spans {:type :comment :start i :end end}) nil))
 
              (= ch \")
@@ -103,6 +114,35 @@
              :else
              (recur (inc i) stack pairs spans nil))))))))
 
+(defn ends-in-string?
+  "Does a line entered with in-string? = `in?` still have a string open at
+   its end? The same rules `scan` applies -- backslash escapes, ; comments,
+   \\c character literals -- with none of its bookkeeping (no spans, pairs
+   or stack), because that's all a caller threading state from line to line
+   needs, and it's the one thing that has to stay cheap: legmacs.render's
+   highlighter carry runs it over every line above the viewport, every
+   frame (see legmacs.modes.letgo/highlight-carry)."
+  [line in?]
+  (let [chars (vec (seq line))
+        n (count chars)]
+    (loop [i 0, in? in?]
+      (if (>= i n)
+        in?
+        (let [ch (nth chars i)]
+          (cond
+            in? (cond
+                  (= ch \\) (recur (+ i 2) true)
+                  (= ch \") (recur (inc i) false)
+                  :else (recur (inc i) true))
+            ;; a comment runs to end of line, and nothing in it can open a
+            ;; string, so the answer is already known
+            (= ch \;) false
+            (= ch \") (recur (inc i) true)
+            ;; character literal: the character after \ is part of it even
+            ;; when it's a quote (\"), so it can't open a string either
+            (= ch \\) (recur (+ i 2) false)
+            :else (recur (inc i) false)))))))
+
 (defn matching
   "Given a full scan (scan text, no upto) and an offset, the matching
    bracket's offset, or nil if `offset` isn't on a matched bracket."
@@ -114,19 +154,91 @@
   [scanned offset]
   (boolean (some (fn [{:keys [start end]}] (and (<= start offset) (< offset end))) (:spans scanned))))
 
+(defn open-stack-at*
+  "The brackets still open at `offset`, innermost first, as ([char offset]
+   ...), plus two answers about `offset` itself: :last-skip -- what the scan
+   was in the middle of, or had just finished, when it got there (:comment,
+   :string for one that closed right at point, :string-open for one still
+   open) -- and :code?, the shorthand for \"neither of the two that mean
+   point is inside text rather than code\".
+
+   `scan`'s :stack, without the bracket-pair map and span vector it builds
+   on the way there. Auto-indent asks for this on every RET and every TAB,
+   over everything above point, so it doesn't allocate what nobody is going
+   to read."
+  [text offset]
+  (let [chars (vec (seq text))
+        n (count chars)
+        len (min offset n)]
+    ;; every skip is capped at `len`, so a string or comment that hasn't
+    ;; closed by the time we reach point reports itself as still open
+    (loop [i 0, stack (), skip nil]
+      (if (>= i len)
+        {:stack stack
+         :last-skip skip
+         :code? (and (= i len) (not (contains? #{:comment :string-open} skip)))}
+        (let [ch (nth chars i)]
+          (cond
+            (= ch \;) (recur (newline-from chars len i) stack :comment)
+
+            (= ch \")
+            (let [[end terminated?]
+                  (loop [j (inc i)]
+                    (cond (>= j len) [len false]
+                          (= \\ (nth chars j)) (recur (+ j 2))
+                          (= \" (nth chars j)) [(inc j) true]
+                          :else (recur (inc j))))]
+              (recur end stack (if terminated? :string :string-open)))
+
+            (and (= ch \\) (< (inc i) len)) (recur (+ i 2) stack nil)
+
+            (open-bracket? ch) (recur (inc i) (cons [ch i] stack) nil)
+
+            (close-bracket? ch)
+            (recur (inc i) (if (empty? stack) stack (rest stack)) nil)
+
+            :else (recur (inc i) stack nil)))))))
+
+(defn point-in-string-or-comment-at?
+  "Whether `offset` -- point, mid-edit -- sits inside string or comment
+   text. Same answer as scanning to `offset` and reading :in-string? plus
+   \"a comment ends here\", from the lean pass above: this runs on every
+   bracket keystroke, so it doesn't build the spans that answer would
+   otherwise come from."
+  [text offset]
+  (contains? #{:comment :string-open} (:last-skip (open-stack-at* text offset))))
+
+(defn open-stack-at
+  "open-stack-at*'s stack alone, for callers that don't care whether point
+   itself is code."
+  [text offset]
+  (:stack (open-stack-at* text offset)))
+
 (defn depth-at
   "How many brackets opened before `offset` (in text) are still open at
    that point -- what auto-indent multiplies by an indent width."
   [text offset]
-  (count (:stack (scan text offset))))
+  (count (open-stack-at text offset)))
+
+(defn match-for-closer
+  "The offset of the bracket that the closing bracket at `offset` closes, or
+   nil if it closes nothing (or isn't code). The cheap half of paren
+   matching -- a closer's match is just the innermost bracket still open in
+   front of it -- and the half that runs the instant you type one."
+  [text offset]
+  (let [chars (vec (seq text))
+        ch (when (< -1 offset (count chars)) (nth chars offset))
+        {:keys [stack code?]} (open-stack-at* text offset)
+        [open-ch open-offset] (first stack)]
+    (when (and ch code? open-ch (= ch (get open->close open-ch)))
+      open-offset)))
 
 (defn innermost-open-before
   "[open-char open-offset] of the nearest bracket still open at `offset`,
-   or nil at top level. What auto-indent would use for column-aligned (as
-   opposed to depth*width) indentation, and what expand-region's first
-   step (from point, no region yet) grows into."
+   or nil at top level. What let-go-mode's auto-indent aligns to, and what
+   expand-region's first step (from point, no region yet) grows into."
   [text offset]
-  (first (:stack (scan text offset))))
+  (first (open-stack-at text offset)))
 
 (defn- matched-pairs [scanned]
   (filter (fn [[k v]] (< k v)) (:pairs scanned)))

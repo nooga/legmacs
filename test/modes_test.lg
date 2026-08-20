@@ -199,3 +199,40 @@
                 (modes/switch-to-mode :test-order-major)
                 (modes/enable-minor-mode :test-order-minor))]
       (is (= [:test-order-minor :test-order-major] (vec (modes/active-modes s)))))))
+
+(deftest line-highlighter-normalizes-both-flavours
+  (testing "a plain :highlighter is lifted into the carry shape, carry always nil"
+    (let [km (atom {})]
+      (modes/register-mode! :test-plain-hl km "plain"
+                             {:highlighter (fn [line] [{:start 0 :end (count line) :style :keyword}])})
+      (let [h (modes/line-highlighter :test-plain-hl)]
+        (is (= {:spans [{:start 0 :end 2 :style :keyword}] :carry nil} (h nil "ab")))
+        ;; whatever carry it is handed, a stateless highlighter returns none
+        (is (nil? (:carry (h :something "ab")))))
+      (is (nil? ((modes/carry-advance :test-plain-hl) :something "ab")))))
+
+  (testing ":highlight-line wins over :highlighter, and drives the default advance"
+    (let [km (atom {})]
+      (modes/register-mode! :test-carry-hl km "carry"
+                             {:highlighter (fn [_line] [{:start 0 :end 1 :style :comment}])
+                              :highlight-line (fn [carry line]
+                                                {:spans [{:start 0 :end (count line) :style :string}]
+                                                 :carry (or carry :opened)})})
+      (let [h (modes/line-highlighter :test-carry-hl)]
+        (is (= :string (:style (first (:spans (h nil "abc"))))))
+        (is (= :opened (:carry (h nil "abc")))))
+      ;; no :highlight-carry declared -> derived from :highlight-line
+      (is (= :opened ((modes/carry-advance :test-carry-hl) nil "abc")))))
+
+  (testing "an explicit :highlight-carry is used instead of the derived one"
+    (let [km (atom {})]
+      (modes/register-mode! :test-cheap-carry km "cheap"
+                             {:highlight-line (fn [_carry line] {:spans [] :carry :from-spans})
+                              :highlight-carry (fn [_carry _line] :from-cheap)})
+      (is (= :from-cheap ((modes/carry-advance :test-cheap-carry) nil "x")))))
+
+  (testing "a mode with no highlighter at all has no line-highlighter and carries nothing"
+    (let [km (atom {})]
+      (modes/register-mode! :test-no-hl km "none")
+      (is (nil? (modes/line-highlighter :test-no-hl)))
+      (is (nil? ((modes/carry-advance :test-no-hl) :anything "x"))))))

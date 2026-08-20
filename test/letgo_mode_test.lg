@@ -176,8 +176,61 @@
                      ["\"" "("])]
       (is (= ["\"("] (:lines s))))))
 
+(deftest lisp-indentation-aligns-to-the-open-form
+  (testing "a call's continuation lines align under its first argument"
+    (let [s (at-end (buf/new-state nil ["(println \"a\""]))
+          s (lg-mode/newline-and-indent s)]
+      ;; under the "a", not two in from the paren
+      (is (= 9 (:cursor-col s)))
+      (is (= "         " (nth (:lines s) 1)))))
+
+  (testing "a body form (defn, let, when, ...) indents a flat two columns"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defn foo [x]" ""]) 1)))
+    (is (= 4 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defn foo [x]" "  (let [y 1]" ""]) 2))))
+
+  (testing "def-ish and with-/when-/if- names count as body forms too"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(defcommand foo \"doc\"" ""]) 1)))
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(with-open [f x]" ""]) 1))))
+
+  (testing "[ ] and { } literals align one past the bracket"
+    (is (= 9 (lg-mode/indent-column-for
+              (buf/new-state nil ["(def xs [1 2" ""]) 1)))
+    (is (= 1 (lg-mode/indent-column-for
+              (buf/new-state nil ["{:a 1" ""]) 1))))
+
+  (testing "an opener that ends its line has nothing to align to, so body indent"
+    (is (= 2 (lg-mode/indent-column-for (buf/new-state nil ["(foo" ""]) 1))))
+
+  (testing "a comment after the head isn't something to align under"
+    (is (= 2 (lg-mode/indent-column-for
+              (buf/new-state nil ["(foo ; why" ""]) 1))))
+
+  (testing "top level is column 0"
+    (is (= 0 (lg-mode/indent-column-for (buf/new-state nil ["(foo)" ""]) 1)))))
+
+(deftest lisp-indent-line-fixes-a-line-in-place
+  (testing "TAB re-indents the current line, dragging point along with the text"
+    (let [s (-> (buf/new-state nil ["(defn foo [x]" "        (inc x))"])
+                (assoc :cursor-row 1 :cursor-col 10)
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "TAB"))]
+      (is (= ["(defn foo [x]" "  (inc x))"] (:lines s)))
+      (is (= 4 (:cursor-col s)))))
+
+  (testing "point in the leading whitespace lands on the first non-blank"
+    (let [s (-> (buf/new-state nil ["(defn foo [x]" "(inc x))"])
+                (assoc :cursor-row 1 :cursor-col 0)
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "TAB"))]
+      (is (= "  (inc x))" (nth (:lines s) 1)))
+      (is (= 2 (:cursor-col s))))))
+
 (deftest newline-and-indent-cases
-  (testing "indents the new line by paren depth * 2 spaces"
+  (testing "indents a body form's body two columns in"
     (let [s (at-end (buf/new-state nil ["(defn foo [x]"]))
           s (lg-mode/newline-and-indent s)]
       (is (= ["(defn foo [x]" "  "] (:lines s)))
@@ -243,3 +296,40 @@
   (testing "contracting with nothing expanded reports itself"
     (let [s (lg-mode/contract-region (buf/new-state nil ["x"]))]
       (is (= "Nothing to contract" (:message s))))))
+
+(deftest multi-line-strings-keep-their-color
+  (testing "a string left open at end of line carries into the next one"
+    (let [rows (loop [ls ["(def banner \"first" "  second" "  last\") (def x 1)" "(println x)"]
+                      carry nil, out []]
+                 (if (empty? ls)
+                   out
+                   (let [res (lg-mode/highlight-line-carry carry (first ls))]
+                     (recur (rest ls) (:carry res) (conj out (:spans res))))))]
+      (is (= {:style :string :start 12 :end 18} (first (nth rows 0))))
+      (is (= [{:style :string :start 0 :end 8}] (nth rows 1)))
+      ;; the closing line: string up to the quote, then ordinary code again
+      (is (= {:style :string :start 0 :end 7} (first (nth rows 2))))
+      (is (some (fn [sp] (= {:style :keyword :start 10 :end 13} sp)) (nth rows 2)))
+      (is (= [] (vec (nth rows 3))))))
+
+  (testing "a quote inside a comment or a character literal opens nothing"
+    (is (nil? (:carry (lg-mode/highlight-line-carry nil "(f x) ; a \" here"))))
+    (is (nil? (:carry (lg-mode/highlight-line-carry nil "(= ch \\\")"))))))
+
+(deftest highlight-carry-is-the-cheap-half
+  (testing "it agrees with the full scanner, line for line"
+    (let [lines ["(def s \"open" "still open" "closed\")" "(inc x)" "; \" in a comment"]]
+      (is (= (loop [ls lines, carry nil, out []]
+               (if (empty? ls)
+                 out
+                 (let [c (:carry (lg-mode/highlight-line-carry carry (first ls)))]
+                   (recur (rest ls) c (conj out c)))))
+             (loop [ls lines, carry nil, out []]
+               (if (empty? ls)
+                 out
+                 (let [c (lg-mode/highlight-carry carry (first ls))]
+                   (recur (rest ls) c (conj out c)))))))))
+
+  (testing "a line with no quote on it can't change anything"
+    (is (= :string (lg-mode/highlight-carry :string "(no quotes here)")))
+    (is (nil? (lg-mode/highlight-carry nil "(no quotes here)")))))

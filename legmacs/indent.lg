@@ -1,0 +1,231 @@
+;; legmacs.indent — how far in should this line start? One pure function,
+;; (indent-column state row spec), plus the small edit that applies its
+;; answer. Everything electric about indentation in legmacs.modes.structural
+;; (RET, TAB, and typing a closing bracket) is a call to those two.
+;;
+;; The rules live in the language's own spec map (legmacs.modes.prog's
+;; :syntax-spec) under :indent, as data, so a language declares how it
+;; indents the same way it declares its comment markers. Two base styles
+;; cover the usual classes, and an escape hatch covers the rest:
+;;
+;;   :style :absolute (default) -- indentation *is* bracket nesting depth,
+;;     counted by legmacs.prog-syntax over everything above the line. This
+;;     is right for C/Go/Rust/JS/Java/..., and it's self-correcting: one
+;;     badly indented line above doesn't drag the rest of the file with it.
+;;
+;;   :style :relative -- indentation is the previous non-blank line's own
+;;     indentation, adjusted by what that line did (opened a block, closed
+;;     one, ended with a `:`) and by what this line starts with. This is the
+;;     only thing that works for languages whose blocks aren't brackets:
+;;     shell's if/then/fi, Ruby's def/end, Lua's function/end, and Python,
+;;     where the indentation is the syntax and can only be read off the line
+;;     above.
+;;
+;;   :fn (fn [state row spec] -> column) -- full control, for a language
+;;     whose rules aren't expressible above. legmacs.modes.letgo doesn't go
+;;     through here at all (it has no :syntax-spec by design and aligns to
+;;     the open form, which is a genuinely different model), but a user's
+;;     mode can take this door without leaving the spec-driven world.
+;;
+;; The rule keys, all optional, all matched against the line with its
+;; strings and comments blanked out (so a `end` inside a comment is not a
+;; block end):
+;;
+;;   :open-first  #{"if" "def"}     line's FIRST word opens a block
+;;   :open-last   #{"then" "do"}    line's LAST word opens a block
+;;   :open-words  #{"function"}     the word anywhere on the line opens one
+;;   :open-suffix [":"]             line's code ends with this literal
+;;   :close-words #{"end" "fi"}     closes a block wherever it appears; also
+;;                                  dedents the line when it starts with one
+;;   :mid-words   #{"else" "case"}  dedents its own line without changing
+;;                                  depth -- else/elsif/when/case labels
+;;   :outdent-after #{"return"}     :relative only: a line starting with one
+;;                                  of these pulls the NEXT line back
+;;   :width n                       overrides :indent-width for indentation
+;;
+;; A line opens at most one level, and a line that also closes one (Lua's
+;; `if x then y() end`, a JS `function () { ... }` closed on the same line)
+;; opens none -- which is what keeps one-liners from dragging everything
+;; after them to the right.
+
+(ns legmacs.indent
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.prog-syntax :as ps]))
+
+(def default-width 2)
+
+(defn- spaces [n] (apply str (repeat (max 0 n) \space)))
+
+(defn- whitespace? [ch] (or (= ch \space) (= ch \tab)))
+
+(defn leading-width
+  "How many leading whitespace *characters* `line` has -- where its text
+   starts, which for space indentation is also its column."
+  [line]
+  (let [chars (vec (seq line))
+        n (count chars)]
+    (loop [i 0]
+      (if (and (< i n) (whitespace? (nth chars i))) (recur (inc i)) i))))
+
+(defn blank-line? [line] (= (leading-width line) (count line)))
+
+(defn code-text
+  "`line` with the *contents* of its strings and comments blanked to spaces,
+   so every rule below sees code only: an `end` in a comment doesn't close a
+   block, a brace in a string doesn't nest. Columns are preserved, so a
+   result can still be compared position-for-position with the raw line."
+  [line spec]
+  (let [scanned (ps/scan line spec)]
+    (reduce (fn [l {:keys [start end]}]
+              (str (subs l 0 start) (spaces (- end start)) (subs l end)))
+            line
+            (:spans scanned))))
+
+(defn- word-char? [ch]
+  (let [c (int ch)]
+    (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57) (= c 95))))
+
+(defn words
+  "The identifier-ish tokens of `code`, in order."
+  [code]
+  (let [chars (vec (seq code))
+        n (count chars)]
+    (loop [i 0, out []]
+      (cond
+        (>= i n) out
+        (word-char? (nth chars i))
+        (let [j (loop [j i] (if (and (< j n) (word-char? (nth chars j))) (recur (inc j)) j))]
+          (recur j (conj out (subs code i j))))
+        :else (recur (inc i) out)))))
+
+(defn- first-char
+  "The first non-whitespace character of `code`, or nil if it has none."
+  [code]
+  (let [i (leading-width code)]
+    (when (< i (count code)) (nth (vec (seq code)) i))))
+
+(defn- brackets-of [spec] (or (:brackets spec) {\( \) \[ \] \{ \}}))
+
+(defn bracket-delta
+  "Brackets opened minus brackets closed on one line of code."
+  [code spec]
+  (let [open (brackets-of spec)
+        close (set (vals open))]
+    (reduce (fn [d ch] (cond (contains? open ch) (inc d)
+                             (contains? close ch) (dec d)
+                             :else d))
+            0
+            (vec (seq code)))))
+
+(defn- closes-block?
+  "Does this line close a block -- a :close-words word anywhere on it?"
+  [ws rules]
+  (boolean (some (fn [w] (contains? (:close-words rules) w)) ws)))
+
+(defn- opens-block?
+  "Does this line open one? Any of the four :open-* rules counts, but only
+   once, and only if the line doesn't also close a block (a one-liner like
+   Lua's `if x then y() end` leaves the next line where it was)."
+  [code ws rules]
+  (and (not (closes-block? ws rules))
+       (boolean
+        (or (contains? (:open-first rules) (first ws))
+            (contains? (:open-last rules) (last ws))
+            (some (fn [w] (contains? (:open-words rules) w)) ws)
+            (some (fn [suffix] (string/ends-with? (string/trim code) suffix))
+                  (:open-suffix rules))))))
+
+(defn- dedents-itself?
+  "Should this line pull back one level relative to its block: it starts
+   with a closing bracket, with a block-closing word, or with a mid-block
+   word (else, elsif, when, a switch's case label)?"
+  [code ws rules spec]
+  (let [ch (first-char code)]
+    (boolean
+     (or (and ch (contains? (set (vals (brackets-of spec))) ch))
+         (contains? (:close-words rules) (first ws))
+         (contains? (:mid-words rules) (first ws))))))
+
+(defn- previous-code-row
+  "The row above `row` that indentation should be read from: the nearest one
+   that isn't blank."
+  [lines row]
+  (loop [r (dec row)]
+    (cond
+      (< r 0) nil
+      (blank-line? (nth lines r)) (recur (dec r))
+      :else r)))
+
+(defn- absolute-column
+  "Bracket depth at the start of `row`, minus one level if the line pulls
+   itself back (see dedents-itself?)."
+  [state row code ws rules spec width]
+  (let [text (buf/buffer-text state)
+        depth (ps/depth-at text (buf/offset-of state row 0) spec)
+        level (- depth (if (dedents-itself? code ws rules spec) 1 0))]
+    (* width (max 0 level))))
+
+(defn- relative-column
+  "The previous non-blank line's own indentation, plus what that line did,
+   minus what this line starts with."
+  [lines prev-row code ws rules spec width]
+  (let [prev (nth lines prev-row)
+        prev-code (code-text prev spec)
+        prev-ws (words prev-code)
+        delta (bracket-delta prev-code spec)
+        base (leading-width prev)
+        bump (cond
+               (pos? delta) (* width delta)
+               ;; a line that closes brackets already sits at its own level
+               (neg? delta) 0
+               (opens-block? prev-code prev-ws rules) width
+               ;; else/elsif/when open their own body even though they
+               ;; dedented themselves
+               (contains? (:mid-words rules) (first prev-ws)) width
+               (contains? (:outdent-after rules) (first prev-ws)) (- width)
+               :else 0)
+        col (+ base bump)]
+    (max 0 (if (dedents-itself? code ws rules spec) (- col width) col))))
+
+(defn indent-column
+  "The column line `row` of `state` should start at, under `spec` (a major
+   mode's :syntax-spec). Pure: it reads the buffer, never edits it."
+  [state row spec]
+  (let [rules (or (:indent spec) {})
+        width (or (:width rules) (:indent-width spec) default-width)]
+    (if-let [f (:fn rules)]
+      (f state row spec)
+      (let [lines (:lines state)
+            line (nth lines row "")
+            code (code-text line spec)
+            ws (words code)]
+        (if (= :relative (:style rules))
+          (if-let [prev-row (previous-code-row lines row)]
+            (relative-column lines prev-row code ws rules spec width)
+            0)
+          (absolute-column state row code ws rules spec width))))))
+
+(defn set-line-indent
+  "Rewrite line `row`'s leading whitespace so its text starts at column
+   `col`. Point keeps its place in the line's *text*, and is pulled to the
+   first non-blank character when it was sitting inside the indentation
+   being rewritten. A no-op (no undo entry) when the line already looks like
+   that."
+  [state row col]
+  (let [line (nth (:lines state) row)
+        lead (leading-width line)
+        want (spaces col)]
+    (if (= want (subs line 0 lead))
+      state
+      (let [cur-row (:cursor-row state)
+            cur-col (:cursor-col state)
+            state (buf/replace-span state row 0 lead want)]
+        (if (= cur-row row)
+          (assoc state :cursor-col (if (<= cur-col lead) col (+ col (- cur-col lead))))
+          (assoc state :cursor-row cur-row :cursor-col cur-col))))))
+
+(defn indent-line
+  "set-line-indent to whatever indent-column says for `row`."
+  [state row spec]
+  (set-line-indent state row (indent-column state row spec)))

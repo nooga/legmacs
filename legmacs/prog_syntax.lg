@@ -24,24 +24,86 @@
 
 (def ^:private default-brackets {\( \) \[ \] \{ \}})
 
-(defn- at? [text i s]
-  (and (<= (+ i (count s)) (count text))
-       (= s (subs text i (+ i (count s))))))
+(defn- marker-at?
+  "Does `chars` (a char vector of length `n`) hold `marker` -- itself a
+   vector of characters -- starting at `i`?
 
-(defn- matches-any-at? [text i markers]
-  (some (fn [m] (at? text i m)) markers))
+   Char vectors, not (subs text i ...) against a string marker, and `n`
+   passed in rather than (count text): in let-go both `count` and `subs` on
+   a *string* walk it from the beginning, because a string is indexed by
+   runes rather than bytes. A scan that reaches for either once per
+   character -- which is exactly what this one would do, per marker the
+   language declares -- is quadratic in the size of the file, and it shows:
+   one RET in a commented 4,000-line file took a minute before this."
+  [chars n i marker]
+  (let [k (count marker)]
+    (and (<= (+ i k) n)
+         (loop [j 0]
+           (cond
+             (>= j k) true
+             (= (nth chars (+ i j)) (nth marker j)) (recur (inc j))
+             :else false)))))
+
+(defn- any-marker-at? [chars n i markers]
+  (some (fn [m] (marker-at? chars n i m)) markers))
+
+(defn- markers-of
+  "Marker strings from a spec as char vectors, ready for marker-at?."
+  [markers]
+  (mapv (fn [m] (vec (seq m))) markers))
+
+(defn- first-chars
+  "The set of characters any of these markers can start with -- a one-lookup
+   gate in front of the real marker test, so the overwhelmingly common
+   character that starts nothing costs a set membership check instead of a
+   closure per marker."
+  [markers]
+  (set (map (fn [m] (nth m 0)) markers)))
+
+(defn- newline-from
+  "Index of the first newline at or after `i`, or `n` if the rest of the
+   text has none -- what a line comment runs to."
+  [chars n i]
+  (loop [j i]
+    (cond (>= j n) n
+          (= \newline (nth chars j)) j
+          :else (recur (inc j)))))
 
 (defn- scan-string-span
   "From an opening delimiter `q` at `i`, honoring backslash escapes, capped
    at `len`. [end terminated?] -- terminated? is false when the string runs
-   off the end of `len` still open (see :in-string? below)."
+   off the end of `len` still open (see :in-string? below). A newline ends
+   one of these too: languages here that really do have multi-line string
+   literals declare them under :multiline-strings, so a plain delimiter
+   left unclosed at end of line is a typo, and stopping there keeps this
+   scanner's idea of what sits inside a string identical to the
+   highlighter's (legmacs.modes.prog) instead of letting one stray quote
+   swallow the rest of the file."
   [chars len i q]
   (loop [j (inc i)]
     (cond
       (>= j len) [len false]
+      (= \newline (nth chars j)) [j true]
       (and (= \\ (nth chars j)) (< (inc j) len)) (recur (+ j 2))
       (= q (nth chars j)) [(inc j) true]
       :else (recur (inc j)))))
+
+(defn- find-marker
+  "Index just past `close` (a char vector) at or after `i`, honoring
+   backslash escapes when `escape?`; nil if it doesn't occur before `len`."
+  [chars len i close escape?]
+  (loop [j i]
+    (cond
+      (>= j len) nil
+      (and escape? (= \\ (nth chars j))) (recur (+ j 2))
+      (marker-at? chars len j close) (+ j (count close))
+      :else (recur (inc j)))))
+
+(defn- multiline-at
+  "The prepared :multiline-strings entry whose :open marker sits at `i`,
+   or nil."
+  [chars n i entries]
+  (some (fn [m] (when (marker-at? chars n i (:open-v m)) m)) entries))
 
 (defn scan
   "One pass over `text`, stopping at `upto` (whole string by default),
@@ -59,12 +121,20 @@
    closes one early), so they don't need a matching flag."
   ([text spec] (scan text (count text) spec))
   ([text upto spec]
-   (let [{:keys [line-comments block-comment string-delims brackets]} spec
-         line-comments (or line-comments [])
+   (let [{:keys [line-comments block-comment string-delims multiline-strings brackets]} spec
+         line-comment-markers (markers-of (or line-comments []))
+         comment-firsts (first-chars line-comment-markers)
+         multiline-strings (mapv (fn [m] (assoc m :open-v (vec (seq (:open m)))
+                                                  :close-v (vec (seq (:close m)))))
+                                 (or multiline-strings []))
+         ml-firsts (first-chars (mapv :open-v multiline-strings))
          string-chars (set (mapcat seq (or string-delims [])))
          brackets (or brackets default-brackets)
          closers (into {} (map (fn [[o c]] [c o]) brackets))
          [block-open block-close] block-comment
+         block-open-v (when block-open (vec (seq block-open)))
+         block-close-v (when block-close (vec (seq block-close)))
+         block-first (when block-open-v (nth block-open-v 0))
          chars (vec (seq text))
          len (min upto (count chars))]
      (loop [i 0, stack (), pairs {}, spans []]
@@ -76,18 +146,26 @@
              ;; marker starts with its line-comment marker (Lua's "--[["
              ;; vs "--") needs the longer, more specific one to win --
              ;; mirrors legmacs.modes.prog/make-highlighter's same fix.
-             (and block-open (at? text i block-open))
-             (let [close-idx (string/index-of text block-close (+ i (count block-open)))]
-               (if (and close-idx (< close-idx len))
-                 (let [end (+ close-idx (count block-close))]
-                   (recur end stack pairs (conj spans {:type :comment :start i :end end})))
-                 {:pairs pairs :stack stack :in-string? false :in-comment? true
-                  :spans (conj spans {:type :comment :start i :end len})}))
+             (and block-first (= ch block-first) (marker-at? chars len i block-open-v))
+             (if-let [end (find-marker chars len (+ i (count block-open-v)) block-close-v false)]
+               (recur end stack pairs (conj spans {:type :comment :start i :end end}))
+               {:pairs pairs :stack stack :in-string? false :in-comment? true
+                :spans (conj spans {:type :comment :start i :end len})})
 
-             (matches-any-at? text i line-comments)
-             (let [nl (string/index-of text "\n" i)
-                   end (min len (or nl len))]
+             (and (contains? comment-firsts ch) (any-marker-at? chars len i line-comment-markers))
+             (let [end (newline-from chars len i)]
                (recur end stack pairs (conj spans {:type :comment :start i :end end})))
+
+             ;; Before the single-character delimiters, for the same reason
+             ;; legmacs.modes.prog's scanner checks them first: a multi-line
+             ;; opener is often a run of them (Python's triple quote).
+             (and (contains? ml-firsts ch) (multiline-at chars len i multiline-strings))
+             (let [m (multiline-at chars len i multiline-strings)
+                   end (find-marker chars len (+ i (count (:open-v m))) (:close-v m) (:escape? m))]
+               (if end
+                 (recur end stack pairs (conj spans {:type :string :start i :end end}))
+                 {:pairs pairs :stack stack :in-string? true :in-comment? false
+                  :spans (conj spans {:type :string :start i :end len})}))
 
              (contains? string-chars ch)
              (let [[end terminated?] (scan-string-span chars len i ch)]
@@ -115,11 +193,97 @@
   [scanned offset]
   (get (:pairs scanned) offset))
 
+(defn open-stack-at
+  "The brackets still open at `offset`, innermost first, as ([char offset]
+   ...), plus two answers about `offset` itself: :last-skip -- what the scan
+   was in the middle of, or had just finished, when it got there (:comment,
+   :string for one that closed right at point, :string-open for one still
+   open) -- and :code?, the shorthand for \"neither of the two that mean
+   point is inside text rather than code\".
+
+   Its own lean pass rather than `scan`'s :stack: this runs on every RET,
+   every TAB, and every closing bracket, over everything above point, while
+   `scan` builds a bracket-pair map and a span vector on the way to the same
+   answer. Same rules, none of the allocation."
+  [text offset spec]
+  (let [{:keys [line-comments block-comment string-delims multiline-strings brackets]} spec
+        line-comment-markers (markers-of (or line-comments []))
+        multiline-strings (mapv (fn [m] (assoc m :open-v (vec (seq (:open m)))
+                                                 :close-v (vec (seq (:close m)))))
+                                (or multiline-strings []))
+        string-chars (set (mapcat seq (or string-delims [])))
+        brackets (or brackets default-brackets)
+        closers (set (vals brackets))
+        [block-open block-close] block-comment
+        block-open-v (when block-open (vec (seq block-open)))
+        block-close-v (when block-close (vec (seq block-close)))
+        block-first (when block-open-v (nth block-open-v 0))
+        comment-firsts (first-chars line-comment-markers)
+        ml-firsts (first-chars (mapv :open-v multiline-strings))
+        chars (vec (seq text))
+        n (count chars)
+        stop (min offset n)]
+    ;; every skip is capped at `stop`, so a construct that hasn't closed by
+    ;; the time we reach point reports itself as still open -- which is the
+    ;; question point-in-string-or-comment-at? is really asking
+    (loop [i 0, stack (), skip nil]
+      (if (>= i stop)
+        {:stack stack
+         :last-skip skip
+         :code? (and (= i stop) (not (contains? #{:comment :string-open} skip)))}
+        (let [ch (nth chars i)]
+          (cond
+            (and block-first (= ch block-first) (marker-at? chars stop i block-open-v))
+            (recur (or (find-marker chars stop (+ i (count block-open-v)) block-close-v false) stop)
+                   stack :comment)
+
+            (and (contains? comment-firsts ch) (any-marker-at? chars stop i line-comment-markers))
+            (recur (newline-from chars stop i) stack :comment)
+
+            (and (contains? ml-firsts ch) (multiline-at chars stop i multiline-strings))
+            (let [m (multiline-at chars stop i multiline-strings)
+                  end (find-marker chars stop (+ i (count (:open-v m))) (:close-v m) (:escape? m))]
+              (recur (or end stop) stack (if end :string :string-open)))
+
+            (contains? string-chars ch)
+            (let [[end terminated?] (scan-string-span chars stop i ch)]
+              (recur end stack (if terminated? :string :string-open)))
+
+            (contains? brackets ch) (recur (inc i) (cons [ch i] stack) nil)
+            (contains? closers ch) (recur (inc i) (if (empty? stack) stack (rest stack)) nil)
+            :else (recur (inc i) stack nil)))))))
+
+(defn point-in-string-or-comment-at?
+  "Whether `offset` -- point, mid-edit -- sits inside string or comment
+   text, straight from `text` and the lean pass above. The same answer
+   point-in-string-or-comment? gives for a full `scan`, including its
+   \"the end of a comment still counts as inside it\" rule (so typing a
+   bracket at the end of a comment line doesn't auto-pair), at a fraction
+   of the cost -- and this one runs on every bracket keystroke."
+  [text offset spec]
+  (contains? #{:comment :string-open} (:last-skip (open-stack-at text offset spec))))
+
 (defn depth-at
   "How many brackets opened before `offset` (in text) are still open at that
    point -- what auto-indent multiplies by an indent width."
   [text offset spec]
-  (count (:stack (scan text offset spec))))
+  (count (:stack (open-stack-at text offset spec))))
+
+(defn match-for-closer
+  "The offset of the bracket that the closing bracket at `offset` closes, or
+   nil if it closes nothing (or isn't code). The cheap half of paren
+   matching: a closer's match is just the innermost bracket still open in
+   front of it, so this costs one lean pass up to point instead of a full
+   scan of the buffer -- and it's the half that runs the instant you *type*
+   a closing bracket."
+  [text offset spec]
+  (let [chars (vec (seq text))
+        ch (when (< -1 offset (count chars)) (nth chars offset))
+        {:keys [stack code?]} (open-stack-at text offset spec)
+        [open-ch open-offset] (first stack)]
+    (when (and ch code? open-ch
+               (= ch (get (or (:brackets spec) default-brackets) open-ch)))
+      open-offset)))
 
 (defn point-in-string-or-comment?
   "Given a scan truncated to `offset` (see scan's `upto`), whether `offset`

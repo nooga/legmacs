@@ -10,7 +10,7 @@ configuring legmacs are the same activity.
 
 ![legmacs](legmacs.gif)
 
-It's small. About 4,500 lines of Lisp for the whole editor, bundled modes
+It's small. About 5,300 lines of Lisp for the whole editor, bundled modes
 included. For that, it does a lot more than I expected it would when I
 started:
 
@@ -20,9 +20,14 @@ started:
 - a real, extensible mode system: major and minor modes, keymaps that shadow
   the global one key by key
 - syntax highlighting for 20+ languages out of the box, plus paren
-  matching, auto-closing brackets, and depth-based auto-indent for all of
+  matching, auto-closing brackets, and per-language auto-indent for all of
   them (see [Language support](#language-support)) -- and it's a one-call
   `register-prog-mode!` to add your own
+- indentation that knows the language: bracket depth for C-likes, the line
+  above plus keyword rules for shell/Ruby/Lua, the offside rule for Python,
+  align-under-the-form for Lisp. `TAB` re-indents a line, typing a closer
+  pulls its line back, and `RET` between a bracket and its closer opens the
+  block out
 - in-process eval (`C-x C-e` / `C-j`), because it's a Lisp editing a Lisp in
   the very same runtime, so `*scratch*` is a live REPL over the editor
   itself -- and since let-go is close enough to Clojure's reader syntax,
@@ -87,7 +92,17 @@ syntax. Everything else comes from one spec-driven scanner
 ([`legmacs/modes/prog.lg`](legmacs/modes/prog.lg)): syntax highlighting,
 paren matching, auto-closing brackets, and auto-indent, all from a single
 data map of comment markers, string delimiters, and keyword/type/constant
-word sets.
+word sets -- plus optional C-style `#directives`, `$variable` sigils, and
+call-site (`name(`) highlighting.
+
+Constructs that cross lines cross them correctly: a block comment, a Go raw
+string, a Python docstring, a JS template literal or a markdown code fence
+stays colored all the way down, including when the line that opened it is
+scrolled off the top of the screen. The scanner hands each line a small
+"carry" value describing what's still open (see `:highlight-line` in the
+[guide](docs/GUIDE.md)), and lines that can't possibly change it are skipped
+with a substring search, so this costs no measurable time even in a big
+file.
 
 | Language | Extensions |
 |---|---|
@@ -107,12 +122,13 @@ word sets.
 | Ruby | `.rb` |
 | Lua | `.lua` |
 | Shell | `.sh` `.bash` `.zsh` |
+| rc (plan 9) | `.rc` `rcmain` |
 | SQL | `.sql` |
 | JSON | `.json` |
 | YAML | `.yaml` `.yml` |
 | TOML | `.toml` |
 | CSS | `.css` |
-| HTML | `.html` `.htm` |
+| HTML / XML / SVG | `.html` `.htm` `.xhtml` `.xml` `.svg` |
 | Dockerfile | `Dockerfile` `.dockerfile` |
 | Makefile | `Makefile` `.mk` |
 

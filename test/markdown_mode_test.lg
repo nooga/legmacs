@@ -84,3 +84,25 @@
 
   (testing "an unmatched [ doesn't produce a span"
     (is (empty? (md/highlight-line "[no closing paren")))))
+
+(deftest fenced-blocks-color-their-body
+  (testing "everything between ``` lines is code, fences included"
+    (let [rows (loop [ls ["intro *emph*" "```sh" "rm -rf *" "echo _x_" "```" "after *emph*"]
+                      carry nil, out []]
+                 (if (empty? ls)
+                   out
+                   (let [res (md/highlight-line-carry carry (first ls))]
+                     (recur (rest ls) (:carry res) (conj out (:spans res))))))]
+      (is (= :md-italic (:style (first (nth rows 0)))))
+      (is (= [{:style :md-code :start 0 :end 5}] (nth rows 1)))
+      ;; inside the fence the inline scanner stands down: no :md-italic for
+      ;; the shell glob or the underscores
+      (is (= [{:style :md-code :start 0 :end 8}] (nth rows 2)))
+      (is (= [{:style :md-code :start 0 :end 8}] (nth rows 3)))
+      (is (= [{:style :md-code :start 0 :end 3}] (nth rows 4)))
+      (is (= :md-italic (:style (first (nth rows 5)))))))
+
+  (testing ":highlight-carry only has to look at fence lines"
+    (is (= :fenced (md/highlight-carry :fenced "rm -rf *")))
+    (is (nil? (md/highlight-carry :fenced "```")))
+    (is (= :fenced (md/highlight-carry nil "```python")))))

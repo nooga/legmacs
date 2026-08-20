@@ -269,6 +269,9 @@
    :number (fg 210 150 90)
    :keyword-literal (fg 90 200 190)
    :type (fg 180 160 220)
+   :function (fg 235 205 110)
+   :variable (fg 120 205 235)
+   :preproc (fg 205 120 190)
    :paren-match (str bold-on (fg 255 255 255))
    ;; legmacs.modes.markdown's styles
    :md-header (str bold-on (fg 235 170 60))
@@ -373,26 +376,56 @@
                              (:candidates mb))))
       [])))
 
-(defn- mode-highlight-spans-for-row
-  "Syntax spans for `buf-row` from every active mode's :highlighter --
-   computed fresh per frame, only for visible rows, since each is just a
-   pure (fn [line-text] -> spans) over one line. Painted in reverse
-   active-modes order (major first, minor modes on top) so a minor mode's
-   colors win on overlap, matching how the keymap layers shadow."
-  [state buf-row]
-  (let [line (nth (:lines state) buf-row)]
-    (mapcat (fn [mode-kw]
-              (if-let [highlighter (modes/mode-highlighter mode-kw)]
-                (highlighter line)
-                []))
-            (reverse (modes/active-modes state)))))
+(defn- mode-rows-spans
+  "One mode's syntax spans for the `n` rows starting at `first-row`, as a
+   vector of span lists (one entry per row, empty past end of buffer).
+   Multi-line aware: the mode's carry (see legmacs.modes/line-highlighter)
+   is folded through every line *above* the viewport first -- with the
+   cheap :highlight-carry half, since nobody needs those lines' spans --
+   so a string or block comment opened offscreen still colors the part of
+   itself you can actually see. A mode with no multi-line constructs
+   carries nil the whole way and pays only that fold's per-line no-op."
+  [lines first-row n mode-kw]
+  (let [highlight (modes/line-highlighter mode-kw)
+        advance (modes/carry-advance mode-kw)
+        total (count lines)
+        entry (loop [i 0, carry nil]
+                (if (or (>= i first-row) (>= i total))
+                  carry
+                  (recur (inc i) (advance carry (nth lines i)))))]
+    (loop [i first-row, carry entry, out []]
+      (if (>= i (+ first-row n))
+        out
+        (if (>= i total)
+          (recur (inc i) carry (conj out []))
+          (let [res (highlight carry (nth lines i))]
+            (recur (inc i) (:carry res) (conj out (vec (:spans res))))))))))
+
+(defn rows-highlight-spans
+  "Syntax spans for the `n` rows starting at `first-row`, one span list per
+   row, merged across every active mode's highlighter. Modes are painted in
+   reverse active-modes order (major first, minor modes on top) so a minor
+   mode's colors win on overlap, matching how the keymap layers shadow.
+   Computed once per window per frame rather than per row, because a
+   multi-line-aware highlighter has to see the rows in order."
+  [state first-row n]
+  (let [lines (:lines state)
+        modes-with-hl (vec (filter modes/line-highlighter (reverse (modes/active-modes state))))]
+    (reduce (fn [acc mode-kw]
+              (let [rows (mode-rows-spans lines first-row n mode-kw)]
+                (mapv (fn [a b] (into a b)) acc rows)))
+            (vec (repeat n []))
+            modes-with-hl)))
 
 (defn- text-row
   "One text row of a window whose left edge sits at 0-based column `x` --
    the gutter cell plus the styled visible slice, padded to exactly the
    window's text width (never wider, so side-by-side windows don't paint
-   over each other or their divider)."
-  [state x screen-row buf-row {:keys [gutter text-cols]}]
+   over each other or their divider). `syntax-spans` are this row's
+   already-computed highlighter spans (see rows-highlight-spans); they
+   arrive from the caller rather than being derived here because a
+   multi-line-aware highlighter needs the rows fed to it in order."
+  [state x screen-row buf-row {:keys [gutter text-cols]} syntax-spans]
   (let [total (count (:lines state))]
     (str (move-to (inc x) screen-row)
          (if (< buf-row total)
@@ -407,7 +440,7 @@
                  bg-spans (conv (concat (region-spans-for-row state buf-row)
                                         (paren-match-spans-for-row state buf-row)
                                         (search-match-spans-for-row state buf-row)))
-                 fg-spans (conv (concat (mode-highlight-spans-for-row state buf-row)
+                 fg-spans (conv (concat syntax-spans
                                         (paren-match-spans-for-row state buf-row)))
                  fg-arr (style-array text-cols fg-spans scroll-col)
                  bg-arr (style-array text-cols bg-spans scroll-col)]
@@ -584,9 +617,11 @@
    keeps for the whole terminal."
   [state rect active?]
   (let [{:keys [x y w h]} rect
-        wd (window-dims state rect)]
+        wd (window-dims state rect)
+        syntax (rows-highlight-spans state (:scroll-row state) (:text-rows wd))]
     (str (apply str
-                (map (fn [i] (text-row state x (+ y 1 i) (+ (:scroll-row state) i) wd))
+                (map (fn [i] (text-row state x (+ y 1 i) (+ (:scroll-row state) i) wd
+                                       (nth syntax i)))
                      (range (:text-rows wd))))
          (status-line state x (+ y h) w active?))))
 
