@@ -2,13 +2,20 @@
 ;; languages, all driven by one spec-based scanner. A language is just a
 ;; data map (comment markers, string delimiters, keyword/type/constant
 ;; word sets, and a few optional knobs below); register-prog-mode! turns
-;; it into a registered mode plus its auto-mode suffixes. A user's init.lg
-;; can add a language the exact same way:
+;; it into a registered mode plus its auto-mode suffixes and (optionally)
+;; its #! interpreter names, for scripts a suffix can't identify. A user's
+;; init.lg can add a language the exact same way:
 ;;
 ;;   (prog/register-prog-mode! :zig "zig-mode"
 ;;     {:line-comments ["//"] :string-delims ["\""]
 ;;      :keywords #{"fn" "pub" "const" ...}}
 ;;     [".zig"])
+;;
+;; and a fifth, optional argument -- interpreter names, matched against a
+;; file's #! line (legmacs.modes/register-interpreter-mode!) -- covers a
+;; script with no suffix at all, e.g. rc(1)'s own scripts below:
+;;
+;;   (prog/register-prog-mode! :rc "rc-mode" {...} [".rc" "rcmain"] ["rc"])
 ;;
 ;; Scanning is per line, but *not* memoryless: make-line-scanner returns
 ;; (fn [carry line] -> {:spans ... :carry ...}), where the carry describes a
@@ -333,22 +340,29 @@
 (defn register-prog-mode!
   "Register `mode-kw` as a major mode built from `spec` (see
    make-highlighter) and associate it with each filename suffix in
-   `suffixes`. This is the whole public surface -- the built-in languages
-   below and a user's own additions go through the same call.
-   `spec` also becomes the mode's :syntax-spec (legmacs.modes/register-mode!),
-   which is what makes legmacs.modes.structural's paren-match, electric-pair,
-   and auto-indent minor modes -- auto-enabled by legmacs.modes/switch-to-mode
-   for any major mode with a :syntax-spec -- work for this language too, for
-   free: no separate call needed to get all three tuned to it."
-  [mode-kw doc spec suffixes]
-  (modes/register-mode! mode-kw (atom {}) doc
-                         {:highlighter (make-highlighter spec)
-                          :highlight-line (make-line-scanner spec)
-                          :highlight-carry (make-carry-advance spec)
-                          :syntax-spec spec})
-  (doseq [suffix suffixes]
-    (modes/register-auto-mode! suffix mode-kw))
-  mode-kw)
+   `suffixes`, and (optional 5th arg) each interpreter name in
+   `interpreters` -- so a file a suffix can't identify (an extensionless
+   script) is still found by its #! line (legmacs.modes/
+   register-interpreter-mode!). This is the whole public surface -- the
+   built-in languages below and a user's own additions go through the same
+   call. `spec` also becomes the mode's :syntax-spec (legmacs.modes/
+   register-mode!), which is what makes legmacs.modes.structural's
+   paren-match, electric-pair, and auto-indent minor modes -- auto-enabled
+   by legmacs.modes/switch-to-mode for any major mode with a :syntax-spec
+   -- work for this language too, for free: no separate call needed to get
+   all three tuned to it."
+  ([mode-kw doc spec suffixes] (register-prog-mode! mode-kw doc spec suffixes []))
+  ([mode-kw doc spec suffixes interpreters]
+   (modes/register-mode! mode-kw (atom {}) doc
+                          {:highlighter (make-highlighter spec)
+                           :highlight-line (make-line-scanner spec)
+                           :highlight-carry (make-carry-advance spec)
+                           :syntax-spec spec})
+   (doseq [suffix suffixes]
+     (modes/register-auto-mode! suffix mode-kw))
+   (doseq [interpreter interpreters]
+     (modes/register-interpreter-mode! interpreter mode-kw))
+   mode-kw))
 
 ;; --- the built-in language pack -----------------------------------------
 
@@ -388,7 +402,8 @@
             "unknown"}
    :constants #{"true" "false" "null" "undefined" "NaN" "Infinity"}
    :indent {:mid-words #{"case" "default"}}}
-  [".js" ".jsx" ".mjs" ".cjs" ".ts" ".tsx"])
+  [".js" ".jsx" ".mjs" ".cjs" ".ts" ".tsx"]
+  ["node" "nodejs" "deno" "bun"])
 
 (register-prog-mode! :python "python-mode: syntax highlighting for Python"
   {:line-comments ["#"]
@@ -413,7 +428,8 @@
             :open-suffix [":"]
             :mid-words #{"else" "elif" "except" "finally" "case"}
             :outdent-after #{"return" "pass" "break" "continue" "raise"}}}
-  [".py"])
+  [".py"]
+  ["python" "python2" "python3"])
 
 (register-prog-mode! :c "c-mode: syntax highlighting for C/C++"
   {:line-comments ["//"]
@@ -456,7 +472,8 @@
             :open-last #{"then" "do" "in"}
             :close-words #{"fi" "done" "esac"}
             :mid-words #{"else" "elif"}}}
-  [".sh" ".bash" ".zsh"])
+  [".sh" ".bash" ".zsh"]
+  ["sh" "bash" "zsh" "dash" "ksh"])
 
 (register-prog-mode! :rc "rc-mode: syntax highlighting for the plan 9 shell"
   {:line-comments ["#"]
@@ -472,7 +489,8 @@
    :keywords #{"builtin" "case" "cd" "echo" "eval" "exec" "exit" "flag"
                "fn" "for" "if" "in" "not" "rfork" "shift" "switch"
                "wait" "whatis" "while"}}
-  [".rc" "rcmain"])
+  [".rc" "rcmain"]
+  ["rc"])
 
 (register-prog-mode! :rust "rust-mode: syntax highlighting for Rust"
   {:line-comments ["//"]
@@ -533,7 +551,8 @@
             :open-words #{"function" "if" "for" "while" "repeat"}
             :close-words #{"end" "until"}
             :mid-words #{"else" "elseif"}}}
-  [".lua"])
+  [".lua"]
+  ["lua" "luajit"])
 
 (register-prog-mode! :ruby "ruby-mode: syntax highlighting for Ruby"
   {:line-comments ["#"]
@@ -558,7 +577,8 @@
             :open-words #{"do"}
             :close-words #{"end"}
             :mid-words #{"else" "elsif" "when" "rescue" "ensure"}}}
-  [".rb"])
+  [".rb"]
+  ["ruby"])
 
 (register-prog-mode! :sql "sql-mode: syntax highlighting for SQL"
   {:line-comments ["--"]
@@ -728,7 +748,8 @@
    :constants #{"true" "false" "null"}
    :indent-width 4
    :indent {:mid-words #{"case" "default"}}}
-  [".php"])
+  [".php"]
+  ["php"])
 
 (register-prog-mode! :makefile "makefile-mode: syntax highlighting for Makefiles"
   {:line-comments ["#"]

@@ -32,6 +32,38 @@
     (is (nil? (modes/mode-for-filename "foo.txt")))
     (is (nil? (modes/mode-for-filename nil)))))
 
+(deftest interpreter-from-shebang-parses-common-shapes
+  (testing "a plain interpreter path"
+    (is (= "sh" (modes/interpreter-from-shebang "#!/bin/sh"))))
+  (testing "the env wrapper is transparent"
+    (is (= "python3" (modes/interpreter-from-shebang "#!/usr/bin/env python3"))))
+  (testing "trailing interpreter args are dropped"
+    (is (= "rc" (modes/interpreter-from-shebang "#!/bin/rc -e"))))
+  (testing "not a shebang at all, or nothing usable on it"
+    (is (nil? (modes/interpreter-from-shebang "echo hi")))
+    (is (nil? (modes/interpreter-from-shebang nil)))
+    (is (nil? (modes/interpreter-from-shebang "#!")))))
+
+(deftest mode-for-file-falls-back-to-content-detection
+  (testing "a suffix match wins outright, without consulting content"
+    (modes/register-auto-mode! ".testsuffix2" :test-mode-suffix)
+    (is (= :test-mode-suffix (modes/mode-for-file "foo.testsuffix2" "#!/bin/testinterp"))))
+
+  (testing "no suffix match falls back to a registered interpreter"
+    (modes/register-interpreter-mode! "testinterp" :test-mode-interp)
+    (is (= :test-mode-interp (modes/mode-for-file "build" "#!/usr/bin/testinterp")))
+    (is (= :test-mode-interp (modes/mode-for-file "build" "#!/usr/bin/env testinterp"))))
+
+  (testing "nothing matches either way -> nil, not an error"
+    (is (nil? (modes/mode-for-file "plain" "just some text")))
+    (is (nil? (modes/mode-for-file "plain" nil))))
+
+  (testing "a custom detector registered directly also gets consulted"
+    (modes/register-mode-detector! (fn [filename _first-line]
+                                      (when (= filename "special") :test-mode-custom-detector)))
+    (is (= :test-mode-custom-detector (modes/mode-for-file "special" nil)))
+    (is (nil? (modes/mode-for-file "not-special" nil)))))
+
 (deftest mode-keymap-shadows-a-single-key
   (testing "a mode binding the same key as global wins while that mode is active"
     (km/bind-key! km/global-keymap "C-c C-c" :keyboard-quit) ;; arbitrary global baseline

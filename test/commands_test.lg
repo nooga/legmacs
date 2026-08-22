@@ -6,7 +6,8 @@
             [legmacs.completion :as completion]
             [legmacs.commands :as c]
             [legmacs.dispatch :as d]
-            [legmacs.modes.letgo]))
+            [legmacs.modes.letgo]
+            [legmacs.modes.prog]))
 
 (defn- type-text [state text]
   (reduce mb/insert-char state (seq text)))
@@ -71,6 +72,24 @@
           s (type-text s path)
           s (mb/submit s)]
       (is (= :let-go (:mode (:state (:buffer-command s))))))))
+
+(deftest find-file-falls-back-to-shebang-detection
+  (testing "an extensionless script starts in the mode its #! line names"
+    (let [path "/tmp/legmacs-test-automode-rc"
+          _ (spit path "#!/bin/rc\necho hi\n")
+          s (buf/new-state nil [""])
+          s (c/find-file s)
+          s (type-text s path)
+          s (mb/submit s)]
+      (is (= :rc (:mode (:state (:buffer-command s)))))))
+
+  (testing "a brand-new (not-yet-existing) file has no content to sniff, so it just gets no mode"
+    (let [path "/tmp/legmacs-test-automode-new-noext"
+          s (buf/new-state nil [""])
+          s (c/find-file s)
+          s (type-text s path)
+          s (mb/submit s)]
+      (is (nil? (:mode (:state (:buffer-command s))))))))
 
 (deftest find-file-switches-to-an-already-open-buffer-instead-of-reopening
   (testing "when :buffer-list already has this filename, find-file signals a plain switch, not a fresh load"

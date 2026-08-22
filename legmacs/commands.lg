@@ -448,25 +448,29 @@
             :completer completion/path-completer}))
 
 (defn- with-auto-mode
-  "Switch into whatever mode legmacs.modes/auto-mode-alist says `path`
-   should start in, if any -- the *only* place that decides this, so a
-   .lg file gets let-go-mode the same way whether it's opened from the
-   command line (main.lg) or with C-x C-f (find-file, below)."
-  [state path]
-  (if-let [mode-kw (modes/mode-for-filename path)]
+  "Switch into whatever mode legmacs.modes/mode-for-file says `path` (with
+   `first-line` as its content sniff, or nil) should start in, if any --
+   the *only* place that decides this, so a .lg file -- or an extensionless
+   #!/bin/rc script -- gets its mode the same way whether it's opened from
+   the command line (main.lg) or with C-x C-f (find-file, below)."
+  [state path first-line]
+  (if-let [mode-kw (modes/mode-for-file path first-line)]
     (modes/switch-to-mode state mode-kw)
     state))
 
 (defn new-file-state
   "A fresh buffer-state for `path`: its contents if it exists, an empty
-   buffer otherwise, either way with auto-mode-detection applied. What
-   both main.lg (the initial file argument) and find-file (below) load a
-   file with. [state message] -- message says whether it was loaded or
-   is a new file, for callers that want to show it."
+   buffer otherwise, either way with auto-mode-detection applied (by
+   suffix, falling back to content -- e.g. a #! shebang -- when the name
+   alone doesn't say). What both main.lg (the initial file argument) and
+   find-file (below) load a file with. [state message] -- message says
+   whether it was loaded or is a new file, for callers that want to
+   show it."
   [path]
   (if-let [content (try (slurp path) (catch e nil))]
-    [(with-auto-mode (buf/new-state path (buf/split-lines content)) path) (str "Loaded " path)]
-    [(with-auto-mode (buf/new-state path [""]) path) (str "New file " path)]))
+    (let [lines (buf/split-lines content)]
+      [(with-auto-mode (buf/new-state path lines) path (first lines)) (str "Loaded " path)])
+    [(with-auto-mode (buf/new-state path [""]) path nil) (str "New file " path)]))
 
 (defcommand find-file
   "Open a file in a new buffer, or switch to it if it's already open --
