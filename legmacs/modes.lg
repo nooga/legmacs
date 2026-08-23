@@ -114,6 +114,83 @@
     (some (fn [[suffix mode-kw]] (when (string/ends-with? filename suffix) mode-kw))
           @auto-mode-alist)))
 
+(def mode-detectors
+  "[(fn [filename first-line] -> mode-kw-or-nil) ...], consulted in
+   registration order by mode-for-file when `filename` matched nothing in
+   auto-mode-alist. This is the general extension point for content-based
+   mode detection (see register-mode-detector!) -- a suffix can't identify
+   an extensionless script (a plan-9 rc(1) script, a shell script called
+   just \"build\"), so a detector gets to look at what's actually in the
+   file instead. The built-in shebang detector (below) is registered here
+   the same way a user's own detector would be."
+  (atom []))
+
+(defn register-mode-detector!
+  "Register a custom content-based mode detector: `detector` is
+   (fn [filename first-line] -> mode-kw-or-nil). Runs only when
+   auto-mode-alist found no suffix match for `filename` -- an explicit
+   extension always wins over content sniffing. See
+   register-interpreter-mode! for the common \"match a #! line\" case,
+   which is built on this."
+  [detector]
+  (swap! mode-detectors conj detector))
+
+(def interpreter-mode-alist
+  "[[interpreter-name mode-kw] ...] matched against the interpreter named
+   on a file's #! line (see interpreter-from-shebang). Populated by
+   register-interpreter-mode! and consulted by the built-in shebang
+   detector installed at the bottom of this namespace -- this is the
+   reusable piece; a mode registering into it (legmacs.modes.prog's
+   register-prog-mode! takes an :interpreters list for exactly this) is
+   all a language needs to do to be found by its shebang, not just its
+   extension."
+  (atom []))
+
+(defn register-interpreter-mode!
+  "Files whose first line is a #! shebang naming `interpreter` (exactly,
+   after stripping a directory path and an `env` wrapper -- see
+   interpreter-from-shebang) default to `mode-kw`. Content detectors only
+   run when auto-mode-alist found no suffix match, so an explicit
+   extension still wins (a `.txt` file with a `#!/bin/sh` line stays
+   whatever `.txt` says)."
+  [interpreter mode-kw]
+  (swap! interpreter-mode-alist conj [interpreter mode-kw]))
+
+(defn interpreter-from-shebang
+  "The interpreter named on `line`'s #! shebang, or nil:
+   \"#!/bin/sh\" -> \"sh\"
+   \"#!/usr/bin/env python3\" -> \"python3\" (the env wrapper is transparent)
+   \"#!/bin/rc -e\" -> \"rc\" (args after the interpreter are dropped)."
+  [line]
+  (when (and line (string/starts-with? line "#!"))
+    (let [tokens (remove string/blank? (string/split (subs line 2) " "))
+          interp (last (string/split (or (first tokens) "") "/"))]
+      (cond
+        (string/blank? interp) nil
+        (= interp "env") (second tokens)
+        :else interp))))
+
+(defn mode-for-interpreter
+  "The mode interpreter-mode-alist says a file starting with `first-line`
+   should start in, or nil."
+  [first-line]
+  (when-let [interp (interpreter-from-shebang first-line)]
+    (some (fn [[name mode-kw]] (when (= name interp) mode-kw)) @interpreter-mode-alist)))
+
+(register-mode-detector! (fn [_filename first-line] (mode-for-interpreter first-line)))
+
+(defn mode-for-file
+  "The mode a newly opened file should start in, or nil: `filename`'s
+   auto-mode-alist suffix match if there is one, else the first non-nil
+   answer from mode-detectors run against `filename` and `first-line` (the
+   file's first line of content, or nil for an empty/new file) -- e.g. the
+   built-in shebang detector, for a script a suffix can't identify. This
+   is what new-file-state (legmacs.commands) uses; mode-for-filename stays
+   available on its own for callers that only ever have a path."
+  [filename first-line]
+  (or (mode-for-filename filename)
+      (some (fn [detector] (detector filename first-line)) @mode-detectors)))
+
 (defn mode-keymap [mode-kw]
   (:keymap (get @registry mode-kw)))
 

@@ -304,6 +304,28 @@
   (testing "a language that doesn't ask for it (no :functions?) gets none"
     (is (empty? (go-hl "printf(x)")))))
 
+(deftest interpreter-mode-alist-covers-extensionless-scripts
+  (testing "a #!/bin/rc script with no suffix at all still starts in rc-mode"
+    (is (= :rc (modes/mode-for-file "build" "#!/bin/rc"))))
+
+  (testing "the various shell interpreters all land on shell-mode"
+    (is (= :shell (modes/mode-for-file "deploy" "#!/bin/sh")))
+    (is (= :shell (modes/mode-for-file "deploy" "#!/usr/bin/env bash")))
+    (is (= :shell (modes/mode-for-file "deploy" "#!/bin/zsh"))))
+
+  (testing "python/ruby/lua/node/php interpreters resolve to their modes"
+    (is (= :python (modes/mode-for-file "tool" "#!/usr/bin/env python3")))
+    (is (= :ruby (modes/mode-for-file "tool" "#!/usr/bin/env ruby")))
+    (is (= :lua (modes/mode-for-file "tool" "#!/usr/bin/lua")))
+    (is (= :javascript (modes/mode-for-file "tool" "#!/usr/bin/env node")))
+    (is (= :php (modes/mode-for-file "tool" "#!/usr/bin/php"))))
+
+  (testing "an explicit suffix still wins over the shebang"
+    (is (= :python (modes/mode-for-file "legacy.py" "#!/bin/sh"))))
+
+  (testing "no suffix and no recognized shebang -> nil"
+    (is (nil? (modes/mode-for-file "plain" "just text")))))
+
 (deftest rc-mode-basics
   (testing "the plan 9 shell claims .rc files"
     (is (= :rc (modes/mode-for-filename "install.rc")))
