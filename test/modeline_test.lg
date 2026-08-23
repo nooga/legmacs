@@ -1,0 +1,70 @@
+;; legmacs.modeline's segment registry and the built-in segments' data.
+;;
+;; The buffer segment gets the most attention here because its label is the
+;; one piece of the bar with a real precedence rule (:buffer-name over
+;; :filename over "*scratch*"), and generated buffers -- *Help*, *repl*, a
+;; directory listing, a dir/+Errors output buffer -- are named but have no
+;; filename, so they'd otherwise all read as "*scratch*" in the mode line.
+
+(ns test.modeline-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modeline :as ml]))
+
+(defn- buffer-badge
+  "The built-in :buffer segment's rendered text for `state`, read back
+   through the public segment API (the label fn itself is private)."
+  [state]
+  (:text (first (ml/left-segments state))))
+
+(deftest buffer-label-prefers-the-buffer-name
+  (testing "a named generated buffer shows its name, not *scratch*"
+    (is (= " *Help* " (buffer-badge (assoc (buf/new-state nil [""]) :buffer-name "*Help*"))))
+    (is (= " *repl* " (buffer-badge (assoc (buf/new-state nil [""]) :buffer-name "*repl*")))))
+
+  (testing "a file buffer shows its filename"
+    (is (= " notes.txt " (buffer-badge (buf/new-state "notes.txt" [""])))))
+
+  (testing "a name wins over a filename when a buffer somehow has both"
+    (is (= " *Custom* " (buffer-badge (assoc (buf/new-state "notes.txt" [""])
+                                             :buffer-name "*Custom*")))))
+
+  (testing "an unnamed, file-less buffer still falls back to *scratch*"
+    (is (= " *scratch* " (buffer-badge (buf/new-state nil [""]))))))
+
+(deftest buffer-badge-flags-unsaved-changes
+  (testing "the modified marker and color ride along with either label kind"
+    (let [seg (fn [s] (first (ml/left-segments s)))
+          saved (seg (buf/new-state "a.txt" [""]))
+          dirty (seg (assoc (buf/new-state "a.txt" [""]) :modified? true))
+          named-dirty (seg (assoc (buf/new-state nil [""])
+                                  :buffer-name "*out*" :modified? true))]
+      (is (= " a.txt " (:text saved)))
+      (is (= " a.txt * " (:text dirty)))
+      (is (= " *out* * " (:text named-dirty)))
+      ;; color alone carries modified state too, so it must actually differ
+      (is (not= (:bg saved) (:bg dirty)))
+      (is (= (:bg dirty) (:bg named-dirty))))))
+
+(deftest segments-are-a-plain-registry
+  (testing "a user segment can be added, ordered, and removed again"
+    (let [state (buf/new-state "a.txt" [""])
+          before (count (ml/left-segments state))]
+      (ml/register-modeline-segment! :test-seg :left (fn [_] "HELLO"))
+      (is (= (inc before) (count (ml/left-segments state))))
+      (is (some (fn [seg] (= "HELLO" (:text seg))) (ml/left-segments state)))
+      (ml/set-modeline-order! [:test-seg])
+      (is (= "HELLO" (:text (first (ml/left-segments state)))))
+      (ml/remove-modeline-segment! :test-seg)
+      (is (= before (count (ml/left-segments state))))
+      (is (not (some (fn [seg] (= "HELLO" (:text seg))) (ml/left-segments state))))))
+
+  (testing "a segment returning nil or an empty string is omitted this frame"
+    (let [state (buf/new-state "a.txt" [""])
+          before (count (ml/left-segments state))]
+      (ml/register-modeline-segment! :nil-seg :left (fn [_] nil))
+      (ml/register-modeline-segment! :blank-seg :left (fn [_] ""))
+      (is (= before (count (ml/left-segments state))))
+      (ml/remove-modeline-segment! :nil-seg)
+      (ml/remove-modeline-segment! :blank-seg))))
