@@ -97,6 +97,17 @@
     (term/flush)
     workspace))
 
+(defn- run-pending-task
+  "Run the blocking task the last command armed (see legmacs.buffers'
+   :pending-task). The frame announcing it is already on screen by the
+   time we get here, so the editor looks busy rather than dead while the
+   task runs. The task is an ordinary (fn [state] -> state), threaded
+   through the same fold as any command -- dropping :pending-task from the
+   flat state first is what consumes it, so a task that arms another one
+   chains and one that doesn't ends the sequence."
+  [workspace task]
+  (bufs/put-current workspace (task (dissoc (bufs/current workspace) :pending-task))))
+
 (defn run
   "Threads a workspace (see legmacs.buffers) rather than a single flat
    buffer state, so multiple buffers and windows can exist -- but dispatch
@@ -104,12 +115,19 @@
    bookkeeping (switching, opening, killing, splitting) happens in the
    fold back via bufs/put-current, driven by whatever :buffer-command a
    command set. render! draws every window but likewise returns just a
-   workspace with per-window scroll positions brought up to date."
+   workspace with per-window scroll positions brought up to date.
+
+   A :pending-task on the workspace takes the place of reading a key for
+   one iteration: the frame above has just been painted, so a command that
+   has slow work to do gets its message on screen before the editor
+   blocks on it."
   [workspace]
   (loop [workspace workspace]
     (let [workspace (render! workspace)]
-      (if (:quit? workspace)
-        workspace
+      (cond
+        (:quit? workspace) workspace
+        (:pending-task workspace) (recur (run-pending-task workspace (:pending-task workspace)))
+        :else
         (let [chord (keys/read-chord)]
           (if (nil? chord)
             (assoc workspace :quit? true)

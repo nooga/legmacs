@@ -87,3 +87,15 @@ command runs.  It is intended initially for short commands such as `pwd`,
 `ls`, `ps`, and pipelines.  Asynchronous jobs, live streaming, interactive
 stdin, cancellation, process status, and exact stdout/stderr interleaving are
 deferred until this basic interaction has been exercised on Plan 9.
+
+The pause is at least a *visible* one.  `execute-at-point` does not call `rc`
+itself; it returns a `"Execute: running ... "` message plus a `:pending-task`
+(see the header comment in `legmacs/buffers.lg`), which is an ordinary
+`(fn [state] -> state)` held as a workspace-shared field.  `main.lg`'s loop
+paints that frame and then, instead of reading the next key, runs the task.
+So the screen shows what LegMacs is waiting on rather than staying frozen on
+the frame from before the keystroke, and the actual `os/sh` call stays out of
+the pure pipeline.  `:pending-task` is also the seam a real async job model
+would grow from: a task may arm a further task, so a future version can poll
+a running process across iterations without any of the layers below `main.lg`
+learning about processes.

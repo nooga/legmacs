@@ -185,17 +185,43 @@
                             :state output}
            :message (format "Execute: rc exited %d" exit))))
 
+(defn run-command-now
+  "Launch `command` through rc in `state`'s directory context and fold the
+   completed result into its +Errors buffer -- the actually-blocking half of
+   execute-at-point, kept separate so the state transition around it stays
+   testable via apply-execute-result on hosts without rc."
+  [state command]
+  (let [result (try
+                 (os/sh "rc" "-p" "-c" (rc-script state command))
+                 (catch e
+                   {:exit 127 :out "" :err (str "could not start rc: " e)}))]
+    (apply-execute-result state command result)))
+
+(defn execute-task
+  "run-command-now as a deferred (fn [state] -> state) task for
+   :pending-task.  A named function rather than an inline fn literal
+   because execute-at-point builds it inside an if-let, and a closure over
+   a local in a conditional branch trips let-go's AOT closure hoisting --
+   see CLAUDE.md."
+  [command]
+  (fn [state] (run-command-now state command)))
+
 (defcommand execute-at-point
-  "Run the active region, or the path-like token at point, as a synchronous
+  "Run the active region, or the path-like token at point, as a
    non-interactive rc expression in this buffer's directory context.  Output
-   is appended to an ordinary editable directory/+Errors buffer."
+   is appended to an ordinary editable directory/+Errors buffer.
+
+   rc still runs to completion before legmacs reads another key, but the run
+   is armed as a :pending-task (see legmacs.buffers) instead of happening
+   inline: the frame naming the command reaches the screen first, so a slow
+   command shows \"Execute: running ...\" rather than freezing on the frame
+   from before the keystroke.  A real async job model would go here too --
+   :pending-task is the seam for it."
   [state]
   (if-let [command (target-text state)]
-    (let [result (try
-                   (os/sh "rc" "-p" "-c" (rc-script state command))
-                   (catch e
-                     {:exit 127 :out "" :err (str "could not start rc: " e)}))]
-      (apply-execute-result state command result))
+    (assoc state
+           :pending-task (execute-task command)
+           :message (str "Execute: running " command " ..."))
     (assoc state :message "Execute: no command at point")))
 
 (defn enable!
