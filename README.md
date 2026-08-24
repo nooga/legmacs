@@ -1,5 +1,7 @@
 # legmacs
 
+> 💬 Come talk about legmacs in `#legmacs` on [The Fixpoint](https://discord.gg/Ky535CQ9pj) Discord.
+
 A little Emacs-flavored terminal editor written in
 [let-go](https://github.com/nooga/let-go), almost-Clojure running on a Go
 bytecode VM. Here's the fun part: the language you'd script it in is the same
