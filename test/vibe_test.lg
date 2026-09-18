@@ -2,7 +2,7 @@
   (:require [test :refer :all]
             [string]
             [legmacs.buffer :as buf]
-            ;; :refer too, mirroring main.lg: resolve-vibe `eval`s the
+            ;; :refer too, mirroring main.lg: eval-vibe-form `eval`s the
             ;; form in whatever namespace is current, so `vibe` has to
             ;; resolve here for the error-path test to reach the real fn.
             [legmacs.vibe :as vibe :refer [vibe]]))
@@ -136,39 +136,52 @@
       (is (= "Buffer is read-only" (:message s*))))))
 
 (deftest vibe-replace-records-the-request-without-performing-it
-  (testing "point in a vibe form arms :pending-task for main.lg to run"
+  (testing "point in a vibe form arms an async job, not a blocking pending-task"
     (let [s (-> (buf/new-state nil ["(vibe \"a thing\")"])
                 (assoc :cursor-col 8))
           s* (vibe/vibe-replace s)]
       (is (= "vibing..." (:message s*)))
-      (is (fn? (:pending-task s*)))
+      (is (nil? (:pending-task s*)))
+      (is (seq (:async-jobs s*)))
       (is (= ["(vibe \"a thing\")"] (:lines s*)))))
 
   (testing "nowhere near a vibe form"
     (let [s* (vibe/vibe-replace (buf/new-state nil ["(+ 1 2)"]))]
-      (is (nil? (:pending-task s*)))
+      (is (nil? (:async-jobs s*)))
       (is (string/includes? (:message s*) "No (vibe")))))
 
 (deftest resolve-vibe-fails-safely
   (testing "a request whose form has since moved is dropped, not misapplied"
     (let [s (buf/new-state nil ["(+ 1 2)"])
-          s* (vibe/resolve-vibe s 0 7)]
+          s* (vibe/resolve-vibe s 0 7 {:ok "42"})]
       (is (= ["(+ 1 2)"] (:lines s*)))
       (is (string/includes? (:message s*) "moved"))))
 
-  (testing "an error during the call is reported, not raised"
-    ;; :provider :nope makes vibe throw before it can reach the network.
+  (testing "an :err outcome is reported, not spliced"
+    (let [s (buf/new-state nil ["(vibe \"a thing\")"])
+          s* (vibe/resolve-vibe s 0 16 {:err "unknown vibe provider :nope"})]
+      (is (= ["(vibe \"a thing\")"] (:lines s*)))
+      (is (string/includes? (:message s*) "vibe error"))
+      (is (string/includes? (:message s*) "unknown vibe provider"))))
+
+  (testing "a string outcome splices over the form"
+    (let [s (buf/new-state nil ["(vibe \"a thing\")"])
+          s* (vibe/resolve-vibe s 0 16 {:ok "42"})]
+      (is (= ["42"] (:lines s*)))
+      (is (string/includes? (:message s*) "vibed"))))
+
+  (testing "eval-vibe-form throws before HTTP when the provider is unknown"
     (let [saved @vibe/config]
       (try
         (swap! vibe/config assoc :provider :nope)
-        (let [s (buf/new-state nil ["(vibe \"a thing\")"])
-              s* (vibe/resolve-vibe s 0 16)]
-          (is (= ["(vibe \"a thing\")"] (:lines s*)))
-          (is (string/includes? (:message s*) "vibe error"))
-          (is (string/includes? (:message s*) "unknown vibe provider")))
+        (let [err (try (vibe/eval-vibe-form "(vibe \"a thing\")" {})
+                       nil
+                       (catch e e))]
+          (is (some? err))
+          (is (string/includes? (str (or (ex-message err) err)) "unknown vibe provider")))
         (finally (reset! vibe/config saved))))))
 
 (deftest context-is-cleared-after-use
-  (testing "with-context always puts the atom back, even when the body throws"
+  (testing "with-context restores *vibe-context* even when the body throws"
     (try (vibe/with-context {:text "x"} (fn [] (throw "boom"))) (catch e nil))
-    (is (nil? @vibe/current-context))))
+    (is (nil? vibe/*vibe-context*))))

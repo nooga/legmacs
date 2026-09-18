@@ -1,5 +1,6 @@
 (ns test.buffers-test
   (:require [test :refer :all]
+            [string]
             [legmacs.buffer :as buf]
             [legmacs.buffers :as bufs]))
 
@@ -224,30 +225,23 @@
         (is (nil? (:overlay ws)))))))
 
 ;; :pending-task -- the "let the screen catch up, then do the slow thing"
-;; seam. main.lg's loop is the only consumer, and requiring main.lg starts
-;; the real editor (see CLAUDE.md), so the one-iteration step it performs
-;; is reproduced inline here instead.
-(defn- run-pending-step
-  "One turn of main.lg's run loop when a task is armed: dropping
-   :pending-task from the flat state is what consumes it."
-  [ws]
-  (let [task (:pending-task ws)]
-    (bufs/put-current ws (task (dissoc (bufs/current ws) :pending-task)))))
+;; seam. main.lg's loop is the only production consumer, but the runner
+;; lives in buffers so tests call the real thing (requiring main.lg would
+;; start the editor -- see CLAUDE.md).
 
 (deftest pending-task-is-a-shared-field-that-round-trips
   (testing "a command can arm a task; it lands on the workspace and in the flat view"
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
           task (fn [state] state)
-          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task task
-                                         :message "running ..."))]
-      (is (some? (:pending-task ws)))
-      (is (some? (:pending-task (bufs/current ws))))
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) task "running ..."))]
+      (is (fn? (:pending-task ws)))
+      (is (fn? (:pending-task (bufs/current ws))))
       ;; the message is on the state that gets painted *before* the task runs
       (is (= "running ..." (:message (bufs/current ws))))))
 
   (testing "it is shared, not per-buffer: switching buffers doesn't lose it"
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
-          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task (fn [state] state)))
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) (fn [state] state)))
           ws (send ws {:op :open-new :state (buf/new-state nil ["other"])})]
       (is (some? (:pending-task (bufs/current ws)))))))
 
@@ -255,8 +249,8 @@
   (testing "the task edits like any command, and does not run twice"
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
           appending (fn [state] (update state :lines conj "from the task"))
-          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task appending))
-          ws (run-pending-step ws)]
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) appending))
+          ws (bufs/run-pending-task ws)]
       (is (= ["x" "from the task"] (:lines (bufs/current ws))))
       (is (nil? (:pending-task ws)))
       (is (nil? (:pending-task (bufs/current ws))))))
@@ -265,20 +259,158 @@
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
           opener (fn [state] (assoc state :buffer-command
                                     {:op :open-new :state (buf/new-state nil ["output"])}))
-          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task opener))
-          ws (run-pending-step ws)]
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) opener))
+          ws (bufs/run-pending-task ws)]
       (is (= ["output"] (:lines (bufs/current ws))))
+      (is (nil? (:pending-task ws)))))
+
+  (testing "the optional after fn sees the task's result, like a post-command hook"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          appending (fn [state] (update state :lines conj "from the task"))
+          after (fn [state] (update state :lines conj "after"))
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) appending))
+          ws (bufs/run-pending-task ws after)]
+      (is (= ["x" "from the task" "after"] (:lines (bufs/current ws))))
       (is (nil? (:pending-task ws)))))
 
   (testing "a task can arm a further task, so the loop chains rather than stalling"
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
           second-step (fn [state] (update state :lines conj "two"))
-          first-step (fn [state] (assoc (update state :lines conj "one")
-                                        :pending-task second-step))
-          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task first-step))
-          ws (run-pending-step ws)]
+          first-step (fn [state] (bufs/arm-task (update state :lines conj "one") second-step))
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) first-step))
+          ws (bufs/run-pending-task ws)]
       (is (= ["x" "one"] (:lines (bufs/current ws))))
       (is (some? (:pending-task ws)))
-      (let [ws (run-pending-step ws)]
+      (let [ws (bufs/run-pending-task ws)]
         (is (= ["x" "one" "two"] (:lines (bufs/current ws))))
         (is (nil? (:pending-task ws)))))))
+
+(deftest a-throwing-task-does-not-kill-the-session
+  (testing "the error becomes a message, the queue is emptied, the buffer is untouched"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          boom (fn [state] (throw "boom"))
+          later (fn [state] (update state :lines conj "should not run"))
+          ws (bufs/put-current ws (-> (bufs/current ws)
+                                      (bufs/arm-task boom)
+                                      (bufs/arm-task later)))
+          ws (bufs/run-pending-task ws)]
+      (is (= ["x"] (:lines (bufs/current ws))))
+      (is (nil? (:pending-task ws)))
+      (is (nil? (:pending-task (bufs/current ws))))
+      (is (string/includes? (:message (bufs/current ws)) "task error"))
+      (is (string/includes? (:message (bufs/current ws)) "boom")))))
+
+(deftest arm-task-queues-two-steps
+  (testing "two arms in one state run as two painted steps, both effects apply"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          one (fn [state] (update state :lines conj "one"))
+          two (fn [state] (update state :lines conj "two"))
+          ws (bufs/put-current ws (-> (bufs/current ws)
+                                      (bufs/arm-task one)
+                                      (bufs/arm-task two)))]
+      (is (vector? (:pending-task ws)))
+      (is (= 2 (count (bufs/pending-queue (:pending-task ws)))))
+      (let [ws (bufs/run-pending-task ws)]
+        (is (= ["x" "one"] (:lines (bufs/current ws))))
+        (is (fn? (:pending-task ws)))
+        (let [ws (bufs/run-pending-task ws)]
+          (is (= ["x" "one" "two"] (:lines (bufs/current ws))))
+          (is (nil? (:pending-task ws))))))))
+
+(deftest a-continuation-runs-before-the-rest-of-the-queue
+  (testing "a task that arms another prepends, then the already-queued remainder"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          two (fn [state] (update state :lines conj "two"))
+          one (fn [state] (bufs/arm-task (update state :lines conj "one") two))
+          three (fn [state] (update state :lines conj "three"))
+          ws (bufs/put-current ws (-> (bufs/current ws)
+                                      (bufs/arm-task one)
+                                      (bufs/arm-task three)))
+          ws (bufs/run-pending-task ws)]
+      (is (= ["x" "one"] (:lines (bufs/current ws))))
+      (is (= 2 (count (bufs/pending-queue (:pending-task ws)))))
+      (let [ws (bufs/run-pending-task ws)]
+        (is (= ["x" "one" "two"] (:lines (bufs/current ws))))
+        (is (fn? (:pending-task ws)))
+        (let [ws (bufs/run-pending-task ws)]
+          (is (= ["x" "one" "two" "three"] (:lines (bufs/current ws))))
+          (is (nil? (:pending-task ws))))))))
+
+(defn- delivered-job [value then]
+  (let [p (promise)]
+    (deliver p value)
+    {:promise p :then then :label "t"}))
+
+(deftest drain-jobs-applies-realized-promises
+  (testing "a delivered job's :then runs and the job is removed"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          then (fn [state outcome] (update state :lines conj (:ok outcome)))
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                (delivered-job {:ok "hi"} then)))
+          ws (bufs/drain-jobs ws)]
+      (is (= ["x" "hi"] (:lines (bufs/current ws))))
+      (is (not (bufs/jobs-running? ws)))
+      (is (nil? (:async-jobs (bufs/current ws))))))
+
+  (testing "an undelivered promise survives drain and does not block"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          p (promise)
+          then (fn [state outcome] (update state :lines conj "nope"))
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                {:promise p :then then :label "t"}))
+          ws (bufs/drain-jobs ws)]
+      (is (bufs/jobs-running? ws))
+      (is (= ["x"] (:lines (bufs/current ws))))))
+
+  (testing "two jobs: only the realized one applies"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          waiting (promise)
+          then-a (fn [state outcome] (update state :lines conj (:ok outcome)))
+          then-b (fn [state outcome] (update state :lines conj "late"))
+          ws (bufs/put-current ws (-> (bufs/current ws)
+                                      (bufs/add-job (delivered-job {:ok "a"} then-a))
+                                      (bufs/add-job {:promise waiting :then then-b :label "b"})))
+          ws (bufs/drain-jobs ws)]
+      (is (= ["x" "a"] (:lines (bufs/current ws))))
+      (is (= 1 (count (:async-jobs ws))))))
+
+  (testing "a throwing :then is an echo-area error, not a dead session"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          boom (fn [state outcome] (throw "nope"))
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                (delivered-job {:ok 1} boom)))
+          ws (bufs/drain-jobs ws)]
+      (is (= ["x"] (:lines (bufs/current ws))))
+      (is (not (bufs/jobs-running? ws)))
+      (is (string/includes? (:message (bufs/current ws)) "task error"))
+      (is (string/includes? (:message (bufs/current ws)) "nope"))))
+
+  (testing "an :err outcome is handed to :then"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          then (fn [state outcome]
+                 (assoc state :message (str "got " (:err outcome))))
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                (delivered-job {:err "boom"} then)))
+          ws (bufs/drain-jobs ws)]
+      (is (= "got boom" (:message (bufs/current ws)))))))
+
+(deftest spawn-task-does-not-arm-a-blocking-pending-task
+  (testing "the editor would still read keys; I/O is a future, not :pending-task"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          io (fn [] :done)
+          then (fn [state _outcome] state)
+          s (bufs/spawn-task (bufs/current ws) io then "go")]
+      (is (nil? (:pending-task s)))
+      (is (seq (:async-jobs s)))
+      (is (= "go" (:message s)))
+      (is (= "go" (:label (first (:async-jobs s))))))))
+
+(deftest discard-jobs-drops-in-flight-work
+  (testing "C-g's helper clears the queue without applying"
+    (let [p (promise)
+          then (fn [state outcome] (update state :lines conj "nope"))
+          s (bufs/add-job (buf/new-state nil ["x"])
+                          {:promise p :then then :label "t"})
+          s (bufs/discard-jobs s)]
+      (is (nil? (:async-jobs s)))
+      (is (not (bufs/jobs-running? s))))))

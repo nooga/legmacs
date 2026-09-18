@@ -8,6 +8,7 @@
             [legmacs.bindings :as bindings]
             [legmacs.dispatch :as d]
             [legmacs.theme :as theme]
+            [legmacs.buffers :as bufs]
             [legmacs.modes.letgo]
             [legmacs.modes.prog]))
 
@@ -152,7 +153,17 @@
     (let [s (c/search-forward (buf/new-state nil ["x"]))
           s (c/keyboard-quit s)]
       (is (not (mb/active? s)))
-      (is (= "Quit" (:message s))))))
+      (is (= "Quit" (:message s)))))
+
+  (testing "C-g discards in-flight async jobs without applying them"
+    (let [p (promise)
+          then (fn [state outcome] (update state :lines conj "nope"))
+          s (bufs/add-job (buf/new-state nil ["x"])
+                          {:promise p :then then :label "vibing..."})
+          s (c/keyboard-quit s)]
+      (is (nil? (:async-jobs s)))
+      (is (= "Quit" (:message s)))
+      (is (= ["x"] (:lines s))))))
 
 (deftest extended-command-by-name
   (testing "M-x runs a command looked up by its hyphenated name"

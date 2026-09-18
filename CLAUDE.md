@@ -204,18 +204,20 @@ The same trap applies to the per-window view slice: `legmacs.windows/
 view-of` uses explicit `get` for the same reason (`scroll-to-fit`
 *dissoc*es `:recenter`/`:scroll-anchor`).
 
-**Blocking work is one shared field, not a per-feature hook.** A command
-that would freeze the editor (a subprocess, an HTTP call) returns a
-message plus `{:pending-task (fn [state] -> state)}` instead of doing the
-work inline. `main.lg`'s loop paints that frame, then runs the task *in
-place of reading a key*, so the screen shows why it's busy. There is no
-second mechanism — Acme Execute, vibe, and anything later arm the same
-field. The task is an ordinary command-shaped function, so it can set a
-`:buffer-command` or arm another task; dropping `:pending-task` from the
-flat state is what consumes it (same `get`-not-`select-keys` trap as the
-other shared fields). Named functions, not inline `fn` literals, when
-building the closure inside a conditional — see the AOT-hoisting gotcha
-below.
+**Blocking work is two shared fields, not a per-feature hook.** Main-thread
+work that must paint first uses `:pending-task` — a fn or vector of fns,
+`bufs/arm-task` to append, `bufs/run-pending-task` to run the head *in
+place of reading a key*. I/O that can run off-thread uses `:async-jobs`:
+`bufs/spawn-task` starts a `(future …)` immediately with an `io` thunk
+(no editor state) and a `:then` `(fn [state outcome] -> state)` applied
+later by `bufs/drain-jobs` on the main thread. Goroutines never touch
+buffers. Outcome is `{:ok v}` / `{:err e}` because let-go's future
+delivers nil on throw. While jobs are in flight the loop peeks
+`term/key-pending?` and sleeps 20ms instead of parking in `read-chord`,
+so typing continues. Idle is still a blocking read. C-g
+(`bufs/discard-jobs`) drops results without killing HTTP/`os/sh`. Named
+functions, not inline `fn` literals, when building the closure inside a
+conditional — see the AOT-hoisting gotcha below.
 
 **Windows (splits) are the same wrapping trick one level up.** The
 workspace holds a window tree (`legmacs.windows` — pure data + layout
@@ -242,18 +244,19 @@ every-cell-written-no-clear frame invariant. The flat single-state
 `render/frame` still exists and must stay byte-identical to a one-window
 workspace frame — there's a test asserting exactly that.
 
-**Vibe (`C-c C-v`) is a `:pending-task` client.** `legmacs/vibe.lg`
+**Vibe (`C-c C-v`) is an `:async-jobs` client.** `legmacs/vibe.lg`
 (`(vibe "...")` / `C-c C-v`) is the thing that waits on a network
-round-trip. `vibe-replace` does no I/O: it sets `:message "vibing..."`
-plus `:pending-task (vibe-task start end)` and returns, so it's as pure
-and testable as any other command. The task `eval`s the form (in
-`legmacs.main`, same as `C-x C-e`) with the call site parked in
-`vibe/current-context`, then splices the returned string over the form as
-one undo step. Two guards there are load-bearing: `resolve-vibe`
-re-checks that a `(vibe` form still opens at `start` before touching the
-buffer, and it refuses to splice a non-string result (let-go's `eval`
-*returns* compile errors as an `#error` value instead of raising them, so
-a typo'd prompt would otherwise be pasted into your code).
+round-trip. `vibe-replace` does no I/O: it snapshots the form and
+`(bufs/spawn-task … "vibing...")`, so it's as pure and testable as any
+other command. The future `eval`s the form (in `legmacs.main`, same as
+`C-x C-e`) with the call site bound in `vibe/*vibe-context*` (a dynamic
+var, so two overlapping vibes don't clobber each other), then
+`resolve-vibe` splices the returned string over the form as one undo
+step. Two guards there are load-bearing: `resolve-vibe` re-checks that a
+`(vibe` form still opens at `start` before touching the buffer, and it
+refuses to splice a non-string result (let-go's `eval` *returns* compile
+errors as an `#error` value instead of raising them, so a typo'd prompt
+would otherwise be pasted into your code).
 
 Full per-file breakdown and the complete default keymap are in
 [README.md](README.md); read it before making structural changes.

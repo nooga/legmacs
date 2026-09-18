@@ -138,10 +138,12 @@
           (buf/insert-string state chord))
         (assoc state :message (str chord " is undefined"))))))
 
-(defn- run-after-commands
+(defn run-after-commands
   "Thread `state` through every active mode's :after-command hook, in
    active-modes priority order (minor modes then major). A mode with no
-   :after-command is skipped."
+   :after-command is skipped. Public so a :pending-task gets the same
+   post-command pass a keystroke does (paren-match after a vibe splice,
+   for example) without buffers requiring this namespace."
   [state]
   (reduce (fn [s mode-kw]
             (if-let [hook (modes/mode-after-command mode-kw)] (hook s) s))

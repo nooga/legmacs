@@ -33,6 +33,18 @@
   (testing "an unnamed, file-less buffer still falls back to *scratch*"
     (is (= " *scratch* " (buffer-badge (buf/new-state nil [""]))))))
 
+(deftest jobs-segment-badges-in-flight-work
+  (testing "one job shows its label; several show a count"
+    (let [one (assoc (buf/new-state nil [""])
+                     :async-jobs [{:label "vibing..."}])
+          two (assoc (buf/new-state nil [""])
+                     :async-jobs [{:label "a"} {:label "b"}])
+          idle (buf/new-state nil [""])
+          texts (fn [s] (map :text (ml/right-segments s)))]
+      (is (some (fn [t] (string/includes? t "vibing...")) (texts one)))
+      (is (some (fn [t] (string/includes? t "2 jobs")) (texts two)))
+      (is (not (some (fn [t] (string/includes? t "job")) (texts idle)))))))
+
 (deftest buffer-badge-flags-unsaved-changes
   (testing "the modified marker and color ride along with either label kind"
     (let [seg (fn [s] (first (ml/left-segments s)))
