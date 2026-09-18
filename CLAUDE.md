@@ -204,6 +204,19 @@ The same trap applies to the per-window view slice: `legmacs.windows/
 view-of` uses explicit `get` for the same reason (`scroll-to-fit`
 *dissoc*es `:recenter`/`:scroll-anchor`).
 
+**Blocking work is one shared field, not a per-feature hook.** A command
+that would freeze the editor (a subprocess, an HTTP call) returns a
+message plus `{:pending-task (fn [state] -> state)}` instead of doing the
+work inline. `main.lg`'s loop paints that frame, then runs the task *in
+place of reading a key*, so the screen shows why it's busy. There is no
+second mechanism — Acme Execute, vibe, and anything later arm the same
+field. The task is an ordinary command-shaped function, so it can set a
+`:buffer-command` or arm another task; dropping `:pending-task` from the
+flat state is what consumes it (same `get`-not-`select-keys` trap as the
+other shared fields). Named functions, not inline `fn` literals, when
+building the closure inside a conditional — see the AOT-hoisting gotcha
+below.
+
 **Windows (splits) are the same wrapping trick one level up.** The
 workspace holds a window tree (`legmacs.windows` — pure data + layout
 geometry, knows nothing of buffer contents or rendering): leaves show a

@@ -78,6 +78,7 @@
    :pending-keys []
    :overlay nil
    :describe-key? nil
+   :pending-task nil
    :kbd-macro-recording? false
    :kbd-macro-chords []
    :last-kbd-macro nil
