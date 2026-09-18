@@ -82,8 +82,8 @@
                 (modes/switch-to-mode :help)
                 (buf/ensure-visible 10 60))
           out (r/frame s 60 12)]
-      (is (string/includes? out (get r/fg-color-for :help-key)))
-      (is (string/includes? out (get r/fg-color-for :help-header))))))
+      (is (string/includes? out (get @r/fg-color-for :help-key)))
+      (is (string/includes? out (get @r/fg-color-for :help-header))))))
 
 (deftest describe-bindings-opens-a-read-only-help-buffer
   (testing "describe-bindings signals a *Help* buffer in help-mode, read-only, listing global bindings"

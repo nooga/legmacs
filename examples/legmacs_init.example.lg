@@ -8,7 +8,8 @@
 (ns legmacs-init
   (:require [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.buffer :as buf]
-            [legmacs.minibuffer :as mb]))
+            [legmacs.minibuffer :as mb]
+            [legmacs.theme :as theme]))
 
 ;; Rebind a default: M-j to move down 5 lines, M-k to move up 5 lines.
 (defcommand jump-down "Move point down 5 lines." [state]
@@ -27,3 +28,13 @@
            (fn [state text] (buf/insert-string state (str text text)))))
 
 (km/bind-key! "C-c d" :insert-doubled)
+
+;; Switch the whole palette (same as M-x load-theme). Shipped names:
+;; default, catppuccin-mocha, catppuccin-latte, gruvbox-dark, tokyo-night, nord.
+;; (theme/load-theme! :catppuccin-mocha)
+
+;; Recolor a face; a bare [r g b] vector is :fg. Merges per face, so this
+;; doesn't wipe the rest of the palette. (theme/reset-theme!) restores the
+;; shipped default.
+(theme/set-theme! {:string {:fg [180 220 140]}
+                   :comment {:italic true}})

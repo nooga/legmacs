@@ -14,6 +14,7 @@
             [legmacs.modes :as modes]
             [legmacs.modes.help :as help]
             [legmacs.dispatch :as dispatch]
+            [legmacs.theme :as theme]
             [legmacs.modes.repl :as repl]))
 
 (defn set-message [state msg] (assoc state :message msg))
@@ -793,6 +794,24 @@
     (-> state
         (assoc :read-only? ro)
         (set-message (if ro "Buffer is now read-only" "Buffer is now writable")))))
+
+(defcommand load-theme
+  "Load a named color theme (TAB-completes against registered themes).
+   Replaces the live palette rather than merging; (theme/set-theme!) is
+   still how you tweak one face afterwards."
+  [state]
+  (mb/open state "Load theme: "
+           (fn [state input]
+             (let [name (string/trim input)]
+               (if (string/blank? name)
+                 state
+                 (if (theme/load-theme! name)
+                   (set-message state (str "Loaded theme " name))
+                   (set-message state (str "Unknown theme: " name))))))
+           {:submit-selected? true
+            :completer (fn [input]
+                         (completion/fuzzy-filter input (map name (theme/theme-names))))}))
+
 
 (defcommand describe-bindings
   "Show the current key bindings in a read-only, syntax-highlighted *Help*

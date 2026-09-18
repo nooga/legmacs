@@ -112,7 +112,7 @@
       (is (string/includes? out "save-buffer"))
       (is (string/includes? out "C-x C-s"))
       (is (string/includes? out "Save the current buffer to its file."))
-      (is (string/includes? out r/candidate-keys-fg))
+      (is (string/includes? out (r/candidate-keys-fg)))
       (is (string/includes? out r/inverse-on))
       (is (string/includes? out "forward-char"))
       (is (string/includes? out "C-f"))
@@ -210,7 +210,7 @@
                                 :candidates [{:row 0 :col 6 :end 11 :label "1: hello world"}]})
           s (buf/ensure-visible s 10 40)
           out (r/frame s 40 24)]
-      (is (string/includes? out r/search-current-bg)))))
+      (is (string/includes? out (r/search-current-bg))))))
 
 (deftest overlay-replaces-the-frame
   (testing "an overlay shows its title and lines instead of the buffer"
@@ -225,13 +225,13 @@
     (let [s (assoc (buf/new-state nil ["hello world"]) :mark [0 0] :cursor-row 0 :cursor-col 5)
           s (buf/ensure-visible s 10 40)
           out (r/frame s 40 12)]
-      (is (string/includes? out r/region-bg))))
+      (is (string/includes? out (r/region-bg)))))
 
   (testing "no mark set -> no highlight at all"
     (let [s (buf/new-state nil ["hello world"])
           s (buf/ensure-visible s 10 40)
           out (r/frame s 40 12)]
-      (is (not (string/includes? out r/region-bg))))))
+      (is (not (string/includes? out (r/region-bg)))))))
 
 (deftest cursor-placement-accounts-for-gutter-and-scroll
   (testing "cursor lands at gutter + (cursor-col - scroll-col), row offset by scroll-row"
@@ -253,7 +253,7 @@
                   (modes/switch-to-mode :test-render-hl)
                   (buf/ensure-visible 10 40))
             out (r/frame s 40 12)]
-        (is (string/includes? out (get r/fg-color-for :keyword)))))))
+        (is (string/includes? out (get @r/fg-color-for :keyword)))))))
 
 (deftest multi-line-highlighter-carries-state-from-above-the-viewport
   (testing "a construct opened offscreen still colors the visible rows"
@@ -280,7 +280,7 @@
         (is (= [{:start 0 :end 7 :style :string}] (nth rows 0)))
         (is (every? (fn [spans] (= :string (:style (first spans)))) rows))
         ;; ...and the frame really paints them
-        (is (string/includes? (r/frame s 40 12) (get r/fg-color-for :string))))
+        (is (string/includes? (r/frame s 40 12) (get @r/fg-color-for :string))))
       ;; past the closing line the carry is gone again
       (let [s (-> (buf/new-state nil ["<< open" ">> close" "plain"])
                   (modes/switch-to-mode :test-render-carry)
@@ -293,8 +293,8 @@
                 (assoc :paren-match [[0 0] [1 3]])
                 (buf/ensure-visible 10 40))
           out (r/frame s 40 12)]
-      (is (string/includes? out (get r/fg-color-for :paren-match)))
-      (is (string/includes? out (get r/bg-color-for :paren-match))))))
+      (is (string/includes? out (get @r/fg-color-for :paren-match)))
+      (is (string/includes? out (get @r/bg-color-for :paren-match))))))
 
 (deftest recenter-centers-point
   (testing "the :recenter flag centers point in the window and is consumed"

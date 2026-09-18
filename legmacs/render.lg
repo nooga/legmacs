@@ -17,7 +17,8 @@
             [legmacs.modes :as modes]
             [legmacs.modeline :as ml]
             [legmacs.windows :as win]
-            [legmacs.buffers :as bufs]))
+            [legmacs.buffers :as bufs]
+            [legmacs.theme :as theme]))
 
 (defn- csi [s] (str (char 27) "[" s))
 (def reset (csi "0m"))
@@ -32,18 +33,66 @@
 (defn- bg [r g b] (csi (str "48;2;" r ";" g ";" b "m")))
 (defn- move-to [col row] (csi (str row ";" col "H")))
 
-(def gutter-fg (fg 110 110 130))
-(def gutter-fg-current (str bold-on (fg 235 200 90)))
-(def tilde-fg (fg 90 90 105))
-(def message-fg (fg 140 200 140))
-(def error-fg (fg 220 120 120))
-;; M-x / describe-function candidate keys (muted on unselected rows).
-;; The selected row is full-width inverse, so it doesn't need its own
-;; key color -- tests pin this escape the same way they pin help-key.
-(def candidate-keys-fg (fg 110 110 130))
-(def region-bg (bg 55 70 95))
-(def search-match-bg (bg 80 70 40))
-(def search-current-bg (bg 170 120 40))
+;; Compiled ANSI for the live palette (legmacs.theme). Faces with :fg or
+;; an attribute land in fg-color-for; faces with :bg land in bg-color-for
+;; (a face can be in both -- :paren-match is). UI-only faces (gutter,
+;; tilde, message, ...) are looked up via `ui`. set-theme! rebuilds these
+;; through theme/on-change! so a frame always sees the current palette.
+(def fg-color-for (atom {}))
+(def bg-color-for (atom {}))
+(def ^:private ui-ansi (atom {}))
+
+(defn- compile-face-fg [spec]
+  (str (when (:bold spec) bold-on)
+       (when (:italic spec) italic-on)
+       (when (:underline spec) underline-on)
+       (when-let [c (:fg spec)] (apply fg c))))
+
+(defn- with-default
+  "Layer `spec` over the theme's :default face so a :bold-only style still
+   picks up the editor fg, and a gutter with only :fg still paints the
+   editor bg. The shipped :default theme has no :default face, so this is
+   a no-op there."
+  [t spec]
+  (merge (get t :default {}) spec))
+
+(defn- compile-theme!
+  "Rebuild the ANSI tables from a theme map. Named (not an fn in a cond)
+   so let-go's AOT lowering doesn't hoist it."
+  [t]
+  (reset! fg-color-for
+          (reduce (fn [m [k spec]]
+                    (let [merged (with-default t spec)]
+                      (if (or (:fg merged) (:bold spec) (:italic spec) (:underline spec))
+                        (assoc m k (compile-face-fg merged))
+                        m)))
+                  {} t))
+  (reset! bg-color-for
+          (reduce (fn [m [k spec]]
+                    (if-let [c (:bg spec)] (assoc m k (apply bg c)) m))
+                  {} t))
+  (reset! ui-ansi
+          (reduce (fn [m k]
+                    (if-let [spec (get t k)]
+                      (let [merged (with-default t spec)]
+                        (assoc m k (str (compile-face-fg merged)
+                                        (when-let [c (:bg merged)] (apply bg c)))))
+                      m))
+                  {} [:default :gutter :gutter-current :tilde :message :error :candidate-keys]))
+  (when-let [face (get t :modeline)]
+    (ml/set-modeline-theme! (select-keys face [:fg :bg]))))
+
+(defn- ui [k] (get @ui-ansi k ""))
+
+(theme/on-change! compile-theme!)
+
+;; Compatibility aliases tests and older code used as bare ANSI strings.
+;; They're functions of the live theme so a set-theme! is visible here too.
+(defn region-bg [] (get @bg-color-for :region ""))
+(defn search-match-bg [] (get @bg-color-for :search-match ""))
+(defn search-current-bg [] (get @bg-color-for :search-current ""))
+(defn candidate-keys-fg [] (ui :candidate-keys))
+
 
 (defn pad-right
   "Truncate or space-pad `s` to exactly `width` display columns."
@@ -245,7 +294,7 @@
     (if (>= n width) s (str (apply str (repeat (- width n) \space)) s))))
 
 (defn- gutter-cell [line-no width is-current?]
-  (let [color (if is-current? gutter-fg-current gutter-fg)]
+  (let [color (if is-current? (ui :gutter-current) (ui :gutter))]
     (str color (right-align (str line-no) (dec width)) reset \space)))
 
 (defn- visible-slice [line scroll-col text-cols]
@@ -265,39 +314,10 @@
 
 (def ^:private open-ended 999999)
 
-(def fg-color-for
-  {:comment tilde-fg
-   :string (fg 150 190 120)
-   :char (fg 215 130 160)
-   :keyword (fg 100 170 220)
-   :number (fg 210 150 90)
-   :keyword-literal (fg 90 200 190)
-   :type (fg 180 160 220)
-   :function (fg 235 205 110)
-   :variable (fg 120 205 235)
-   :preproc (fg 205 120 190)
-   :paren-match (str bold-on (fg 255 255 255))
-   ;; legmacs.modes.markdown's styles
-   :md-header (str bold-on (fg 235 170 60))
-   :md-hr gutter-fg
-   :md-quote (str italic-on (fg 140 150 120))
-   :md-list (fg 220 150 80)
-   :md-code (fg 200 130 190)
-   :md-bold bold-on
-   :md-italic italic-on
-   :md-link (str underline-on (fg 120 180 240))
-   :md-url tilde-fg
-   ;; legmacs.modes.help's styles
-   :help-header (str bold-on (fg 235 170 60))
-   :help-key (str bold-on (fg 100 170 220))
-   :help-command (fg 150 190 120)
-   :help-doc (str italic-on (fg 140 145 160))})
+;; fg-color-for / bg-color-for are atoms rebuilt from legmacs.theme; the
+;; span compositor still keys them by the same style keywords highlighters
+;; emit, so a theme change never touches a mode.
 
-(def bg-color-for
-  {:region region-bg
-   :paren-match (bg 80 80 40)
-   :search-match search-match-bg
-   :search-current search-current-bg})
 
 (defn- clamp-span
   "[start end) in absolute columns -> screen-relative, clamped to
@@ -334,8 +354,9 @@
         (let [f (nth fg-styles i), b (nth bg-styles i)
               j (loop [j i] (if (and (< j n) (= (nth fg-styles j) f) (= (nth bg-styles j) b)) (recur (inc j)) j))
               seg (subs text i j)
-              prefix (str (get fg-color-for f "") (get bg-color-for b ""))]
-          (recur j (conj out (if (or f b) (str prefix seg reset) seg))))))))
+              prefix (str (if f (get @fg-color-for f "") (get @fg-color-for :default ""))
+                          (if b (get @bg-color-for b "") (get @bg-color-for :default "")))]
+          (recur j (conj out (if (seq prefix) (str prefix seg reset) seg))))))))
 
 (defn- region-spans-for-row
   "The active region's span(s) on `buf-row`, as a list for style-array
@@ -451,7 +472,8 @@
                  bg-arr (style-array text-cols bg-spans scroll-col)]
              (str (gutter-cell (inc buf-row) gutter (= buf-row (:cursor-row state)))
                   (render-spans visible fg-arr bg-arr)))
-           (str tilde-fg (pad-right "~" gutter) reset (pad-right "" text-cols))))))
+           (str (ui :tilde) (pad-right "~" gutter) reset
+                (ui :default) (pad-right "" text-cols) reset)))))
 
 ;; --- mode-line segment compositor --------------------------------------
 ;;
@@ -482,17 +504,16 @@
                      (str (apply bg (or (:bg seg) default-bg)) (apply fg (or (:fg seg) default-fg))
                           text-piece reset)))))))
 
-;; A window that isn't active renders its mode line in these muted colors
-;; instead of the theme's (and with every segment's own badge colors
+;; A window that isn't active renders its mode line in the theme's
+;; :inactive-modeline face (and with every segment's own badge colors
 ;; stripped) -- the one bright mode line on screen is where your keys go,
 ;; the same cue Emacs gives.
-(def ^:private inactive-ml-bg [30 33 42])
-(def ^:private inactive-ml-fg [122 127 142])
 
 (defn- status-line [state x screen-row cols active?]
   (let [theme @ml/theme
-        default-bg (if active? (:bg theme) inactive-ml-bg)
-        default-fg (if active? (:fg theme) inactive-ml-fg)
+        inactive (get @theme/theme :inactive-modeline)
+        default-bg (if active? (:bg theme) (:bg inactive))
+        default-fg (if active? (:fg theme) (:fg inactive))
         sep @ml/separator
         dim (fn [segs] (if active? segs (map #(dissoc % :fg :bg) segs)))
         left-segs (dim (ml/left-segments state))
@@ -524,7 +545,8 @@
 ;; the promised height no matter what: a plain prompt, a live candidate list
 ;; below the prompt (swiper), or a multi-line message.
 
-(defn- blank-row [screen-row cols] (str (move-to 1 screen-row) reset (pad-right "" cols)))
+(defn- blank-row [screen-row cols]
+  (str (move-to 1 screen-row) reset (ui :default) (pad-right "" cols) reset))
 
 (defn- candidate-window
   "The slice of `candidates` to show given a `cap`-row budget, scrolled so
@@ -589,16 +611,17 @@
            prefix name keys-plain fill-part
            (if (seq doc) (str italic-on doc-plain) "")
            reset)
-      (str (move-to 1 screen-row) reset
+      (str (move-to 1 screen-row) reset (ui :default)
            prefix name
-           (if (seq keys) (str "  " candidate-keys-fg keys reset) "")
+           (if (seq keys) (str "  " (ui :candidate-keys) keys reset) "")
            fill-part reset))))
 
 (defn- candidate-row [screen-row cand selected? cols]
   (if (or (seq (:keys cand)) (seq (:doc cand)))
     (annotated-candidate-row screen-row cand selected? cols)
     (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)]
-      (str (move-to 1 screen-row) (if selected? (str inverse-on text reset) text)))))
+      (str (move-to 1 screen-row) (ui :default)
+           (if selected? (str inverse-on text reset) (str text reset))))))
 
 (defn- minibuffer-view [state screen-row0 mb-rows cols]
   (let [{:keys [prompt input note candidates selection]} (:minibuffer state)
@@ -606,8 +629,9 @@
         [start shown] (candidate-window candidates selection cap)
         used (inc (count shown))]
     (apply str
-           (str (move-to 1 screen-row0) reset
-                (pad-right (str prompt input (if note (str "  " note) "")) cols))
+           (str (move-to 1 screen-row0) reset (ui :default)
+                (pad-right (str prompt input (if note (str "  " note) "")) cols)
+                reset)
            (concat
             (map-indexed (fn [i c] (candidate-row (+ screen-row0 1 i) c
                                                   (= (+ start i) (or selection 0)) cols))
@@ -619,7 +643,7 @@
         n (count lines)]
     (apply str
            (concat
-            (map-indexed (fn [i l] (str (move-to 1 (+ screen-row0 i)) message-fg (pad-right l cols) reset))
+            (map-indexed (fn [i l] (str (move-to 1 (+ screen-row0 i)) (ui :message) (pad-right l cols) reset))
                          lines)
             (map (fn [i] (blank-row (+ screen-row0 n i) cols)) (range (- mb-rows n)))))))
 
@@ -693,7 +717,7 @@
 
 (defn- divider-column [{:keys [x y h]}]
   (apply str
-         (map (fn [i] (str (move-to (inc x) (+ y 1 i)) tilde-fg divider-char reset))
+         (map (fn [i] (str (move-to (inc x) (+ y 1 i)) (ui :tilde) divider-char reset))
               (range h))))
 
 (defn- clamp-view
