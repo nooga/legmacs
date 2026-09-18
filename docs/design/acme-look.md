@@ -89,7 +89,7 @@ a future so you can keep typing.
 `execute-at-point` does not call `rc` itself; it snapshots the script and
 `(bufs/spawn-task …)` (see the header comment in `legmacs/buffers.lg`).
 The I/O thunk runs in a goroutine; `drain-jobs` folds the result into
-`+Errors` on the main thread when the promise realizes.  The editor keeps
+`+Errors` on the main thread *before the next frame is painted*.  The editor keeps
 reading keys while rc runs.  C-g discards the result without killing the
 process.  A throw in `:then` is an echo-area message, not a session death.
 Killing the process, streaming output, and job ids are still later.

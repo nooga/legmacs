@@ -210,14 +210,18 @@ work that must paint first uses `:pending-task` — a fn or vector of fns,
 place of reading a key*. I/O that can run off-thread uses `:async-jobs`:
 `bufs/spawn-task` starts a `(future …)` immediately with an `io` thunk
 (no editor state) and a `:then` `(fn [state outcome] -> state)` applied
-later by `bufs/drain-jobs` on the main thread. Goroutines never touch
-buffers. Outcome is `{:ok v}` / `{:err e}` because let-go's future
-delivers nil on throw. While jobs are in flight the loop peeks
-`term/key-pending?` and sleeps 20ms instead of parking in `read-chord`,
-so typing continues. Idle is still a blocking read. C-g
-(`bufs/discard-jobs`) drops results without killing HTTP/`os/sh`. Named
-functions, not inline `fn` literals, when building the closure inside a
-conditional — see the AOT-hoisting gotcha below.
+later by `bufs/drain-jobs` on the main thread *before* the next frame is
+painted — drain-then-paint, not the other way around, or a finished job
+sits on screen until the next keystroke. `bufs/loop-wait` is the idle
+decision (`:quit` / `:pending-task` / `:poll` / `:read-key`) so that
+order is testable without a TTY. Goroutines never touch buffers. Outcome
+is `{:ok v}` / `{:err e}` because let-go's future delivers nil on throw.
+While jobs are in flight the loop peeks `term/key-pending?` and sleeps
+20ms instead of parking in `read-chord`, so typing continues. Idle is
+still a blocking read. C-g (`bufs/discard-jobs`) drops results without
+killing HTTP/`os/sh`. Named functions, not inline `fn` literals, when
+building the closure inside a conditional — see the AOT-hoisting gotcha
+below.
 
 **Windows (splits) are the same wrapping trick one level up.** The
 workspace holds a window tree (`legmacs.windows` — pure data + layout
