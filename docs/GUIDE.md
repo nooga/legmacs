@@ -80,6 +80,7 @@ not held together.
 | `C-x k` | kill (close) the current buffer |
 | `C-x <right>` / `C-x <left>` | cycle to the next / previous buffer |
 | `C-c C-z` | open (or switch to) the `*repl*` buffer |
+| `C-c C-v` | vibe-replace: run the `(vibe "...")` form around point and replace it with the code it returns |
 | `C-x 2` | split the current window in two, one above the other |
 | `C-x 3` | split the current window in two, side by side |
 | `C-x o` | move to the next window (cycles top-to-bottom, left-to-right) |
@@ -261,6 +262,15 @@ same way Emacs's does. Eval errors (bad syntax, a runtime exception,
 whatever) are caught and shown in the echo area rather than crashing the
 editor.
 
+`C-c C-e` puts the current namespace back when it's done. It has to:
+`load-string`ing a buffer that opens with `(ns foo)` -- which every real
+`.lg` file does -- relocates the running namespace permanently, and since
+that namespace *is* the editor's own, one `C-c C-e` on an ordinary file
+would otherwise leave `buf/`, `km/`, `dispatch/` and `vibe` unresolvable
+for the rest of the session. `C-x C-e` and `C-j` are deliberately left
+alone, as is the `*repl*` buffer: an `(in-ns 'foo)` you typed and evaluated
+on purpose should still move you.
+
 `C-c C-z` opens (or switches to) `*repl*` -- a dedicated, persistent REPL
 buffer rather than a transcript you build by hand with `C-j`. It's plain
 let-go-mode (so everything above -- highlighting, auto-pairing, paren
@@ -309,6 +319,67 @@ matter how far above the screen it started.
 See [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) for all of the
 above. Registering your own mode from `legmacs-init.lg`, with or without
 these features, is the same `register-mode!`/`register-auto-mode!` call.
+
+### Vibing (`C-c C-v`)
+
+[`legmacs/vibe.lg`](../legmacs/vibe.lg) adds one function and one command.
+The function is ordinary: `(vibe "a quicksort")` asks the configured model
+for let-go code and returns it as a string, so `C-x C-e` on it echoes the
+code, and it composes (`(str (vibe "a") (vibe "b"))` is fine). The command,
+`C-c C-v`, finds the innermost `(vibe ...)` form around point, runs it, and
+replaces the form's text with the string it returned -- as one undo step,
+so one `C-_` puts your prompt back.
+
+What makes the answers usable is the context. `vibe-replace` sends the
+whole buffer with the call site swapped for a `<<<VIBE:HERE>>>` marker,
+plus the column that marker starts at, so the model writes code shaped to
+fit that exact spot rather than a generic answer to the prompt. `vibe`
+itself can't see any of that (it's just a function), so `vibe-replace`
+parks the call site in an atom for the duration of the eval -- which is
+also why a bare `(vibe "...")` from the REPL still works, just contextless.
+
+Setup is `~/.config/legmacs/vibe.edn` (or `$LEGMACS_CONFIG_DIR/vibe.edn` --
+the same variable `bin/legmacs` already honours for `legmacs_init.lg`):
+
+```clojure
+{:key "sk-..."}
+```
+
+A key is all that's required. The default model is `gpt-5.6-luna`;
+`:model` picks another. The file is merged into the config map wholesale
+rather than being read key by key, so everything else works from there too:
+
+| Key | Meaning |
+|---|---|
+| `:key` | API key. Falls back to the provider's env var (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) if absent. |
+| `:model` | Model id. Defaults to the provider's (`gpt-5.6-luna` / `claude-sonnet-5`). |
+| `:provider` | `:openai` (default) or `:anthropic`. |
+| `:url` | Endpoint. Point it at llama.cpp/ollama/openrouter/groq and keep `:provider :openai`, since they speak the same shape. |
+| `:max-tokens` | Default 8192. Reasoning models spend this budget on reasoning *and* output, so a small value shows up as an empty reply, not a truncated one. |
+| `:system` | The instructions the model gets. Replace to change house style. |
+
+Config is four layers, each beating the one before it: `legmacs.vibe/defaults`,
+then vibe.edn, then the `legmacs.vibe/config` atom (for `legmacs-init.lg`:
+`(swap! vibe/config assoc :model "gpt-5.6-terra")`), then a per-call opts
+map (`(vibe "a quicksort" {:model "gpt-5.6-sol"})`). vibe.edn is re-read on
+every call, not cached at startup, so editing it in a legmacs buffer takes
+effect on the next `C-c C-v`. A malformed or half-saved file parses as no
+config rather than an error, so a stray keystroke in it can't break the
+command with a reader error -- you get the ordinary "no API key, put one
+in ..." message instead.
+
+A provider in `legmacs.vibe/providers` is four keys and two functions
+(`:body` builds the request map, `:extract` pulls the text out of the
+parsed response), so adding one is a `swap!`.
+
+Vibe has to block on a network round-trip, and it stays out of the
+pure pipeline the same way Acme Execute does: `vibe-replace` performs no
+I/O at all, it just sets `:message "vibing..."` and
+`:pending-task (vibe-task start end)` on the state and returns. `main.lg`'s
+loop renders that frame first, *then* runs the task in place of reading a
+key. Doing it inline in the command instead would have left the screen
+frozen on a stale frame for the whole request, with no way to say what it
+was waiting for.
 
 Any file ending in `.md` or `.markdown` opens into **markdown-mode**
 (highlighting only, no key bindings of its own, so every global key still
@@ -699,6 +770,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
+| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer as context, and splice the answer over the call. Arms `:pending-task` so the "vibing..." frame paints before the HTTP call. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |

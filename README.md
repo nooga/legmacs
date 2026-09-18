@@ -36,6 +36,9 @@ started:
   `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files open into the same mode too
 - a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
   running transcript instead of building one by hand with `C-j`
+- `(vibe "...")` (`C-c C-v`): write what you want where you want it, and an
+  LLM writes the code over the call -- with the rest of your buffer as
+  context (see [Vibe coding](#vibe-coding))
 - keyboard macros, a mark ring, interactive query-replace, dabbrev-expand,
   comment-dwim, and bracketed paste
 - structural expand-region for let-go, growing the selection one
@@ -85,6 +88,67 @@ Drop a `legmacs-init` namespace at `~/.config/legmacs/legmacs_init.lg`:
 Same `defcommand`/`bind-key!` the editor defines its own keys with. See
 [examples/legmacs_init.example.lg](examples/legmacs_init.example.lg) for a
 fuller one.
+
+## Vibe coding
+
+Type a call where you want the code, put point in it, press `C-c C-v`:
+
+```clojure
+(defn triple [x] (* 3 x))
+
+(vibe "a fn that doubles x, named double")
+```
+
+...and the form is replaced, in place, by whatever the model wrote:
+
+```clojure
+(defn triple [x] (* 3 x))
+
+(defn double [x]
+  (* 2 x))
+```
+
+One undo puts the call back. The model gets your whole buffer with the call
+site swapped for a marker, so it writes code that fits *that spot* --
+surrounding defns, aliases, and indentation included, not a generic answer
+to the prompt in isolation.
+
+`vibe` is also just a function: `C-x C-e` on `(vibe "a quicksort")` echoes
+the generated code instead of splicing it, and it composes like anything
+else (`(str (vibe "a") (vibe "b"))` works).
+
+Setup is one file, `~/.config/legmacs/vibe.edn`:
+
+```clojure
+{:key "sk-..."}
+```
+
+That's it. The default model is `gpt-5.6-luna`; add `:model` to pick
+another:
+
+```clojure
+{:key "sk-..."
+ :model "gpt-5.6-sol"}
+```
+
+The file is merged into vibe's config wholesale, so the other knobs work
+from there too -- `:provider` (`:openai` or `:anthropic`, both ship in
+`legmacs.vibe/providers`), `:url` for anything speaking the OpenAI
+chat-completions shape (llama.cpp, ollama, openrouter, groq), `:max-tokens`,
+and `:system` if you want to rewrite the instructions the model gets:
+
+```clojure
+{:key "sk-ant-..."
+ :provider :anthropic
+ :model "claude-opus-5"}
+```
+
+`legmacs-init.lg` can override any of it in code
+(`(swap! legmacs.vibe/config assoc :model "gpt-5.6-terra")`), and a per-call
+opts map beats both: `(vibe "a quicksort" {:model "gpt-5.6-sol"})`. If you
+already export `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, that works as a
+fallback for `:key`. A provider is four keys and two functions -- adding a
+third is a `swap!` on `providers`, same as everything else here.
 
 ## Language support
 

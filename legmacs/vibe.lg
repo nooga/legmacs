@@ -1,0 +1,389 @@
+;; legmacs.vibe — `(vibe "prompt")`: ask an LLM for let-go code, then splice
+;; its answer into the buffer in place of the call.
+;;
+;; Two halves that are useful on their own:
+;;
+;;   (vibe "a fn that reverses a vector")   ; an ordinary function. Returns
+;;                                          ; the generated code as a string,
+;;                                          ; so C-x C-e works on it too.
+;;
+;;   C-c C-v                                ; vibe-replace: find the (vibe ...)
+;;                                          ; form around point, run it, and
+;;                                          ; replace the form's text with the
+;;                                          ; string it returned.
+;;
+;; The interesting part is the context: vibe-replace hands the model the whole
+;; buffer with the call site swapped for a marker, so the answer is written to
+;; fit *that spot* — surrounding defns, aliases, indentation and all — rather
+;; than in a vacuum.
+;;
+;; Setup is one file, ~/.config/legmacs/vibe.edn:
+;;
+;;   {:key "sk-..."}
+;;
+;; See the vibe.edn section below for the rest of what can go in there.
+;;
+;; The network call blocks, which the rest of legmacs never does. So the
+;; command is still pure: it arms a :pending-task (see legmacs.buffers)
+;; and returns, and main.lg's loop paints the "vibing..." frame before
+;; running the task. Same seam Acme Execute uses -- not a vibe-specific
+;; hook. Otherwise the editor would freeze with a stale screen for however
+;; long the model takes.
+
+(ns legmacs.vibe
+  (:require [string]
+            [json]
+            [http]
+            [os]
+            [legmacs.buffer :as buf]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.lisp-syntax :as ls]))
+
+(def marker
+  "What the call site is replaced with in the context sent to the model."
+  "<<<VIBE:HERE>>>")
+
+(def default-system-prompt
+  (str "You write let-go code. let-go is a Clojure dialect running on a Go VM: "
+       "most of clojure.core is there, plus namespaces like string/, json/, "
+       "http/, os/ and term/.\n\n"
+       "You get a source file with the marker " marker " at exactly one spot, "
+       "and a request. Reply with the code that should replace that marker.\n\n"
+       "Rules:\n"
+       "- Output raw code only. No markdown fences, no prose, no preamble, no "
+       "trailing explanation.\n"
+       "- The code must read as balanced, complete form(s) in that position.\n"
+       "- Match the file's existing style, naming and aliases.\n"
+       "- Do not repeat any other part of the file.\n"
+       "- let-go has no forward references at the top level: a defn body may "
+       "only refer to names defined above it.\n"))
+
+;; --- providers -----------------------------------------------------------
+;;
+;; Two request/response shapes, picked by (:provider @config). Both are
+;; plain data + two functions, so a user's legmacs-init.lg can add a third
+;; (or point :url at a local llama.cpp / ollama / openrouter endpoint,
+;; which speak the :openai shape) without touching this file.
+;;
+;; Request bodies are built with *keyword* keys on purpose: let-go's
+;; json/write-json double-quotes string map keys ({"a" 1} serialises as
+;; {"\"a\"": 1}), but keywordizes correctly.
+
+(defn- openai-body [{:keys [model system user max-tokens]}]
+  {:model model
+   :max_completion_tokens max-tokens
+   :messages [{:role "system" :content system}
+              {:role "user" :content user}]})
+
+(defn- openai-extract [m]
+  (let [choices (get m "choices")]
+    (when (seq choices)
+      (get (get (first choices) "message") "content"))))
+
+(defn- anthropic-body [{:keys [model system user max-tokens]}]
+  {:model model
+   :max_tokens max-tokens
+   :system system
+   :messages [{:role "user" :content user}]})
+
+(defn- anthropic-extract [m]
+  (let [blocks (get m "content")]
+    (when (seq blocks)
+      (get (first blocks) "text"))))
+
+(def providers
+  {:openai {:url "https://api.openai.com/v1/chat/completions"
+            :model "gpt-5.6-luna"
+            :key-env "OPENAI_API_KEY"
+            :headers (fn [key] {"Authorization" (str "Bearer " key)
+                                "Content-Type" "application/json"})
+            :body openai-body
+            :extract openai-extract}
+   :anthropic {:url "https://api.anthropic.com/v1/messages"
+               :model "claude-sonnet-5"
+               :key-env "ANTHROPIC_API_KEY"
+               :headers (fn [key] {"x-api-key" key
+                                   "anthropic-version" "2023-06-01"
+                                   "Content-Type" "application/json"})
+               :body anthropic-body
+               :extract anthropic-extract}})
+
+(def defaults
+  "The bottom layer. Anything absent here falls through to the provider's
+   own defaults (:url, :model), so a provider stays a self-contained unit.
+
+   :max-tokens is generous because gpt-5.6-luna is a reasoning model and
+   its reasoning tokens come out of the same budget as the code you asked
+   for -- a tight limit shows up as an empty reply, not a truncated one."
+  {:provider :openai
+   :max-tokens 8192
+   :system default-system-prompt})
+
+(def config
+  "Programmatic overrides, on top of vibe.edn. Empty by default -- this is
+   for legmacs-init.lg, e.g.
+
+     (swap! legmacs.vibe/config assoc :provider :anthropic)
+
+   Code wins over the config file, and a per-call opts map wins over both."
+  (atom {}))
+
+;; --- vibe.edn ------------------------------------------------------------
+;;
+;; ~/.config/legmacs/vibe.edn (or $LEGMACS_CONFIG_DIR/vibe.edn, the same
+;; variable bin/legmacs already honours for legmacs_init.lg):
+;;
+;;   {:key "sk-..."
+;;    :model "gpt-5.6-luna"}
+;;
+;; :key and an optional :model are the whole expected surface, but the file
+;; is merged into the config map wholesale, so :provider, :url, :max-tokens
+;; and :system work from here too without needing their own plumbing.
+;;
+;; Re-read on every call rather than cached at load: it's one small file
+;; against a network round-trip, and editing your model in a legmacs buffer
+;; and having the next C-c C-v use it is exactly what you'd want from an
+;; editor that can already eval itself.
+
+(defn config-dir []
+  (let [d (os/getenv "LEGMACS_CONFIG_DIR")]
+    (if (seq d) d (str (os/getenv "HOME") "/.config/legmacs"))))
+
+(defn config-path [] (str (config-dir) "/vibe.edn"))
+
+(defn parse-config
+  "EDN text -> a config map. Anything that isn't a map (a blank file, a
+   stray vector, a half-finished edit) is no config rather than an error:
+   the call that follows will fail on the missing :key with a message that
+   names this file, which is more use than a reader error would be."
+  [text]
+  (if-not (seq (string/trim (str text)))
+    {}
+    (let [v (try (read-string text) (catch e nil))]
+      (if (map? v) v {}))))
+
+(defn read-config
+  "vibe.edn's contents, or {} if there's no such file."
+  []
+  (parse-config (try (slurp (config-path)) (catch e nil))))
+
+(defn api-key
+  "vibe.edn's :key, or the provider's env var as a fallback for people who
+   already export one."
+  [cfg provider]
+  (or (let [k (:key cfg)] (when (seq k) k))
+      (let [v (os/getenv (:key-env provider))] (when (seq v) v))))
+
+;; --- talking to the model ------------------------------------------------
+
+(defn strip-fences
+  "Models wrap code in ``` fences no matter how firmly you ask them not to.
+   Peel one outer fence (with or without a language tag) if that's all
+   there is; leave anything else alone, since a fence in the *middle* of a
+   reply means the reply wasn't just code and the caller should see that."
+  [s]
+  (let [t (string/trim s)]
+    (if-not (string/starts-with? t "```")
+      t
+      (let [after-open (subs t 3)
+            nl (string/index-of after-open "\n")
+            body (if nl (subs after-open (inc nl)) after-open)
+            close (string/last-index-of body "```")]
+        (string/trim (if close (subs body 0 close) body))))))
+
+(defn- one-line
+  "Collapse a message to something the one-line echo area can show."
+  [s]
+  (let [s (string/replace (str s) "\n" " ")]
+    (if (> (count s) 200) (str (subs s 0 200) "...") s)))
+
+(defn- error-message [e]
+  (or (ex-message e) (str e)))
+
+(defn- request-completion [cfg provider user-message]
+  (let [key (api-key cfg provider)
+        model (or (:model cfg) (:model provider))
+        url (or (:url cfg) (:url provider))]
+    (when-not key
+      (throw (str "no API key -- put {:key \"...\"} in " (config-path)
+                  " (or export " (:key-env provider) ")")))
+    (let [body ((:body provider) {:model model
+                                  :system (:system cfg)
+                                  :user user-message
+                                  :max-tokens (:max-tokens cfg)})
+          resp (http/post url (json/write-json body)
+                          {:headers ((:headers provider) key)})
+          status (:status resp)]
+      (when-not (and (<= 200 status) (< status 300))
+        (throw (str "HTTP " status ": " (one-line (:body resp)))))
+      (let [parsed (json/read-json (:body resp))
+            content ((:extract provider) parsed)]
+        (when-not (seq content)
+          (throw (str "no content in response: " (one-line (:body resp)))))
+        content))))
+
+;; --- call-site context ---------------------------------------------------
+;;
+;; `vibe` is an ordinary function, so it can't see the buffer it was typed
+;; into. vibe-replace parks the call site here for the duration of the eval
+;; instead -- which also means (str (vibe "a") (vibe "b")) in one form works,
+;; and a bare (vibe "...") from a REPL still works, just contextless.
+
+(def current-context (atom nil))
+
+(defn with-context
+  "Run `thunk` with `ctx` visible to vibe. Always clears it afterwards.
+
+   Written the long way round on purpose: let-go's `finally` can't be used
+   for this. A try whose only trailing clause is `finally` *swallows* the
+   in-flight exception and returns it as an ordinary value, and a `catch`
+   that rethrows skips the `finally` entirely -- so neither shape both
+   propagates the error and clears the atom. Reifying the outcome does."
+  [ctx thunk]
+  (reset! current-context ctx)
+  (let [outcome (try {:ok (thunk)} (catch e {:err e}))]
+    (reset! current-context nil)
+    (if (contains? outcome :err)
+      (throw (:err outcome))
+      (:ok outcome))))
+
+(defn context-text
+  "The buffer's text with [start end) replaced by the marker."
+  [text start end]
+  (str (subs text 0 start) marker (subs text end)))
+
+(defn user-message
+  "The prompt actually sent. Splitting this out (pure, no I/O) is what
+   makes the interesting half of vibe testable."
+  [request ctx]
+  (if-not ctx
+    (str "Request: " request "\n\n"
+         "There is no surrounding file; reply with standalone let-go code.")
+    (str "Request: " request "\n\n"
+         "File: " (or (:filename ctx) "*scratch*") "\n"
+         "The " marker " below starts at column " (:column ctx)
+         ", so indent any continuation lines to match.\n\n"
+         "----- begin file -----\n"
+         (:text ctx)
+         "\n----- end file -----")))
+
+(defn vibe
+  "Ask the configured model for let-go code and return it as a string.
+
+   Called by vibe-replace (C-c C-v), which supplies the surrounding buffer
+   as context and splices the answer back over the call. Also fine on its
+   own: C-x C-e on (vibe \"...\") echoes the generated code.
+
+   Configuration is four layers, each beating the one before it: `defaults`,
+   then vibe.edn, then the `config` atom (legmacs-init.lg), then `opts` for
+   this one call -- (vibe \"a quicksort\" {:model \"gpt-5.6-sol\"})."
+  ([request] (vibe request {}))
+  ([request opts]
+   (let [cfg (merge defaults (read-config) @config opts)
+         provider (get providers (:provider cfg))]
+     (when-not provider
+       (throw (str "unknown vibe provider " (pr-str (:provider cfg)))))
+     (strip-fences (request-completion cfg provider
+                                       (user-message request @current-context))))))
+
+;; --- finding the (vibe ...) form ----------------------------------------
+
+(defn- name-char? [ch]
+  (let [c (int ch)]
+    (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)
+        (contains? #{45 95 33 63 42 43 62 60 61} c))))
+
+(defn vibe-head-at?
+  "Does a `(vibe ` form open at `offset`? Checks the character after the
+   name too, so (vibes ...) doesn't match."
+  [text offset]
+  (and (<= 0 offset)
+       (<= (+ offset 6) (count text))
+       (= "(vibe" (subs text offset (+ offset 5)))
+       (not (name-char? (nth text (+ offset 5))))))
+
+(defn find-vibe-form
+  "[start end) of the innermost (vibe ...) form containing `point` --
+   end exclusive, so it covers the closing paren. Point may also sit
+   just past the close, the way C-x C-e treats a sexp it follows.
+   nil if there's no such form."
+  [text point]
+  (let [scanned (ls/scan text)
+        candidates (filter (fn [[o c]]
+                             (and (< o c)
+                                  (<= o point)
+                                  (<= point (inc c))
+                                  (vibe-head-at? text o)))
+                           (:pairs scanned))]
+    (when (seq candidates)
+      (let [[o c] (apply max-key first candidates)]
+        [o (inc c)]))))
+
+(defn splice-offsets
+  "Replace [start end) of the buffer's flat text with `replacement`, as a
+   single undo step, leaving point just after it. buf/replace-span can't do
+   this: the replacement is routinely multi-line."
+  [state start end replacement]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [text (buf/buffer-text state)
+          new-text (str (subs text 0 start) replacement (subs text end))
+          state (-> (buf/push-undo state)
+                    (assoc :lines (buf/split-lines new-text) :modified? true))
+          [row col] (buf/row-col-of state (+ start (count replacement)))]
+      (-> state
+          (assoc :cursor-row row :cursor-col col :goal-col nil)
+          buf/clamp-cursor))))
+
+;; --- the command ---------------------------------------------------------
+
+(defn resolve-vibe
+  "Perform the vibe at [start end): evaluate the form with the call site's
+   context in scope and splice the resulting string over it. The one impure
+   thing in this namespace's editing path, called from a :pending-task --
+   never from dispatch."
+  [state start end]
+  (let [text (buf/buffer-text state)]
+    (if-not (and start end (<= end (count text)) (vibe-head-at? text start))
+      (assoc state :message "vibe: form moved before it could run")
+      (let [[_row col] (buf/row-col-of state start)
+            form-text (subs text start end)]
+        (try
+          (let [result (with-context {:text (context-text text start end)
+                                      :filename (:filename state)
+                                      :column col}
+                         (fn [] (eval (read-string form-text))))]
+            ;; Anything but a string means the form didn't vibe: a runtime
+            ;; failure throws and lands in the catch below, but let-go's
+            ;; `eval` *returns* compile errors as an #error value rather
+            ;; than raising them -- splicing that over your code would be a
+            ;; miserable way to find out.
+            (if-not (string? result)
+              (assoc state :message (str "vibe: expected a string, got "
+                                         (one-line (pr-str result))))
+              (-> (splice-offsets state start end result)
+                  (assoc :message (str "vibed " (count result) " chars")))))
+          (catch e (assoc state :message (str "vibe error: "
+                                              (one-line (error-message e))))))))))
+
+(defn vibe-task
+  "resolve-vibe as a deferred (fn [state] -> state) for :pending-task.
+   A named function rather than an inline fn literal because vibe-replace
+   builds it inside if-let, and a closure over a local in a conditional
+   branch trips let-go's AOT closure hoisting -- see CLAUDE.md."
+  [start end]
+  (fn [state] (resolve-vibe state start end)))
+
+(defcommand vibe-replace
+  "Replace the (vibe \"...\") form around point with what the model writes.
+   Records the request rather than performing it, so the echo area can say
+   \"vibing...\" before the blocking HTTP call -- arms :pending-task
+   (see legmacs.buffers) and returns."
+  [state]
+  (let [text (buf/buffer-text state)
+        point (buf/offset-of state (:cursor-row state) (:cursor-col state))]
+    (if-let [[start end] (find-vibe-form text point)]
+      (assoc state :message "vibing..." :pending-task (vibe-task start end))
+      (assoc state :message "No (vibe \"...\") form at point"))))
+
+(km/bind-key! "C-c C-v" :vibe-replace)

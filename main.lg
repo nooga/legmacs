@@ -27,6 +27,10 @@
             [legmacs.modes.crutch]
             [legmacs.modes.keycast]
             [legmacs.modes.help]
+            ;; :refer, not just :as -- (vibe "...") typed into a buffer is
+            ;; read and evaluated *in this namespace* (see legmacs.modes.letgo's
+            ;; docstring), so the name has to resolve here unqualified.
+            [legmacs.vibe :refer [vibe]]
             [legmacs.dispatch :as dispatch]
             [legmacs.render :as render]
             [legmacs.buffers :as bufs]))

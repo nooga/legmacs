@@ -49,6 +49,24 @@
           s (lg-mode/eval-buffer s)]
       (is (= "=> 30" (:message s))))))
 
+(deftest eval-buffer-does-not-relocate-the-running-namespace
+  ;; Regression: a buffer that opens with (ns ...) -- i.e. every real .lg
+  ;; file -- used to switch the editor's own namespace permanently, so the
+  ;; next C-x C-e couldn't resolve buf/, km/ or dispatch/ any more.
+  (testing "a buffer with an ns form leaves the current namespace alone"
+    (let [before (ns-name *ns*)
+          s (lg-mode/eval-buffer (buf/new-state nil ["(ns letgo-mode-test-elsewhere)"
+                                                     "(def y 1)"]))]
+      (is (string/includes? (:message s) "=>"))
+      (is (= before (ns-name *ns*)))))
+
+  (testing "...and still leaves it alone when the buffer throws partway through"
+    (let [before (ns-name *ns*)
+          s (lg-mode/eval-buffer (buf/new-state nil ["(ns letgo-mode-test-elsewhere-2)"
+                                                     "(/ 1 0)"]))]
+      (is (string/includes? (:message s) "Eval error"))
+      (is (= before (ns-name *ns*))))))
+
 (deftest let-go-mode-is-registered-for-dot-lg-files
   (testing ".lg is in the auto-mode-alist, pointing at :let-go"
     (is (= :let-go (modes/mode-for-filename "foo.lg")))))

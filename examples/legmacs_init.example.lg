@@ -38,3 +38,12 @@
 ;; shipped default.
 (theme/set-theme! {:string {:fg [180 220 140]}
                    :comment {:italic true}})
+
+;; legmacs.vibe reads ~/.config/legmacs/vibe.edn ({:key "sk-..."}) on its
+;; own, so nothing here is required to make C-c C-v work. This is only for
+;; the bits you'd rather express in code than in the config file -- these
+;; win over vibe.edn.
+;;
+;; (require '[legmacs.vibe :as vibe])
+;; (swap! vibe/config assoc :model "gpt-5.6-sol")
+;; (swap! vibe/config update :system str "\nPrefer threading macros.\n")
