@@ -30,8 +30,8 @@
 
 (defn- spec-for [state] (modes/mode-syntax-spec (:mode state)))
 
-(defn- char-at [text offset]
-  (when (< -1 offset (count text)) (first (subs text offset (inc offset)))))
+(defn- char-at [chars offset]
+  (when (< -1 offset (count chars)) (nth chars offset)))
 
 ;; --- paren matching --------------------------------------------------
 
@@ -41,10 +41,10 @@
    (rather than erroring) when the mode has none."
   [state]
   (if-let [spec (spec-for state)]
-    (let [text (buf/buffer-text state)
+    (let [chars (buf/buffer-chars state)
           offset (buf/offset-of state (:cursor-row state) (:cursor-col state))
-          after (char-at text offset)
-          before (char-at text (dec offset))
+          after (char-at chars offset)
+          before (char-at chars (dec offset))
           point (cond
                   (and after (ps/open-bracket? spec after)) offset
                   (and before (ps/close-bracket? spec before)) (dec offset)
@@ -53,9 +53,9 @@
           ;; bracket -- only needs the innermost open bracket in front of
           ;; point, so it skips the full scan (see ps/match-for-closer)
           match (when point
-                  (if (ps/close-bracket? spec (char-at text point))
-                    (ps/match-for-closer text point spec)
-                    (ps/matching (ps/scan text spec) point)))]
+                  (if (ps/close-bracket? spec (char-at chars point))
+                    (ps/match-for-closer chars point spec)
+                    (ps/matching (ps/scan chars spec) point)))]
       (assoc state :paren-match
              (when match
                [(buf/row-col-of state point) (buf/row-col-of state match)])))
@@ -64,11 +64,11 @@
 ;; --- auto-pairing brackets ----------------------------------------------
 
 (defn- point-info [state spec]
-  (let [text (buf/buffer-text state)
+  (let [chars (buf/buffer-chars state)
         offset (buf/offset-of state (:cursor-row state) (:cursor-col state))]
-    {:before (char-at text (dec offset))
-     :after (char-at text offset)
-     :in-str-or-comment? (ps/point-in-string-or-comment-at? text offset spec)}))
+    {:before (char-at chars (dec offset))
+     :after (char-at chars offset)
+     :in-str-or-comment? (ps/point-in-string-or-comment-at? chars offset spec)}))
 
 (defn- insert-pair [state open-ch close-ch]
   (if-let [spec (spec-for state)]

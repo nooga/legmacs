@@ -160,18 +160,18 @@
 ;; it stays current after every edit or cursor move while let-go-mode is
 ;; active -- see legmacs.modes/register-mode!.
 
-(defn- char-at [text offset]
-  (when (< -1 offset (count text)) (first (subs text offset (inc offset)))))
+(defn- char-at [chars offset]
+  (when (< -1 offset (count chars)) (nth chars offset)))
 
 (defn update-paren-match
   "Emacs show-paren-mode's rule: if the character *after* point is an
    open bracket, or the character *before* point is a close bracket,
    highlight it and its match. Otherwise clear :paren-match."
   [state]
-  (let [text (buf/buffer-text state)
+  (let [chars (buf/buffer-chars state)
         offset (buf/offset-of state (:cursor-row state) (:cursor-col state))
-        after (char-at text offset)
-        before (char-at text (dec offset))
+        after (char-at chars offset)
+        before (char-at chars (dec offset))
         point (cond
                 (and after (ls/open-bracket? after)) offset
                 (and before (ls/close-bracket? before)) (dec offset)
@@ -180,9 +180,9 @@
         ;; which costs one lean pass up to point; only the open-bracket case
         ;; needs the full scan (and its bracket-pair map) to look forward
         match (when point
-                (if (ls/close-bracket? (char-at text point))
-                  (ls/match-for-closer text point)
-                  (ls/matching (ls/scan text) point)))]
+                (if (ls/close-bracket? (char-at chars point))
+                  (ls/match-for-closer chars point)
+                  (ls/matching (ls/scan chars) point)))]
     (assoc state :paren-match
            (when match
              [(buf/row-col-of state point) (buf/row-col-of state match)]))))
@@ -211,15 +211,15 @@
 
 (def ^:private open->close-char {\( \) \[ \] \{ \}})
 
-(defn- point-in-string-or-comment? [text offset]
-  (ls/point-in-string-or-comment-at? text offset))
+(defn- point-in-string-or-comment? [chars offset]
+  (ls/point-in-string-or-comment-at? chars offset))
 
 (defn- point-info [state]
-  (let [text (buf/buffer-text state)
+  (let [chars (buf/buffer-chars state)
         offset (buf/offset-of state (:cursor-row state) (:cursor-col state))]
-    {:before (char-at text (dec offset))
-     :after (char-at text offset)
-     :in-str-or-comment? (point-in-string-or-comment? text offset)}))
+    {:before (char-at chars (dec offset))
+     :after (char-at chars offset)
+     :in-str-or-comment? (point-in-string-or-comment? chars offset)}))
 
 (defn- insert-pair [state open-ch close-ch]
   (if (:in-str-or-comment? (point-info state))
@@ -368,9 +368,9 @@
    the first argument on the opener's own line (falling back to one past
    the bracket when the opener ends its line)."
   [state row]
-  (let [text (buf/buffer-text state)
+  (let [chars (buf/buffer-chars state)
         offset (buf/offset-of state row 0)]
-    (if-let [[open-ch open-offset] (ls/innermost-open-before text offset)]
+    (if-let [[open-ch open-offset] (ls/innermost-open-before chars offset)]
       (let [[open-row open-col] (buf/row-col-of state open-offset)
             line (nth (:lines state) open-row)]
         (if (contains? #{\[ \{} open-ch)
@@ -432,7 +432,7 @@
     [(buf/offset-of state sr sc) (buf/offset-of state er ec)]))
 
 (defn- next-region-to-select [state]
-  (let [scanned (ls/scan (buf/buffer-text state))
+  (let [scanned (ls/scan (buf/buffer-chars state))
         current (region-offsets state)]
     (if current
       (let [[s e] current]

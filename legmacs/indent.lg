@@ -161,8 +161,8 @@
   "Bracket depth at the start of `row`, minus one level if the line pulls
    itself back (see dedents-itself?)."
   [state row code ws rules spec width]
-  (let [text (buf/buffer-text state)
-        depth (ps/depth-at text (buf/offset-of state row 0) spec)
+  (let [chars (buf/buffer-chars state)
+        depth (ps/depth-at chars (buf/offset-of state row 0) spec)
         level (- depth (if (dedents-itself? code ws rules spec) 1 0))]
     (* width (max 0 level))))
 

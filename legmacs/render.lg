@@ -148,6 +148,26 @@
    what TAB inserts (that's tab-insert in legmacs.commands)."
   (atom 4))
 
+(defn- display-piece
+  "How character `ch` at display column `dc` expands, given tab width `tw`."
+  [ch dc tw]
+  (let [c (int ch)]
+    (cond
+      (= c 9) (apply str (repeat (- (* tw (inc (quot dc tw))) dc) \space))
+      (< c 32) (str "^" (char (+ c 64)))
+      (= c 127) "^?"
+      :else (str ch))))
+
+(defn- display-width
+  "Display columns `ch` occupies at display column `dc`."
+  [ch dc tw]
+  (let [c (int ch)]
+    (cond
+      (= c 9) (- (* tw (inc (quot dc tw))) dc)
+      (< c 32) 2
+      (= c 127) 2
+      :else 1)))
+
 (defn line-display
   "Expand `line` for display: {:text expanded-string :cols mapping}.
    `mapping` has (inc (count line)) entries; entry i is the display
@@ -159,25 +179,45 @@
     (loop [i 0, dc 0, out [], cols []]
       (if (>= i n)
         {:text (apply str out) :cols (conj cols dc)}
-        (let [ch (nth chars i)
-              c (int ch)
-              piece (cond
-                      (= c 9) (apply str (repeat (- (* tw (inc (quot dc tw))) dc) \space))
-                      (< c 32) (str "^" (char (+ c 64)))
-                      (= c 127) "^?"
-                      :else (str ch))]
+        (let [piece (display-piece (nth chars i) dc tw)]
           (recur (inc i) (+ dc (count piece)) (conj out piece) (conj cols dc)))))))
+
+(defn line-display-window
+  "Like line-display, but :text is only the `width` display columns starting
+   at `scroll-col` (not padded). :cols is still the full char-index map so
+   highlight spans convert correctly. A 10k-char line that's scrolled to
+   column 0 of an 80-col window no longer builds a 10k-char expanded string."
+  [line tw scroll-col width]
+  (let [chars (vec (seq line))
+        n (count chars)
+        lo (max 0 scroll-col)
+        hi (+ lo (max 0 width))]
+    (loop [i 0, dc 0, out [], cols []]
+      (if (>= i n)
+        {:text (apply str out) :cols (conj cols dc)}
+        (let [piece (display-piece (nth chars i) dc tw)
+              plen (count piece)
+              pe (+ dc plen)
+              out (if (or (>= dc hi) (<= pe lo))
+                    out
+                    (let [from (max 0 (- lo dc))
+                          to (- (min pe hi) dc)]
+                      (conj out (subs piece from to))))]
+          (recur (inc i) pe out (conj cols dc)))))))
 
 (defn display-col
   "The display column where character index `col` of `line` lands. Past
    the end of the line the mapping continues one-for-one, so open-ended
    span ends and the append position both keep working."
   [line col tw]
-  (let [cols (:cols (line-display line tw))
-        n (dec (count cols))]
-    (if (>= col n)
-      (+ (nth cols n) (- col n))
-      (nth cols col))))
+  (let [chars (vec (seq line))
+        n (count chars)
+        col (if (neg? col) 0 col)]
+    (loop [i 0, dc 0]
+      (cond
+        (>= i n) (+ dc (- col n))
+        (>= i col) dc
+        :else (recur (inc i) (+ dc (display-width (nth chars i) dc tw)))))))
 
 (defn- display-span
   "Re-express one {:start :end} span (char columns) in display columns
@@ -296,12 +336,6 @@
 (defn- gutter-cell [line-no width is-current?]
   (let [color (if is-current? (ui :gutter-current) (ui :gutter))]
     (str color (right-align (str line-no) (dec width)) reset \space)))
-
-(defn- visible-slice [line scroll-col text-cols]
-  (let [len (count line)]
-    (if (>= scroll-col len)
-      ""
-      (subs line scroll-col (min len (+ scroll-col text-cols))))))
 
 ;; --- span compositor --------------------------------------------------
 ;;
@@ -456,13 +490,15 @@
     (str (move-to (inc x) screen-row)
          (if (< buf-row total)
            (let [scroll-col (:scroll-col state)
-                 {dtext :text cols :cols} (line-display (nth (:lines state) buf-row) @tab-width)
+                 {dtext :text cols :cols} (line-display-window
+                                           (nth (:lines state) buf-row)
+                                           @tab-width scroll-col text-cols)
                  ;; mapv, not map: in let-go, reducing over a lazy (map f
                  ;; (concat ...)) that is *empty* still calls the reducing
                  ;; fn once with nil (see CLAUDE.md gotchas); style-array
                  ;; reduces over these, so materialize.
                  conv (fn [spans] (mapv #(display-span % cols) spans))
-                 visible (pad-right (visible-slice dtext scroll-col text-cols) text-cols)
+                 visible (pad-right dtext text-cols)
                  bg-spans (conv (concat (region-spans-for-row state buf-row)
                                         (paren-match-spans-for-row state buf-row)
                                         (search-match-spans-for-row state buf-row)))

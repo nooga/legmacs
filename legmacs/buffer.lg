@@ -396,12 +396,54 @@
     (assoc state :scroll-row (max 0 scroll-row) :scroll-col (max 0 scroll-col))))
 
 ;; --- whole-buffer text access (for eval, search-the-whole-thing, etc.) -----
+;;
+;; Paren-match / electric-pair / auto-indent run after every keystroke and
+;; used to string/join the whole buffer, then count/subs that string from
+;; the start (both O(n) in let-go). Cursor motion doesn't replace :lines,
+;; so we cache a char vector and per-line start offsets against that
+;; vector's identity -- a move is then nth, not a rebuild.
+
+(def ^:private flat-cache (atom nil))
+
+(defn- build-flat [lines]
+  (let [n (count lines)]
+    (loop [i 0, off 0, starts [], lens [], chars []]
+      (if (>= i n)
+        {:lines lines :starts starts :lens lens :chars chars}
+        (let [line (nth lines i)
+              chs (vec (seq line))
+              len (count chs)
+              chars (reduce conj chars chs)
+              chars (if (< i (dec n)) (conj chars \newline) chars)]
+          (recur (inc i)
+                 (+ off len (if (< i (dec n)) 1 0))
+                 (conj starts off)
+                 (conj lens len)
+                 chars))))))
+
+(defn- flat-index
+  "Cached {:starts :lens :chars} for `state`'s current :lines."
+  [state]
+  (let [lines (:lines state)
+        cached @flat-cache]
+    (if (and cached (identical? lines (:lines cached)))
+      cached
+      (let [built (build-flat lines)]
+        (reset! flat-cache built)
+        built))))
+
+(defn buffer-chars
+  "The buffer as a char vector (newlines between lines, no trailing
+   newline) -- the shape lisp-syntax/prog-syntax scan. Cached against
+   :lines identity so a cursor move doesn't rebuild it."
+  [state]
+  (:chars (flat-index state)))
 
 (defn buffer-text
   "The whole buffer joined with newlines -- no trailing newline, unlike
    join-lines (which is for writing files)."
   [state]
-  (string/join "\n" (:lines state)))
+  (apply str (buffer-chars state)))
 
 (defn text-before-cursor
   "Everything in the buffer up to (not including) the cursor, as one
@@ -521,28 +563,28 @@
 
 ;; --- offset <-> [row col] --------------------------------------------
 ;;
-;; legmacs.lisp-syntax scans the buffer as one flat string (buffer-text --
-;; string/join "\n" lines), since bracket-matching/sexp boundaries are
-;; naturally a flat-text problem. These convert between that flat
-;; character offset and the [row col] the rest of the editor speaks.
+;; lisp-syntax/prog-syntax scan a flat char vector (buffer-chars). These
+;; convert between that offset and the [row col] the rest of the editor
+;; speaks, using the cached per-line lengths so we don't recount strings.
 
 (defn offset-of
   "The offset into (buffer-text state) of [row col]. Each line contributes
    (count line) + 1 for its joining newline."
   [state row col]
-  (let [lines (:lines state)]
-    (+ (reduce + 0 (map #(inc (count %)) (subvec lines 0 row))) col)))
+  (let [starts (:starts (flat-index state))]
+    (+ (nth starts row 0) col)))
 
 (defn row-col-of
   "The inverse of offset-of: the [row col] at flat offset `offset`."
   [state offset]
-  (loop [row 0, remaining offset, lines (:lines state)]
-    (if (empty? lines)
-      [row remaining]
-      (let [len (count (first lines))]
-        (if (<= remaining len)
-          [row remaining]
-          (recur (inc row) (- remaining len 1) (rest lines)))))))
+  (let [lens (:lens (flat-index state))]
+    (loop [row 0, remaining offset]
+      (if (>= row (count lens))
+        [row remaining]
+        (let [len (nth lens row)]
+          (if (<= remaining len)
+            [row remaining]
+            (recur (inc row) (- remaining len 1))))))))
 
 ;; --- symbol at point (word-level expand-region) -----------------------
 
