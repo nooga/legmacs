@@ -87,9 +87,13 @@ not held together.
 | `C-x 1` | make the current window the only one |
 | `C-x C-c` | quit (prompts if the current buffer has unsaved changes) |
 | `C-g` | cancel / quit-out-of-here |
-| `M-x` | run a command by name (`TAB` completes) -- `replace-string` (the old unconditional M-% behavior) is still there under this |
+| `M-x` | run a command by name (`TAB` completes); the live list shows each command's current key bindings |
 | `C-x C-q` | toggle the current buffer read-only |
-| `C-h` | show all key bindings (in a read-only `*Help*` buffer) |
+| `C-h b` | show all key bindings (mode maps, then global) in a read-only `*Help*` buffer |
+| `C-h k` | describe the command bound to the next key sequence |
+| `C-h f` | describe a command by name (docstring + keys) |
+| `C-h m` | describe the current major and minor modes |
+| `C-h C-h` | list the `C-h` help prefix itself |
 
 Pasting into a terminal that supports bracketed paste lands as one atomic
 insert, not a burst of individual keystrokes -- so a multi-line paste can't
@@ -108,11 +112,15 @@ current line in one that has a major mode with indent rules (see
 Completing prompts (`M-x`, `C-x C-f`, `C-x C-s`, `C-x C-w`, `C-x b`) show a
 live, vertico-style vertical list that narrows as you type. Matching is
 *fuzzy* (the characters you type just have to appear in order, so `nxtl`
-finds `next-line`), best match highlighted at the top. (File prompts match
-fuzzily within the current directory segment: `src/cmp` narrows the entries
-of `src/`.) `C-n`/`C-p` (or the arrows) move the highlight, `TAB` pulls the
-highlighted candidate up into the input line (so you can descend into a
-directory or refine further). `M-x` and the buffer/mode pickers submit the
+finds `next-line`), best match highlighted at the top. `M-x` annotates each
+command with the keys that would invoke it in the current buffer, drawn
+muted after the name (`save-buffer` then `C-x C-s`); the selected row also
+right-aligns that command's docstring when it has one. Matching is still on
+the name, so `sbf` finds `save-buffer` and `RET` still runs it. (File prompts match fuzzily within the current directory
+segment: `src/cmp` narrows the entries of `src/`.) `C-n`/`C-p` (or the
+arrows) move the highlight, `TAB` pulls the highlighted candidate up into
+the input line (so you can descend into a directory or refine further).
+`M-x` and the buffer/mode pickers submit the
 **highlighted** candidate on `RET`; the file prompts submit exactly the
 **path you typed** on `RET` (so a brand-new filename is never silently
 swapped for a lookalike), so `TAB` then `RET` to open a listed one, or
@@ -126,14 +134,20 @@ through matches, `RET` leaves point on the current one, `C-g` returns to
 where you started. (The older one-shot `search-forward` is still there under
 `M-x`.)
 
-`C-h` (`describe-bindings`) opens the key-binding list in a real, read-only,
-syntax-highlighted `*Help*` buffer rather than a one-shot overlay, so you
-can scroll it, search it with `C-s`, and switch away and back like any other
-buffer. Read-only is a general buffer property (`C-x C-q` toggles it on any
-buffer); the buffer mutation primitives in
-[`legmacs/buffer.lg`](../legmacs/buffer.lg) refuse edits when it's set, so no
-command (built-in or from your config) can modify a read-only buffer, while
-movement, scrolling, and search keep working.
+`C-h` is a help prefix. `C-h b` (`describe-bindings`) opens the key-binding
+list — the current major mode, then any minor modes with bindings, then
+global — in a real, read-only, syntax-highlighted `*Help*` buffer rather
+than a one-shot overlay, so you can scroll it, search it with `C-s`, and
+switch away and back like any other buffer. Each binding is followed by
+that command's docstring, flattened to one muted line. `C-h k` (`describe-key`)
+captures the next key sequence without running it and shows the command
+plus its docstring; `C-h f` (`describe-function`) does the same from a
+command name (the same fuzzy list as `M-x`); `C-h m` describes the buffer's
+modes; `C-h C-h` lists the prefix itself. Read-only is a general buffer
+property (`C-x C-q` toggles it on any buffer); the buffer mutation
+primitives in [`legmacs/buffer.lg`](../legmacs/buffer.lg) refuse edits when
+it's set, so no command (built-in or from your config) can modify a
+read-only buffer, while movement, scrolling, and search keep working.
 
 Multiple buffers: `lg main.lg a.txt b.txt` opens both (the first one
 focused); `C-x C-f` on a new path opens another without touching whatever
@@ -634,7 +648,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes/structural.lg`](../legmacs/modes/structural.lg) | Three generic minor modes -- `:paren-match`, `:electric-pair`, `:auto-indent` (`RET`, `TAB`, dedent-on-closer, and opening a bracket pair out into a block) -- driven by whatever `:syntax-spec` the buffer's major mode declares; no-op (plain newline/self-insert) when it has none. `legmacs.modes/switch-to-mode` auto-enables all three for any major mode with a spec, so the whole language pack gets them by default. |
 | [`legmacs/modes/crutch.lg`](../legmacs/modes/crutch.lg) | CRUTCH: vi-style modal editing as a bundled minor mode (`M-x crutch-mode`). A worked example of the minor-mode/`:keymap`-fn/`:suppress-self-insert?` machinery. |
 | [`legmacs/modes/keycast.lg`](../legmacs/modes/keycast.lg) | keycast: a right-aligned live keystroke preview (`M-x keycast-mode`). A pure observer minor mode built on `:last-chord` + `:status-right`. |
-| [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (see `C-h`/`describe-bindings`). Highlight-only, like markdown-mode. |
+| [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (`C-h b`/`describe-bindings`, `C-h k`, `C-h f`, `C-h m`). Highlight-only, like markdown-mode. |
 | [`legmacs/dispatch.lg`](../legmacs/dispatch.lg) | One key chord → a new editor state. Layers every active mode's keymap (minor modes, then major) over the global one; runs their `:after-command` hooks on the way out. |
 | [`legmacs/modeline.lg`](../legmacs/modeline.lg) | The mode-line's registry: named, ordered, independently-colorable segments plus a theme (bg/fg + separator), all plain data. `register-modeline-segment!`/`set-modeline-theme!` are the scripting surface; the built-in segments (buffer name, mode, position, ...) are registered the same way. |
 | [`legmacs/render.lg`](../legmacs/render.lg) | Editor state → one ANSI string per frame. A per-column fg/bg span compositor, so region highlight/paren-match/syntax colors can all coexist on one line; the mode line is a block compositor over `legmacs.modeline`'s segments instead. Draws each window of the workspace into its own rectangle (per-window mode line, `│` dividers), the echo area under all of them. |

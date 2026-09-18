@@ -1,20 +1,34 @@
 ;; legmacs.modes.help — the major mode for read-only *Help* buffers (see
-;; commands/describe-bindings). Like markdown-mode it's read-mostly: no eval,
-;; no editing (the buffer itself carries :read-only?, enforced in
-;; legmacs.buffer), just a per-line highlighter that colors a two-column
-;; "key -> command" listing plus section headers.
+;; commands/describe-bindings, describe-key, describe-function). Like
+;; markdown-mode it's read-mostly: no eval, no editing (the buffer itself
+;; carries :read-only?, enforced in legmacs.buffer), just a per-line
+;; highlighter that colors section headers, a two-column "key -> command"
+;; listing, and leaves docstring prose alone.
 ;;
 ;; The buffer is a real buffer, not the one-shot :overlay the help used to
 ;; be, so it scrolls, searches (C-s swiper), and switches like any other --
-;; that's the whole reason to prefer it. describe-bindings formats each entry
-;; as "  <keys>  <command>" (two leading spaces, then a two-space gap before
-;; the command); a header line starts in column 0.
+;; that's the whole reason to prefer it. Binding entries are formatted as
+;; "  <keys>  <command>" (two leading spaces, then a two-space gap before
+;; the command); a docstring hangs under the command column at 4+ spaces;
+;; a header line starts in column 0 and has no spaces, or is a known title
+;; ("Key bindings", "Major mode: ...").
 
 (ns legmacs.modes.help
   (:require [string]
+            [legmacs.buffer :as buf]
             [legmacs.modes :as modes]))
 
 (def keymap (atom {}))
+
+(defn pop-to-help
+  "Open -- or refresh and switch to -- a read-only, help-mode buffer named
+   `name` showing `lines`. The named-singleton :help op (see legmacs.buffers)
+   reuses the one buffer across calls instead of piling up copies."
+  [state name lines]
+  (let [help-buf (-> (buf/new-state nil (vec lines))
+                     (modes/switch-to-mode :help)
+                     (assoc :buffer-name name :read-only? true))]
+    (assoc state :buffer-command {:op :help :name name :state help-buf})))
 
 (defn- entry-spans
   "Color an entry line: the key chord (after the 2-space indent, up to the
@@ -35,11 +49,32 @@
        {:style :help-command :start cmd-start :end n}]
       [{:style :help-key :start 2 :end n}])))
 
+(defn- header-line?
+  "Column-0 titles: a single token (`save-buffer`, `Global`), or a known
+   section heading. Anything else at column 0 is docstring prose."
+  [line]
+  (or (not (string/includes? line " "))
+      (string/starts-with? line "Key bindings")
+      (string/starts-with? line "Major mode:")
+      (string/starts-with? line "Minor mode:")
+      (= line "Help")))
+
+(defn- leading-spaces [line]
+  (loop [i 0]
+    (if (and (< i (count line)) (= \space (nth line i)))
+      (recur (inc i))
+      i)))
+
 (defn highlight-line [line]
   (cond
     (string/blank? line) []
+    ;; describe-bindings hangs a flattened docstring under the command
+    ;; column (4+ spaces). Must beat the 2-space entry rule, or the doc
+    ;; would be painted as a key/command pair.
+    (>= (leading-spaces line) 4) [{:style :help-doc :start 0 :end (count line)}]
     (string/starts-with? line "  ") (entry-spans line)
-    :else [{:style :help-header :start 0 :end (count line)}]))
+    (header-line? line) [{:style :help-header :start 0 :end (count line)}]
+    :else []))
 
 (modes/register-mode! :help keymap
                        "help-mode: read-only, syntax-highlighted help buffers"

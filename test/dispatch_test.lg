@@ -5,7 +5,8 @@
             [legmacs.minibuffer :as mb]
             [legmacs.keymap :as km]
             [legmacs.bindings :as bindings]
-            [legmacs.dispatch :as d]))
+            [legmacs.dispatch :as d]
+            [legmacs.commands :as c]))
 
 (defn- paste [text] [:paste text])
 
@@ -124,4 +125,38 @@
     (let [s (buf/new-state nil [""])
           s (d/dispatch s (paste "a fairly long pasted string"))]
       (is (= "[paste 27]" (:last-chord s))))))
+
+(deftest describe-key-reports-without-running
+  (testing "C-h k then C-x C-s opens *Help* naming save-buffer and does not save"
+    (let [s (buf/new-state "x.txt" ["hi"])
+          s (c/describe-key s)]
+      (is (:describe-key? s))
+      (let [s (d/dispatch s "C-x")]
+        (is (:describe-key? s))
+        (is (some? (:pending-prefix s)))
+        (is (string/includes? (:message s) "C-x"))
+        (let [s (d/dispatch s "C-s")
+              text (string/join "\n" (:lines (:state (:buffer-command s))))]
+          (is (nil? (:describe-key? s)))
+          (is (nil? (:pending-prefix s)))
+          (is (= :help (:op (:buffer-command s))))
+          (is (string/includes? text "save-buffer"))
+          (is (string/includes? text "C-x C-s"))
+          (is (string/includes? text (km/command-doc :save-buffer)))
+          (is (= ["hi"] (:lines s)))
+          (is (not (:quit? s)))))))
+
+  (testing "an unbound chord during describe-key opens *Help* saying so"
+    (let [s (c/describe-key (buf/new-state nil ["x"]))
+          s (d/dispatch s "M-z")
+          text (string/join "\n" (:lines (:state (:buffer-command s))))]
+      (is (nil? (:describe-key? s)))
+      (is (string/includes? text "undefined"))))
+
+  (testing "C-g cancels describe-key without opening help"
+    (let [s (c/describe-key (buf/new-state nil ["x"]))
+          s (d/dispatch s "C-g")]
+      (is (nil? (:describe-key? s)))
+      (is (nil? (:buffer-command s)))
+      (is (= "Quit" (:message s))))))
 

@@ -97,6 +97,59 @@
       (is (>= (:text-rows d) 1))
       (is (= 10 (+ (:text-rows d) 1 (:mb-rows d)))))))     ; text + status + echo == rows
 
+(deftest command-candidates-mute-keys-and-show-selected-doc
+  (testing "M-x-style candidates paint keys muted; only the selected row shows its docstring"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :minibuffer {:prompt "M-x " :input "" :cursor-col 0 :selection 0
+                                :candidates [{:label "save-buffer" :value "save-buffer"
+                                              :keys "C-x C-s"
+                                              :doc "Save the current buffer to its file."}
+                                             {:label "forward-char" :value "forward-char"
+                                              :keys "C-f"
+                                              :doc "Move point right."}]})
+          s (buf/ensure-visible s 10 80)
+          out (r/frame s 80 16)]
+      (is (string/includes? out "save-buffer"))
+      (is (string/includes? out "C-x C-s"))
+      (is (string/includes? out "Save the current buffer to its file."))
+      (is (string/includes? out r/candidate-keys-fg))
+      (is (string/includes? out r/inverse-on))
+      (is (string/includes? out "forward-char"))
+      (is (string/includes? out "C-f"))
+      (is (not (string/includes? out "Move point right.")))))
+
+  (testing "a wrapped defcommand docstring flattens to one line, never ^J"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :minibuffer {:prompt "M-x " :input "" :cursor-col 0 :selection 0
+                                :candidates [{:label "recenter" :value "recenter"
+                                              :doc "First sentence.\n   Second sentence."}]})
+          s (buf/ensure-visible s 10 80)
+          out (r/frame s 80 16)]
+      (is (string/includes? out "First sentence. Second sentence."))
+      (is (not (string/includes? out "^J")))))
+
+  (testing "a docstring that doesn't fit is ellipsis-truncated, not overflowing the row"
+    (let [doc "Replace every occurrence of a string from point to the end of the buffer, prompting at each match."
+          s (assoc (buf/new-state nil ["x"])
+                   :minibuffer {:prompt "M-x " :input "" :cursor-col 0 :selection 0
+                                :candidates [{:label "query-replace" :value "query-replace"
+                                              :keys "M-%"
+                                              :doc doc}]})
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "query-replace"))
+      (is (string/includes? out "…"))
+      (is (not (string/includes? out doc)))))
+
+  (testing "a plain {:label} candidate (swiper, files) still inverse-highlights the whole row"
+    (let [s (assoc (buf/new-state nil ["x"])
+                   :minibuffer {:prompt "p: " :input "" :cursor-col 0 :selection 0
+                                :candidates [{:label "plain-file.lg" :value "plain-file.lg"}]})
+          s (buf/ensure-visible s 10 40)
+          out (r/frame s 40 12)]
+      (is (string/includes? out "plain-file.lg"))
+      (is (string/includes? out r/inverse-on)))))
+
 (deftest multi-line-message-expands-without-overflowing
   (testing "a message with newlines becomes several padded rows, not a raw newline in the frame"
     (let [s (assoc (buf/new-state nil ["x"]) :message "line one\nline two\nline three")]

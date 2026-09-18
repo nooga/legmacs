@@ -39,7 +39,12 @@
 (defn command-fn [name]
   (:fn (get @commands name)))
 
-(defn- command-name-str [kw] (if (keyword? kw) (name kw) (str kw)))
+(defn command-name-str [kw] (if (keyword? kw) (name kw) (str kw)))
+
+(defn command-doc
+  "The docstring `defcommand` stored for `name`, or nil."
+  [name]
+  (:doc (get @commands name)))
 
 (defn run-command
   "Look up a command by keyword and run it against state. Unknown commands
@@ -99,3 +104,32 @@
               (map (fn [[path cmd]] [(into [chord] path) cmd]) (describe-keymap v))
               [[[chord] v]]))
           keymap))
+
+(defn format-binding-line
+  "One `describe-bindings` entry: two-space indent, keys, two-space gap,
+   command name. help-mode's highlighter splits on that gap."
+  [path-or-str cmd]
+  (let [keys (if (string? path-or-str) path-or-str (string/join " " path-or-str))]
+    (format "  %-18s  %s" keys (command-name-str cmd))))
+
+(defn chord-paths-by-command
+  "Invert keymap `layers` (highest priority first) into
+   {command-kw [\"C-x C-s\" ...]}. A chord-path is claimed by the first
+   layer that binds it, matching how dispatch walks mode maps over global:
+   a mode can add C-x C-e without stealing global's C-x C-s, and a later
+   layer cannot advertise a chord an earlier one already claimed."
+  [layers]
+  (let [claimed (reduce (fn [seen km]
+                          (reduce (fn [seen [path cmd]]
+                                    (let [s (string/join " " path)]
+                                      (if (contains? seen s)
+                                        seen
+                                        (assoc seen s cmd))))
+                                  seen
+                                  (describe-keymap (or km {}))))
+                        {}
+                        layers)]
+    (reduce (fn [m [s cmd]]
+              (update m cmd (fnil conj []) s))
+            {}
+            claimed)))

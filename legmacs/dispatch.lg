@@ -2,9 +2,11 @@
 ;; where the keymap, the minibuffer, and self-insert all meet:
 ;;
 ;;   1. An overlay (e.g. the help screen) swallows the next key to dismiss.
-;;   2. C-g always aborts a pending prefix key, no matter what.
+;;   2. C-g always aborts a pending prefix key (and describe-key).
 ;;   3. A live minibuffer gets the key for line-editing.
-;;   4. Otherwise, walk the (possibly multi-key) keymap; an unbound single
+;;   4. describe-key (C-h k) captures the next chord sequence without
+;;      running it, then opens *Help* with the command and its docstring.
+;;   5. Otherwise, walk the (possibly multi-key) keymap; an unbound single
 ;;      printable character falls back to self-insert-command.
 ;;
 ;; A buffer's active modes (if any) shadow the global keymap key-by-key, not
@@ -28,14 +30,16 @@
             [legmacs.keys :as keys]
             [legmacs.keymap :as km]
             [legmacs.modes :as modes]
+            [legmacs.modes.help :as help]
             [legmacs.minibuffer :as mb]))
 
 (defn- chord-path-str [chords] (string/join " " chords))
 
-(defn- keymaps-for
+(defn keymaps-for
   "The ordered keymap layers active for `state`: every active mode's map
    (in legmacs.modes/active-modes priority order -- minor modes then major),
-   then global last."
+   then global last. Shared with M-x annotations and describe-bindings so
+   they list the keys that would actually fire right now."
   [state]
   (conj (vec (remove nil? (map (fn [mode-kw] (modes/resolve-keymap mode-kw state))
                                (modes/active-modes state))))
@@ -84,7 +88,7 @@
   [state text]
   (if (mb/active? state)
     (mb/insert-text state (string/replace text "\n" ""))
-    (buf/insert-string (assoc state :pending-prefix nil :pending-keys []) text)))
+    (buf/insert-string (assoc state :pending-prefix nil :pending-keys [] :describe-key? nil) text)))
 
 (defn- dispatch-prefix [state chord]
   (let [path (conj (:pending-keys state) chord)
@@ -95,6 +99,32 @@
       :prefix (assoc state :pending-prefix v :pending-keys path)
       (assoc state :pending-prefix nil :pending-keys []
              :message (str (chord-path-str path) " is undefined")))))
+
+(defn- finish-describe-key
+  "Open *Help* for the chord path we just collected. Never runs the command."
+  [state path tag v]
+  (let [path-str (chord-path-str path)
+        lines (if (= tag :command)
+                (let [n (km/command-name-str v)
+                      doc (or (km/command-doc v) "No documentation.")]
+                  [n (str "  " path-str) "" doc])
+                [(str path-str " is undefined")])
+        state (assoc state :describe-key? nil :pending-prefix nil :pending-keys [] :message nil)]
+    (help/pop-to-help state "*Help*" lines)))
+
+(defn- dispatch-describe-key
+  "Walk the same layered keymaps as a normal dispatch, but report rather
+   than run. A prefix keeps collecting (C-x then C-s); a command or an
+   unbound chord opens *Help*."
+  [state chord]
+  (let [layers (or (:pending-prefix state) (keymaps-for state))
+        path (conj (or (:pending-keys state) []) chord)
+        [tag v] (lookup-layers layers chord)]
+    (case tag
+      :command (finish-describe-key state path :command v)
+      :prefix (assoc state :pending-prefix v :pending-keys path
+                     :message (str "Describe key: " (chord-path-str path) "-"))
+      (finish-describe-key state path :unbound nil))))
 
 (defn- dispatch-normal [state chord]
   (let [[tag v] (lookup-layers (keymaps-for state) chord)
@@ -154,10 +184,11 @@
                  (buf/query-replace-active? state) (buf/query-replace-answer state chord)
                  (keys/paste? chord) (dispatch-paste state (keys/paste-text chord))
 
-                 (and (:pending-prefix state) (= chord "C-g"))
-                 (km/run-command (assoc state :pending-prefix nil :pending-keys []) :keyboard-quit)
+                 (and (or (:pending-prefix state) (:describe-key? state)) (= chord "C-g"))
+                 (km/run-command (assoc state :describe-key? nil :pending-prefix nil :pending-keys []) :keyboard-quit)
 
                  (mb/active? state) (dispatch-minibuffer state chord)
+                 (:describe-key? state) (dispatch-describe-key state chord)
                  (:pending-prefix state) (dispatch-prefix state chord)
                  :else (dispatch-normal state chord))
         state* (record-if-still-recording recording-before? (:pending-keys state) chord state*)
