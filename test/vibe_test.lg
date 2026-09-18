@@ -147,7 +147,7 @@
   (testing "nowhere near a vibe form"
     (let [s* (vibe/vibe-replace (buf/new-state nil ["(+ 1 2)"]))]
       (is (nil? (:pending-task s*)))
-      (is (string/includes? (:message s*) "No (vibe"))))))
+      (is (string/includes? (:message s*) "No (vibe")))))
 
 (deftest resolve-vibe-fails-safely
   (testing "a request whose form has since moved is dropped, not misapplied"
