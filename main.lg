@@ -101,16 +101,15 @@
     (term/flush)
     workspace))
 
-(defn- run-pending-task
-  "Run the blocking task the last command armed (see legmacs.buffers'
-   :pending-task). The frame announcing it is already on screen by the
-   time we get here, so the editor looks busy rather than dead while the
-   task runs. The task is an ordinary (fn [state] -> state), threaded
-   through the same fold as any command -- dropping :pending-task from the
-   flat state first is what consumes it, so a task that arms another one
-   chains and one that doesn't ends the sequence."
-  [workspace task]
-  (bufs/put-current workspace (task (dissoc (bufs/current workspace) :pending-task))))
+(def ^:private job-poll-ms 20)
+
+(defn- handle-chord
+  "Block for one key (or take one that's already pending) and dispatch it."
+  [workspace]
+  (let [chord (keys/read-chord)]
+    (if (nil? chord)
+      (assoc workspace :quit? true)
+      (bufs/put-current workspace (dispatch/dispatch (bufs/current workspace) chord)))))
 
 (defn run
   "Threads a workspace (see legmacs.buffers) rather than a single flat
@@ -121,21 +120,28 @@
    command set. render! draws every window but likewise returns just a
    workspace with per-window scroll positions brought up to date.
 
-   A :pending-task on the workspace takes the place of reading a key for
-   one iteration: the frame above has just been painted, so a command that
-   has slow work to do gets its message on screen before the editor
-   blocks on it."
+   After each frame, drain-jobs applies any futures that have finished
+   (I/O ran off-thread; the splice stays on this one). A :pending-task
+   still takes the place of reading a key for one iteration -- main-thread
+   work that asked to paint first. While :async-jobs are in flight the
+   loop peeks term/key-pending? instead of parking in read-chord, so
+   typing continues; a short sleep avoids a busy-spin until the next
+   completion or keystroke. Idle (no jobs, no pending-task) is a blocking
+   read-chord, same as before."
   [workspace]
   (loop [workspace workspace]
-    (let [workspace (render! workspace)]
+    (let [workspace (render! workspace)
+          workspace (bufs/drain-jobs workspace dispatch/run-after-commands)]
       (cond
         (:quit? workspace) workspace
-        (:pending-task workspace) (recur (run-pending-task workspace (:pending-task workspace)))
+        (:pending-task workspace)
+        (recur (bufs/run-pending-task workspace dispatch/run-after-commands))
+        (bufs/jobs-running? workspace)
+        (if (term/key-pending?)
+          (recur (handle-chord workspace))
+          (do (sleep job-poll-ms) (recur workspace)))
         :else
-        (let [chord (keys/read-chord)]
-          (if (nil? chord)
-            (assoc workspace :quit? true)
-            (recur (bufs/put-current workspace (dispatch/dispatch (bufs/current workspace) chord)))))))))
+        (recur (handle-chord workspace))))))
 
 (defn- open-additional-buffer [workspace path]
   (bufs/put-current workspace

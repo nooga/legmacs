@@ -24,11 +24,11 @@
 ;; See the vibe.edn section below for the rest of what can go in there.
 ;;
 ;; The network call blocks, which the rest of legmacs never does. So the
-;; command is still pure: it arms a :pending-task (see legmacs.buffers)
-;; and returns, and main.lg's loop paints the "vibing..." frame before
-;; running the task. Same seam Acme Execute uses -- not a vibe-specific
-;; hook. Otherwise the editor would freeze with a stale screen for however
-;; long the model takes.
+;; command is still pure: it snapshots the form and context, then
+;; (bufs/spawn-task ...) starts the HTTP in a future and returns. The
+;; editor keeps reading keys; drain-jobs splices the answer on the main
+;; thread when the promise realizes. Same seam Acme Execute uses -- not
+;; a vibe-specific hook.
 
 (ns legmacs.vibe
   (:require [string]
@@ -36,6 +36,7 @@
             [http]
             [os]
             [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.lisp-syntax :as ls]))
 
@@ -225,27 +226,22 @@
 ;; --- call-site context ---------------------------------------------------
 ;;
 ;; `vibe` is an ordinary function, so it can't see the buffer it was typed
-;; into. vibe-replace parks the call site here for the duration of the eval
+;; into. vibe-replace binds the call site here for the duration of the eval
 ;; instead -- which also means (str (vibe "a") (vibe "b")) in one form works,
 ;; and a bare (vibe "...") from a REPL still works, just contextless.
+;;
+;; A dynamic var, not an atom: spawn-task runs the eval in a future, and
+;; two overlapping vibes would clobber a shared atom. Futures inherit the
+;; spawning context's bindings, so each job sees only its own *vibe-context*.
 
-(def current-context (atom nil))
+(def ^:dynamic *vibe-context* nil)
 
 (defn with-context
-  "Run `thunk` with `ctx` visible to vibe. Always clears it afterwards.
-
-   Written the long way round on purpose: let-go's `finally` can't be used
-   for this. A try whose only trailing clause is `finally` *swallows* the
-   in-flight exception and returns it as an ordinary value, and a `catch`
-   that rethrows skips the `finally` entirely -- so neither shape both
-   propagates the error and clears the atom. Reifying the outcome does."
+  "Run `thunk` with `ctx` visible to vibe. `binding` restores the previous
+   value even if thunk throws -- unlike a try/finally, which let-go mishandles."
   [ctx thunk]
-  (reset! current-context ctx)
-  (let [outcome (try {:ok (thunk)} (catch e {:err e}))]
-    (reset! current-context nil)
-    (if (contains? outcome :err)
-      (throw (:err outcome))
-      (:ok outcome))))
+  (binding [*vibe-context* ctx]
+    (thunk)))
 
 (defn context-text
   "The buffer's text with [start end) replaced by the marker."
@@ -284,7 +280,7 @@
      (when-not provider
        (throw (str "unknown vibe provider " (pr-str (:provider cfg)))))
      (strip-fences (request-completion cfg provider
-                                       (user-message request @current-context))))))
+                                       (user-message request *vibe-context*))))))
 
 ;; --- finding the (vibe ...) form ----------------------------------------
 
@@ -337,53 +333,64 @@
 
 ;; --- the command ---------------------------------------------------------
 
-(defn resolve-vibe
-  "Perform the vibe at [start end): evaluate the form with the call site's
-   context in scope and splice the resulting string over it. The one impure
-   thing in this namespace's editing path, called from a :pending-task --
-   never from dispatch."
-  [state start end]
-  (let [text (buf/buffer-text state)]
-    (if-not (and start end (<= end (count text)) (vibe-head-at? text start))
-      (assoc state :message "vibe: form moved before it could run")
-      (let [[_row col] (buf/row-col-of state start)
-            form-text (subs text start end)]
-        (try
-          (let [result (with-context {:text (context-text text start end)
-                                      :filename (:filename state)
-                                      :column col}
-                         (fn [] (eval (read-string form-text))))]
-            ;; Anything but a string means the form didn't vibe: a runtime
-            ;; failure throws and lands in the catch below, but let-go's
-            ;; `eval` *returns* compile errors as an #error value rather
-            ;; than raising them -- splicing that over your code would be a
-            ;; miserable way to find out.
-            (if-not (string? result)
-              (assoc state :message (str "vibe: expected a string, got "
-                                         (one-line (pr-str result))))
-              (-> (splice-offsets state start end result)
-                  (assoc :message (str "vibed " (count result) " chars")))))
-          (catch e (assoc state :message (str "vibe error: "
-                                              (one-line (error-message e))))))))))
+(defn eval-vibe-form
+  "Evaluate `form-text` with `ctx` bound for `vibe`. The I/O half: HTTP
+   lives inside `vibe`. A throw is boxed by spawn-task's job-outcome."
+  [form-text ctx]
+  (with-context ctx
+    (fn [] (eval (read-string form-text)))))
 
-(defn vibe-task
-  "resolve-vibe as a deferred (fn [state] -> state) for :pending-task.
-   A named function rather than an inline fn literal because vibe-replace
-   builds it inside if-let, and a closure over a local in a conditional
-   branch trips let-go's AOT closure hoisting -- see CLAUDE.md."
+(defn vibe-io
+  "eval-vibe-form as a (fn [] -> value) for spawn-task. Named because
+   vibe-replace builds it inside if-let -- see CLAUDE.md on AOT hoisting."
+  [form-text ctx]
+  (fn [] (eval-vibe-form form-text ctx)))
+
+(defn resolve-vibe
+  "Apply a completed vibe `outcome` at [start end). outcome is {:ok string}
+   or {:err e}. Re-checks that a (vibe form still opens at start -- the
+   buffer may have moved while the future ran. Does no I/O."
+  [state start end outcome]
+  (if-let [err (:err outcome)]
+    (assoc state :message (str "vibe error: " (one-line (error-message err))))
+    (let [text (buf/buffer-text state)]
+      (if-not (and start end (<= end (count text)) (vibe-head-at? text start))
+        (assoc state :message "vibe: form moved before it could run")
+        (let [result (:ok outcome)]
+          ;; Anything but a string means the form didn't vibe: let-go's
+          ;; `eval` *returns* compile errors as an #error value rather
+          ;; than raising them -- splicing that over your code would be a
+          ;; miserable way to find out.
+          (if-not (string? result)
+            (assoc state :message (str "vibe: expected a string, got "
+                                       (one-line (pr-str result))))
+            (-> (splice-offsets state start end result)
+                (assoc :message (str "vibed " (count result) " chars")))))))))
+
+(defn vibe-then
+  "resolve-vibe as a (fn [state outcome] -> state) for spawn-task."
   [start end]
-  (fn [state] (resolve-vibe state start end)))
+  (fn [state outcome] (resolve-vibe state start end outcome)))
+
+(defn- vibe-call-context [state start end]
+  (let [[_row col] (buf/row-col-of state start)]
+    {:text (context-text (buf/buffer-text state) start end)
+     :filename (:filename state)
+     :column col}))
 
 (defcommand vibe-replace
   "Replace the (vibe \"...\") form around point with what the model writes.
-   Records the request rather than performing it, so the echo area can say
-   \"vibing...\" before the blocking HTTP call -- arms :pending-task
-   (see legmacs.buffers) and returns."
+   Snapshots the form and starts the HTTP call in a future so the editor
+   keeps reading keys -- spawn-task (see legmacs.buffers), not a blocking
+   pending-task."
   [state]
   (let [text (buf/buffer-text state)
         point (buf/offset-of state (:cursor-row state) (:cursor-col state))]
     (if-let [[start end] (find-vibe-form text point)]
-      (assoc state :message "vibing..." :pending-task (vibe-task start end))
+      (bufs/spawn-task state
+                       (vibe-io (subs text start end) (vibe-call-context state start end))
+                       (vibe-then start end)
+                       "vibing...")
       (assoc state :message "No (vibe \"...\") form at point"))))
 
 (km/bind-key! "C-c C-v" :vibe-replace)

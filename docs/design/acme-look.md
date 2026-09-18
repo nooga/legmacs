@@ -82,20 +82,14 @@ opens or focuses that buffer, and later executions from the same directory
 append a blank-line-separated block containing the command and its output.
 Edits in this buffer are only text edits.
 
-This is deliberately a synchronous first slice: LegMacs pauses while the
-command runs.  It is intended initially for short commands such as `pwd`,
-`ls`, `ps`, and pipelines.  Asynchronous jobs, live streaming, interactive
-stdin, cancellation, process status, and exact stdout/stderr interleaving are
-deferred until this basic interaction has been exercised on Plan 9.
+This is still a non-interactive slice: no live streaming, no stdin, no
+process kill on C-g.  The command itself is asynchronous -- `os/sh` runs in
+a future so you can keep typing.
 
-The pause is at least a *visible* one.  `execute-at-point` does not call `rc`
-itself; it returns a `"Execute: running ... "` message plus a `:pending-task`
-(see the header comment in `legmacs/buffers.lg`), which is an ordinary
-`(fn [state] -> state)` held as a workspace-shared field.  `main.lg`'s loop
-paints that frame and then, instead of reading the next key, runs the task.
-So the screen shows what LegMacs is waiting on rather than staying frozen on
-the frame from before the keystroke, and the actual `os/sh` call stays out of
-the pure pipeline.  `:pending-task` is also the seam a real async job model
-would grow from: a task may arm a further task, so a future version can poll
-a running process across iterations without any of the layers below `main.lg`
-learning about processes.
+`execute-at-point` does not call `rc` itself; it snapshots the script and
+`(bufs/spawn-task …)` (see the header comment in `legmacs/buffers.lg`).
+The I/O thunk runs in a goroutine; `drain-jobs` folds the result into
+`+Errors` on the main thread when the promise realizes.  The editor keeps
+reading keys while rc runs.  C-g discards the result without killing the
+process.  A throw in `:then` is an echo-area message, not a session death.
+Killing the process, streaming output, and job ids are still later.

@@ -153,9 +153,24 @@
   (format "Ln %d, Col %d  (%d lines)"
           (inc (:cursor-row state)) (inc (:cursor-col state)) (count (:lines state))))
 
+(defn- jobs-segment
+  "A badge for in-flight async jobs -- the latest label, or \"N jobs\"
+   when several. Same treatment as the pending-keys prefix badge, so it
+   stays visible after dispatch has cleared the echo-area message."
+  [state]
+  (let [jobs (vec (or (:async-jobs state) []))
+        n (count jobs)]
+    (when (pos? n)
+      {:text (if (= 1 n)
+               (str " " (or (:label (last jobs)) "job") " ")
+               (str " " n " jobs "))
+       :fg [40 36 20]
+       :bg [229 192 123]})))
+
 (register-modeline-segment! :buffer :left buffer-segment)
 (register-modeline-segment! :mode :left mode-segment)
 (register-modeline-segment! :modes-status :left modes-status-segment)
 (register-modeline-segment! :pending-keys :left pending-keys-segment)
 (register-modeline-segment! :position :left position-segment)
 (register-modeline-segment! :modes-status-right :right modes-status-right-segment)
+(register-modeline-segment! :async-jobs :right jobs-segment)

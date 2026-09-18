@@ -372,14 +372,15 @@ A provider in `legmacs.vibe/providers` is four keys and two functions
 (`:body` builds the request map, `:extract` pulls the text out of the
 parsed response), so adding one is a `swap!`.
 
-Vibe has to block on a network round-trip, and it stays out of the
+Vibe has to wait on a network round-trip, and it stays out of the
 pure pipeline the same way Acme Execute does: `vibe-replace` performs no
-I/O at all, it just sets `:message "vibing..."` and
-`:pending-task (vibe-task start end)` on the state and returns. `main.lg`'s
-loop renders that frame first, *then* runs the task in place of reading a
-key. Doing it inline in the command instead would have left the screen
-frozen on a stale frame for the whole request, with no way to say what it
-was waiting for.
+I/O at all, it snapshots the form and `(bufs/spawn-task … "vibing...")`.
+The HTTP call runs in a future; `main.lg` keeps reading keys, and
+`drain-jobs` splices the answer on the main thread when it arrives. C-g
+discards the result (it does not abort the request). A throw in the apply
+step is an echo-area message, not a crash. The mode line shows `vibing...`
+so you still know work is in flight after the echo area has been cleared
+by typing.
 
 Any file ending in `.md` or `.markdown` opens into **markdown-mode**
 (highlighting only, no key bindings of its own, so every global key still
@@ -770,7 +771,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
-| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer as context, and splice the answer over the call. Arms `:pending-task` so the "vibing..." frame paints before the HTTP call. |
+| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer as context, and splice the answer over the call. `spawn-task` runs the HTTP call in a future so the editor stays interactive. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |
@@ -783,7 +784,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modeline.lg`](../legmacs/modeline.lg) | The mode-line's registry: named, ordered, independently-colorable segments plus a theme (bg/fg + separator), all plain data. `register-modeline-segment!`/`set-modeline-theme!` are the scripting surface; the built-in segments (buffer name, mode, position, ...) are registered the same way. |
 | [`legmacs/render.lg`](../legmacs/render.lg) | Editor state → one ANSI string per frame. A per-column fg/bg span compositor, so region highlight/paren-match/syntax colors can all coexist on one line; the mode line is a block compositor over `legmacs.modeline`'s segments instead. Draws each window of the workspace into its own rectangle (per-window mode line, `│` dividers), the echo area under all of them. |
 | [`legmacs/windows.lg`](../legmacs/windows.lg) | The window tree: split panes as pure data (leaves show a buffer through a per-window view; splits stack `:below` or sit `:beside` with proportional weights) plus the layout geometry that turns the tree into screen rectangles and divider positions. |
-| [`legmacs/buffers.lg`](../legmacs/buffers.lg) | Wraps a collection of buffers — and the window tree showing them — behind the exact same flat state shape everything above expects. See below. |
+| [`legmacs/buffers.lg`](../legmacs/buffers.lg) | Wraps a collection of buffers — and the window tree showing them — behind the exact same flat state shape everything above expects. Also the home of `:pending-task` (`arm-task` / `run-pending-task`) and `:async-jobs` (`spawn-task` / `drain-jobs`). See below. |
 | [`main.lg`](../main.lg) | Wires it all up; the only place that touches the terminal. |
 
 The editor state is one plain map, threaded through a `loop`/`recur` in
@@ -801,7 +802,8 @@ parsing, command dispatch, even rendering) without a terminal. See `test/`.
 was true before multiple buffers existed and it's still true now.
 `legmacs.buffers` holds a "workspace" (every buffer, plus the handful of
 things that are genuinely global rather than per-buffer: the message, an
-open minibuffer/overlay, a pending prefix key, the one shared clipboard).
+open minibuffer/overlay, a pending prefix key, a `:pending-task` queue,
+`:async-jobs`, the one shared clipboard).
 `bufs/current` merges the active buffer with those into one flat map,
 exactly what dispatch already expects; `bufs/put-current` splits whatever
 comes back apart again. `main.lg`'s loop is just:

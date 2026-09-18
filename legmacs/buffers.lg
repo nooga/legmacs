@@ -17,16 +17,22 @@
 ;; put-current reads that field and applies it to the workspace, then
 ;; clears it -- ordinary state, not a side channel.
 ;;
-;; :pending-task is the same trick for the other thing a pure command
-;; can't express: "do this slow, blocking thing -- but let the screen
-;; catch up first." A command that would freeze the editor (running a
-;; subprocess, say) instead returns a message describing what it's about
-;; to do plus {:pending-task (fn [state] -> state)}. main.lg's loop paints
-;; that frame, then runs the task in place of reading a key, so the user
-;; sees "Running ..." rather than a dead screen. It stays a shared field
-;; because there's only one editor to be busy; the task itself is just
-;; another (fn [state] -> state), so it can arm a further one and everything
-;; downstream of it stays as pure and testable as any command.
+;; :pending-task is the main-thread serial queue: "do this slow thing, but
+;; let the screen catch up first." A command that must run on the editor
+;; thread (or that hasn't been split into I/O + apply) returns a message
+;; plus {:pending-task (fn [state] -> state)} -- or a vector of such fns.
+;; main.lg's loop paints, then runs the head in place of reading a key.
+;; arm-task appends; a task that itself arms prepends; a throw is an
+;; echo-area message rather than a dead session.
+;;
+;; :async-jobs is the other half of the same seam: I/O that can run in a
+;; goroutine while the user keeps typing. spawn-task starts a future
+;; immediately (HTTP, rc, ...); drain-jobs on the main thread applies each
+;; realized result through a (fn [state outcome] -> state). Goroutines
+;; never touch buffers. The loop only blocks on read-chord when both
+;; queues are empty; while jobs are in flight it peeks term/key-pending?
+;; and sleeps a tick so completions show up without a keystroke. C-g
+;; discards in-flight jobs (results dropped, processes not killed).
 ;;
 ;; Windows (split panes, see legmacs.windows) ride the exact same
 ;; mechanism. The workspace holds one window tree; each window shows a
@@ -57,7 +63,7 @@
 ;; recording hook and legmacs.commands' start/end/call-last-kbd-macro.
 (def shared-keys [:clipboard :message :minibuffer :pending-prefix :pending-keys :overlay
                    :kbd-macro-recording? :kbd-macro-chords :last-kbd-macro
-                   :describe-key? :pending-task])
+                   :describe-key? :pending-task :async-jobs])
 
 (defn new-workspace
   "A workspace holding one buffer (id 0, current) shown in one window
@@ -79,6 +85,7 @@
    :overlay nil
    :describe-key? nil
    :pending-task nil
+   :async-jobs nil
    :kbd-macro-recording? false
    :kbd-macro-chords []
    :last-kbd-macro nil
@@ -310,3 +317,164 @@
                       (update :windows win/update-leaf (:active-window workspace)
                               (fn [leaf] (assoc leaf :view (win/view-of flat-state)))))]
     (sync-current (apply-buffer-command workspace cmd))))
+
+;; --- pending-task --------------------------------------------------------
+;; Serial queue of (fn [state] -> state). The field holds a fn, a vector of
+;; fns, or nil; pending-queue is the only thing that has to know which.
+
+(defn pending-queue
+  "Normalize :pending-task (nil, one fn, or a vector of fns) to a vector."
+  [x]
+  (cond (nil? x) []
+        (fn? x) [x]
+        (vector? x) x
+        :else (vec x)))
+
+(defn- as-pending
+  "The canonical stored form: nil, a lone fn, or a vector of 2+."
+  [q]
+  (let [q (vec q)
+        n (count q)]
+    (cond (zero? n) nil
+          (= 1 n) (first q)
+          :else q)))
+
+(defn arm-task
+  "Append `f` (fn [state] -> state) onto state's :pending-task queue.
+   A single arm stays a bare fn (so existing fn? checks still hold); a
+   second arm promotes the field to a vector. Optional `message` is what
+   the next painted frame should show before the head runs."
+  ([state f] (arm-task state f nil))
+  ([state f message]
+   (let [state (assoc state :pending-task
+                      (as-pending (conj (pending-queue (:pending-task state)) f)))]
+     (if message
+       (assoc state :message message)
+       state))))
+
+(defn- task-error-line
+  "Collapse an exception into something the one-line echo area can show."
+  [e]
+  (let [s (string/replace (str (or (ex-message e) e)) "\n" " ")]
+    (if (> (count s) 200) (str (subs s 0 200) "...") s)))
+
+(defn- task-failed-state [state e]
+  (assoc state :pending-task nil :message (str "task error: " (task-error-line e))))
+
+(defn- finish-pending-step
+  "Run `after` on the task's result, then put any newly-armed work *in
+   front of* `remaining` (a continuation before the rest of the queue)."
+  [workspace after remaining state*]
+  (let [state* (after state*)
+        state* (assoc state* :pending-task
+                      (as-pending (into (pending-queue (:pending-task state*)) remaining)))]
+    (put-current workspace state*)))
+
+(defn run-pending-task
+  "One loop step: consume the queue, run the head, fold the result back.
+   `after` (default identity) is threaded over the task's returned state
+   before the remainder is restored -- main.lg passes
+   dispatch/run-after-commands so a task gets the same post-command
+   hooks a keystroke does, without this ns requiring dispatch.
+
+   Consume happens on the flat state *before* the call, so a throw cannot
+   retry the same head; the catch reports it and drops the rest of the
+   queue rather than killing the session."
+  ([workspace] (run-pending-task workspace identity))
+  ([workspace after]
+   (let [q (pending-queue (:pending-task workspace))]
+     (if (empty? q)
+       workspace
+       (let [f (first q)
+             remaining (vec (rest q))
+             state (assoc (current workspace) :pending-task nil)]
+         (try
+           (finish-pending-step workspace after remaining (f state))
+           (catch e
+             (put-current workspace (task-failed-state state e)))))))))
+
+;; --- async-jobs ----------------------------------------------------------
+;; I/O in a future, apply on the main thread. Each job is
+;; {:promise p :then (fn [state outcome] -> state) :label "..."}.
+;; outcome is {:ok v} or {:err e} -- let-go's future delivers nil on throw,
+;; so job-outcome wraps the io thunk.
+
+(defn- job-list [x]
+  (vec (or x [])))
+
+(defn- as-jobs [jobs]
+  (let [jobs (job-list jobs)]
+    (if (empty? jobs) nil jobs)))
+
+(defn jobs-running?
+  "True if `m` (workspace or flat state) has any in-flight async jobs."
+  [m]
+  (boolean (seq (:async-jobs m))))
+
+(defn add-job
+  "Append a job map onto state's :async-jobs. The caller supplies the
+   promise (tests); spawn-task is the one that starts a future."
+  [state job]
+  (assoc state :async-jobs (conj (job-list (:async-jobs state)) job)))
+
+(defn discard-jobs
+  "Drop in-flight jobs without applying. Goroutines still finish; the
+   results are ignored. C-g uses this -- it does not kill HTTP/os/sh."
+  [state]
+  (assoc state :async-jobs nil))
+
+(defn- job-outcome
+  "Run `io` (fn [] -> value) and box the result so a throw cannot vanish
+   as a nil delivery from future*."
+  [io]
+  (try {:ok (io)} (catch e {:err e})))
+
+(defn spawn-task
+  "Start `io` (fn [] -> value) in a future and record a job whose `:then`
+   (fn [state outcome] -> state) will run on the main thread when the
+   promise realizes. Optional `message` is the echo-area line for the
+   next paint; the modeline also shows in-flight labels. Does not arm
+   :pending-task -- the editor keeps reading keys."
+  ([state io then] (spawn-task state io then nil))
+  ([state io then message]
+   (let [p (future (job-outcome io))
+         state (add-job state {:promise p :then then :label message})]
+     (if message
+       (assoc state :message message)
+       state))))
+
+(defn- apply-one-job
+  "Deref a realized job and run its :then. A throw becomes an echo-area
+   message; the job is still dropped by the caller."
+  [state job]
+  (try
+    ((:then job) state (deref (:promise job)))
+    (catch e
+      (assoc state :message (str "task error: " (task-error-line e))))))
+
+(defn- job-realized? [job]
+  (boolean (realized? (:promise job))))
+
+(defn- job-waiting? [job]
+  (not (job-realized? job)))
+
+(defn drain-jobs
+  "Apply every realized job's :then on the current buffer, leave the
+   rest in flight. `after` (default identity) is the same post-command
+   hook main.lg passes to run-pending-task. Newly spawned jobs from a
+   :then stay; a throw in :then drops that job and continues with the
+   others."
+  ([workspace] (drain-jobs workspace identity))
+  ([workspace after]
+   (let [jobs (job-list (:async-jobs workspace))]
+     (if (empty? jobs)
+       workspace
+       (let [realized (filterv job-realized? jobs)
+             waiting (filterv job-waiting? jobs)]
+         (if (empty? realized)
+           workspace
+           (let [state (assoc (current workspace) :async-jobs (as-jobs waiting))
+                 state (reduce apply-one-job state realized)
+                 state (after state)
+                 state (assoc state :async-jobs (as-jobs (:async-jobs state)))]
+             (put-current workspace state))))))))

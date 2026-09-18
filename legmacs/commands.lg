@@ -16,6 +16,7 @@
             [legmacs.modes.help :as help]
             [legmacs.dispatch :as dispatch]
             [legmacs.theme :as theme]
+            [legmacs.buffers :as bufs]
             [legmacs.modes.repl :as repl]))
 
 (defn set-message [state msg] (assoc state :message msg))
@@ -771,13 +772,15 @@
 
 (defcommand keyboard-quit
   "C-g: cancel whatever's in progress -- a minibuffer prompt, a pending
-   prefix key, describe-key, or an active region, in that order."
+   prefix key, describe-key, an active region, or in-flight async jobs
+   (results dropped; the goroutine is not killed)."
   [state]
   (cond
     (mb/active? state) (mb/cancel state)
     (or (:pending-prefix state) (:describe-key? state))
     (assoc state :pending-prefix nil :pending-keys [] :describe-key? nil :message "Quit")
     (buf/region-active? state) (-> state (assoc :mark nil) (set-message "Quit"))
+    (bufs/jobs-running? state) (set-message (bufs/discard-jobs state) "Quit")
     :else (set-message state "Quit")))
 
 (defcommand execute-extended-command

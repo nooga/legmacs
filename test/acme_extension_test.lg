@@ -114,30 +114,30 @@
     (is (:modified? (buf/insert-string output "note ")))))
 
 (deftest execute-defers-the-blocking-run-behind-a-visible-message
-  (testing "F7 arms a :pending-task instead of running rc inline, and says what it's running"
+  (testing "F7 arms an async job instead of running rc inline, and says what it's running"
     (let [s (assoc (buf/new-state nil ["pwd"])
                    :default-directory "/usr/glenda"
                    :buffer-list [])
           armed (acme/execute-at-point s)]
-      ;; nothing has run yet: no output buffer, just the frame-to-be-painted
+      ;; nothing has been applied yet: no output buffer, just the job
       (is (nil? (:buffer-command armed)))
+      (is (nil? (:pending-task armed)))
       (is (= "Execute: running pwd ..." (:message armed)))
-      (is (some? (:pending-task armed)))))
+      (is (seq (:async-jobs armed)))))
 
   (testing "with no target, it reports that and arms nothing"
     (let [s (assoc (buf/new-state nil ["   "]) :default-directory "/usr/glenda")
           armed (acme/execute-at-point s)]
-      (is (nil? (:pending-task armed)))
+      (is (nil? (:async-jobs armed)))
       (is (= "Execute: no command at point" (:message armed)))))
 
-  (testing "each armed task is its own closure over its own command"
-    ;; guards the CLAUDE.md AOT hazard: if execute-task's closure were
+  (testing "each armed job is its own closure over its own command"
+    ;; guards the CLAUDE.md AOT hazard: if execute-io/then's closures were
     ;; hoisted out and shared, distinct commands would collapse onto one.
     (let [s (fn [line] (assoc (buf/new-state nil [line])
                               :default-directory "/usr/glenda" :buffer-list []))
           a (acme/execute-at-point (s "pwd"))
           b (acme/execute-at-point (s "date"))]
-      (is (fn? (:pending-task a)))
-      (is (fn? (:pending-task b)))
-      (is (not= (:pending-task a) (:pending-task b)))
-      (is (= "Execute: running date ..." (:message b))))))
+      (is (not= (:async-jobs a) (:async-jobs b)))
+      (is (= "Execute: running date ..." (:message b)))
+      (is (= "Execute: running date ..." (:label (first (:async-jobs b))))))))
