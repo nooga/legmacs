@@ -7,6 +7,7 @@
             [legmacs.commands :as c]
             [legmacs.bindings :as bindings]
             [legmacs.dispatch :as d]
+            [legmacs.theme :as theme]
             [legmacs.modes.letgo]
             [legmacs.modes.prog]))
 
@@ -489,3 +490,26 @@
 (deftest recenter-sets-the-flag
   (testing "recenter marks the state; legmacs.render/scroll-to-fit consumes it"
     (is (:recenter (c/recenter (buf/new-state nil ["x"]))))))
+
+(deftest load-theme-command-switches-palette
+  (testing "M-x load-theme prompts, then replaces the live palette"
+    (theme/reset-theme!)
+    (try
+      (let [s (c/load-theme (buf/new-state nil ["x"]))]
+        (is (mb/active? s))
+        (let [s (type-input s "nord")
+              s (mb/submit s)]
+          (is (not (mb/active? s)))
+          (is (= :nord (theme/current-theme)))
+          (is (string/includes? (:message s) "nord"))))
+      (finally (theme/reset-theme!))))
+
+  (testing "an unknown name leaves the current theme alone"
+    (theme/reset-theme!)
+    (try
+      (let [s (c/load-theme (buf/new-state nil ["x"]))
+            s (type-input s "not-a-real-theme")
+            s (mb/submit s)]
+        (is (= :default (theme/current-theme)))
+        (is (string/includes? (:message s) "Unknown")))
+      (finally (theme/reset-theme!)))))

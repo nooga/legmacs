@@ -87,7 +87,7 @@ not held together.
 | `C-x 1` | make the current window the only one |
 | `C-x C-c` | quit (prompts if the current buffer has unsaved changes) |
 | `C-g` | cancel / quit-out-of-here |
-| `M-x` | run a command by name (`TAB` completes); the live list shows each command's current key bindings |
+| `M-x` | run a command by name (`TAB` completes); the live list shows each command's current key bindings. `load-theme` switches the color palette |
 | `C-x C-q` | toggle the current buffer read-only |
 | `C-h b` | show all key bindings (mode maps, then global) in a read-only `*Help*` buffer |
 | `C-h k` | describe the command bound to the next key sequence |
@@ -527,6 +527,63 @@ handy next to CRUTCH: the same physical `j` shows up as a bare motion in
 normal state and as a typed character in insert state, so the difference
 between the modes is visible as you press keys.
 
+### Theming colors
+
+Syntax highlighting, the gutter, echo-area messages, region/search
+highlights, and the inactive mode line all read from one palette
+([`legmacs/theme.lg`](../legmacs/theme.lg)): an atom of face specs, the same
+split the mode line already uses. Render compiles those specs into ANSI;
+modes still emit style keywords (`:string`, `:comment`, ...), never escape
+codes, so a theme change never touches a mode.
+
+**`M-x load-theme`** completes against the catalog and *replaces* the live
+palette. The shipped names:
+
+| Theme | Notes |
+|---|---|
+| `default` | The original hardcoded colors. Unstyled text uses the terminal's own fg/bg. |
+| `catppuccin-mocha` | Catppuccin Mocha (MIT, © Catppuccin Org). |
+| `catppuccin-latte` | Catppuccin Latte, the light flavor. Paints its own editor bg. |
+| `gruvbox-dark` | morhetz Gruvbox dark / medium contrast (MIT/X11). |
+| `tokyo-night` | Enkia's Tokyo Night (MIT). |
+| `nord` | Nord polar-bluish palette (MIT, © Sven Greb). |
+
+Ported themes include a `:default` face, so they cover the terminal's
+background -- that's what makes a light theme work on a dark terminal.
+`default` deliberately doesn't, so it still looks like it did before the
+palette was data.
+
+```clojure
+(require '[legmacs.theme :as theme])
+
+;; switch to a named palette (same as M-x load-theme)
+(theme/load-theme! :catppuccin-mocha)
+
+;; recolor strings; everything else stays
+(theme/set-theme! {:string {:fg [255 80 80]}})
+
+;; one face, and a vector means :fg
+(theme/set-face! :comment [90 90 105])
+(theme/set-face! :comment {:italic true})   ; keeps the :fg from above
+
+;; add your own, then M-x load-theme sees it
+(theme/register-theme! :acme {:default {:fg [0 0 0] :bg [255 255 234]}
+                              :string {:fg [32 100 32]}})
+
+;; the shipped default, matching the colors that used to be hardcoded
+(theme/reset-theme!)
+```
+
+A face spec is a map with any of `:fg` / `:bg` (Truecolor `[r g b]` triples)
+and `:bold` / `:italic` / `:underline` (booleans). `set-theme!` merges per
+face; `load-theme!` replaces. The faces highlighters emit (`:string`,
+`:keyword`, `:md-header`, `:help-key`, `:region`, ...) share a keyword with
+the span style. UI-only faces (`:default`, `:gutter`, `:gutter-current`,
+`:tilde`, `:message`, `:error`, `:modeline`, `:inactive-modeline`,
+`:candidate-keys`) are looked up by render directly. Unknown keys you `set-theme!` are stored and
+compiled, so a mode you add can introduce a new style without a render
+change.
+
 ### Theming the mode line
 
 The mode line ([`legmacs/modeline.lg`](../legmacs/modeline.lg)) is a registry
@@ -650,6 +707,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes/keycast.lg`](../legmacs/modes/keycast.lg) | keycast: a right-aligned live keystroke preview (`M-x keycast-mode`). A pure observer minor mode built on `:last-chord` + `:status-right`. |
 | [`legmacs/modes/help.lg`](../legmacs/modes/help.lg) | help-mode: the read-only, syntax-highlighted major mode for `*Help*` buffers (`C-h b`/`describe-bindings`, `C-h k`, `C-h f`, `C-h m`). Highlight-only, like markdown-mode. |
 | [`legmacs/dispatch.lg`](../legmacs/dispatch.lg) | One key chord → a new editor state. Layers every active mode's keymap (minor modes, then major) over the global one; runs their `:after-command` hooks on the way out. |
+| [`legmacs/theme.lg`](../legmacs/theme.lg) | The editor's color palette as data (face keyword → `{:fg :bg :bold ...}`). `load-theme!` switches a named map; `set-theme!`/`set-face!` merge; `register-theme!` is how user palettes get into `M-x load-theme`. Render compiles the atom into ANSI. |
 | [`legmacs/modeline.lg`](../legmacs/modeline.lg) | The mode-line's registry: named, ordered, independently-colorable segments plus a theme (bg/fg + separator), all plain data. `register-modeline-segment!`/`set-modeline-theme!` are the scripting surface; the built-in segments (buffer name, mode, position, ...) are registered the same way. |
 | [`legmacs/render.lg`](../legmacs/render.lg) | Editor state → one ANSI string per frame. A per-column fg/bg span compositor, so region highlight/paren-match/syntax colors can all coexist on one line; the mode line is a block compositor over `legmacs.modeline`'s segments instead. Draws each window of the workspace into its own rectangle (per-window mode line, `│` dividers), the echo area under all of them. |
 | [`legmacs/windows.lg`](../legmacs/windows.lg) | The window tree: split panes as pure data (leaves show a buffer through a per-window view; splits stack `:below` or sit `:beside` with proportional weights) plus the layout geometry that turns the tree into screen rectangles and divider positions. |

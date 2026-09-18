@@ -1,0 +1,354 @@
+;; legmacs.theme — the editor's color palette as data, the same split the
+;; mode line already uses: this namespace never emits ANSI, it just holds
+;; an atom of face specs (keyword -> {:fg :bg :bold :italic :underline}).
+;; legmacs.render compiles those into the escape codes a frame needs.
+;;
+;; Switching: (load-theme! :nord) replaces the live palette. Tweaking:
+;; (set-theme! {:string {:fg [255 80 80]}}) merges per face. M-x load-theme
+;; completes against the catalog; register-theme! is how a user's init.lg
+;; adds one, the same way bind-key! adds a key.
+;;
+;; A face spec is a map with any of:
+;;   :fg / :bg   [r g b] triples (Truecolor)
+;;   :bold :italic :underline   booleans
+;; A bare [r g b] vector is :fg for that face.
+;;
+;; :default, when present, is the unstyled editor fg/bg -- ported themes
+;; paint it so a light palette covers a dark terminal (and vice versa).
+;; The shipped :default theme omits it, so the terminal's own colors show
+;; through, matching the old hardcoded look.
+;;
+;; Shipped ports (MIT; RGB from each project's official palette, mapped
+;; onto our faces -- we don't copy their source):
+;;   Catppuccin Mocha / Latte  © Catppuccin Org
+;;     https://github.com/catppuccin/catppuccin  (style guide for roles)
+;;   Gruvbox Dark              © Pavel Pertsev (morhetz)
+;;     https://github.com/morhetz/gruvbox
+;;   Tokyo Night               © Enkia
+;;     https://github.com/enkia/tokyo-night-vscode-theme
+;;   Nord                      © Sven Greb / Arctic Ice Studio
+;;     https://github.com/nordtheme/nord
+
+(ns legmacs.theme)
+
+(def default-theme
+  "The shipped palette, matching the colors that used to be hardcoded in
+   legmacs.render. Faces used as syntax/UI span styles share a keyword
+   with the highlighter (:string, :region, ...); UI-only faces (:gutter,
+   :tilde, :message, :modeline, ...) are looked up by render directly."
+  {;; UI
+   :gutter {:fg [110 110 130]}
+   :gutter-current {:fg [235 200 90] :bold true}
+   :tilde {:fg [90 90 105]}
+   :message {:fg [140 200 140]}
+   :error {:fg [220 120 120]}
+   :modeline {:fg [190 195 210] :bg [40 44 58]}
+   :inactive-modeline {:fg [122 127 142] :bg [30 33 42]}
+   ;; syntax
+   :comment {:fg [90 90 105]}
+   :string {:fg [150 190 120]}
+   :char {:fg [215 130 160]}
+   :keyword {:fg [100 170 220]}
+   :number {:fg [210 150 90]}
+   :keyword-literal {:fg [90 200 190]}
+   :type {:fg [180 160 220]}
+   :function {:fg [235 205 110]}
+   :variable {:fg [120 205 235]}
+   :preproc {:fg [205 120 190]}
+   :paren-match {:fg [255 255 255] :bold true :bg [80 80 40]}
+   ;; markdown
+   :md-header {:fg [235 170 60] :bold true}
+   :md-hr {:fg [110 110 130]}
+   :md-quote {:fg [140 150 120] :italic true}
+   :md-list {:fg [220 150 80]}
+   :md-code {:fg [200 130 190]}
+   :md-bold {:bold true}
+   :md-italic {:italic true}
+   :md-link {:fg [120 180 240] :underline true}
+   :md-url {:fg [90 90 105]}
+   ;; help
+   :help-header {:fg [235 170 60] :bold true}
+   :help-key {:fg [100 170 220] :bold true}
+   :help-command {:fg [150 190 120]}
+   :help-doc {:fg [140 145 160] :italic true}
+   :candidate-keys {:fg [110 110 130]}
+   ;; selection / search (bg spans)
+   :region {:bg [55 70 95]}
+   :search-match {:bg [80 70 40]}
+   :search-current {:bg [170 120 40]}})
+
+(def catalog
+  "Registered themes, name (keyword) -> full face map. load-theme! looks
+   up here; register-theme! is how user themes get in."
+  (atom {:default default-theme}))
+
+(def current-name
+  "The last theme load-theme! installed. set-theme! tweaks don't change it."
+  (atom :default))
+
+(def theme
+  "The live palette. Render compiles this; don't put ANSI in it."
+  (atom default-theme))
+
+(def ^:private after-change
+  "Optional (fn [theme] ...) render registers so a set-theme! recompiles
+   ANSI without this ns knowing about escape codes."
+  (atom nil))
+
+(defn on-change!
+  "Install `f` as the (fn [theme-map] ...) called after every palette
+   edit. Render uses this to rebuild its ANSI tables; there is at most
+   one listener."
+  [f]
+  (reset! after-change f)
+  (when f (f @theme)))
+
+(defn- notify! [t]
+  (when-let [f @after-change] (f t))
+  t)
+
+(defn- as-face
+  "A vector [r g b] means {:fg that-triple}; a map is a face spec as-is."
+  [v]
+  (if (vector? v) {:fg v} (or v {})))
+
+(defn- as-name [name]
+  (if (keyword? name) name (keyword name)))
+
+(defn set-theme!
+  "Merge face specs into the current palette. Nested maps merge per face,
+   so `(set-theme! {:string {:fg [255 80 80]}})` recolors strings and
+   leaves everything else. A bare `[r g b]` vector is :fg for that face."
+  [m]
+  (notify!
+   (swap! theme
+          (fn [t]
+            (reduce (fn [t [k v]]
+                      (assoc t k (merge (as-face (get t k)) (as-face v))))
+                    t
+                    m)))))
+
+(defn set-face!
+  "Merge `spec` into one face. Same vector-means-:fg rule as set-theme!."
+  [k spec]
+  (notify!
+   (swap! theme (fn [t] (assoc t k (merge (as-face (get t k)) (as-face spec)))))))
+
+(defn register-theme!
+  "Add or replace a named palette in the catalog. Doesn't load it;
+   call load-theme! (or M-x load-theme) for that."
+  [name spec]
+  (swap! catalog assoc (as-name name) spec)
+  (as-name name))
+
+(defn theme-names
+  "Registered theme keywords, :default first, the rest sorted."
+  []
+  (let [ks (keys @catalog)]
+    (vec (cons :default (sort (remove #{:default} ks))))))
+
+(defn current-theme
+  "Keyword of the last theme load-theme! installed."
+  []
+  @current-name)
+
+(defn load-theme!
+  "Replace the live palette with the registered theme `name`. Unlike
+   set-theme!, this does not merge -- it's a switch. Returns the theme
+   map, or nil if `name` isn't registered."
+  [name]
+  (let [k (as-name name)]
+    (when-let [t (get @catalog k)]
+      (reset! current-name k)
+      (notify! (reset! theme t)))))
+
+(defn reset-theme!
+  "Restore the shipped :default palette."
+  []
+  (load-theme! :default))
+
+;; --- shipped ports -------------------------------------------------------
+
+(defn- catppuccin
+  "Map a Catppuccin flavor onto our faces, following their style guide:
+   keyword mauve, string green, number peach, function blue, type yellow,
+   comment overlay2, macros rosewater."
+  [{:keys [rosewater red peach yellow green teal blue mauve lavender
+           text overlay2 overlay1 overlay0 surface2 surface1 base mantle crust]}]
+  {:default {:fg text :bg base}
+   :gutter {:fg overlay1 :bg base}
+   :gutter-current {:fg lavender :bold true :bg base}
+   :tilde {:fg overlay0 :bg base}
+   :message {:fg green :bg base}
+   :error {:fg red :bg base}
+   :modeline {:fg text :bg mantle}
+   :inactive-modeline {:fg overlay1 :bg crust}
+   :comment {:fg overlay2 :italic true}
+   :string {:fg green}
+   :char {:fg teal}
+   :keyword {:fg mauve}
+   :number {:fg peach}
+   :keyword-literal {:fg peach}
+   :type {:fg yellow}
+   :function {:fg blue}
+   :variable {:fg text}
+   :preproc {:fg rosewater}
+   :paren-match {:fg rosewater :bold true :bg surface1}
+   :md-header {:fg lavender :bold true}
+   :md-hr {:fg overlay1}
+   :md-quote {:fg overlay2 :italic true}
+   :md-list {:fg peach}
+   :md-code {:fg teal}
+   :md-bold {:bold true}
+   :md-italic {:italic true}
+   :md-link {:fg blue :underline true}
+   :md-url {:fg overlay2}
+   :help-header {:fg yellow :bold true}
+   :help-key {:fg mauve :bold true}
+   :help-command {:fg green}
+   :help-doc {:fg overlay1 :italic true}
+   :candidate-keys {:fg overlay1}
+   :region {:bg surface1}
+   :search-match {:bg surface2}
+   :search-current {:bg overlay0}})
+
+(register-theme!
+ :catppuccin-mocha
+ (catppuccin {:rosewater [245 224 220] :red [243 139 168] :peach [250 179 135]
+              :yellow [249 226 175] :green [166 227 161] :teal [148 226 213]
+              :blue [137 180 250] :mauve [203 166 247]
+              :lavender [180 190 254] :text [205 214 244]
+              :overlay2 [147 153 178] :overlay1 [127 132 156] :overlay0 [108 112 134]
+              :surface2 [88 91 112] :surface1 [69 71 90]
+              :base [30 30 46] :mantle [24 24 37] :crust [17 17 27]}))
+
+(register-theme!
+ :catppuccin-latte
+ (catppuccin {:rosewater [220 138 120] :red [210 15 57] :peach [254 100 11]
+              :yellow [223 142 29] :green [64 160 43] :teal [23 146 153]
+              :blue [30 102 245] :mauve [136 57 239]
+              :lavender [114 135 253] :text [76 79 105]
+              :overlay2 [124 127 147] :overlay1 [140 143 161] :overlay0 [156 160 176]
+              :surface2 [172 176 190] :surface1 [188 192 204]
+              :base [239 241 245] :mantle [230 233 239] :crust [220 224 232]}))
+
+(register-theme!
+ :gruvbox-dark
+ {;; morhetz/gruvbox dark / medium contrast (bg0, fg1, bright_*).
+  :default {:fg [235 219 178] :bg [40 40 40]}
+  :gutter {:fg [146 131 116] :bg [40 40 40]}
+  :gutter-current {:fg [250 189 47] :bold true :bg [40 40 40]}
+  :tilde {:fg [124 111 100] :bg [40 40 40]}
+  :message {:fg [184 187 38] :bg [40 40 40]}
+  :error {:fg [251 73 52] :bg [40 40 40]}
+  :modeline {:fg [235 219 178] :bg [60 56 54]}
+  :inactive-modeline {:fg [146 131 116] :bg [40 40 40]}
+  :comment {:fg [146 131 116] :italic true}
+  :string {:fg [184 187 38]}
+  :char {:fg [254 128 25]}
+  :keyword {:fg [251 73 52]}
+  :number {:fg [211 134 155]}
+  :keyword-literal {:fg [211 134 155]}
+  :type {:fg [250 189 47]}
+  :function {:fg [142 192 124]}
+  :variable {:fg [131 165 152]}
+  :preproc {:fg [142 192 124]}
+  :paren-match {:fg [251 241 199] :bold true :bg [80 73 69]}
+  :md-header {:fg [250 189 47] :bold true}
+  :md-hr {:fg [124 111 100]}
+  :md-quote {:fg [146 131 116] :italic true}
+  :md-list {:fg [254 128 25]}
+  :md-code {:fg [184 187 38]}
+  :md-bold {:bold true}
+  :md-italic {:italic true}
+  :md-link {:fg [131 165 152] :underline true}
+  :md-url {:fg [146 131 116]}
+  :help-header {:fg [250 189 47] :bold true}
+  :help-key {:fg [251 73 52] :bold true}
+  :help-command {:fg [184 187 38]}
+  :help-doc {:fg [146 131 116] :italic true}
+  :candidate-keys {:fg [146 131 116]}
+  :region {:bg [80 73 69]}
+  :search-match {:bg [102 92 84]}
+  :search-current {:bg [124 80 20]}})
+
+(register-theme!
+ :tokyo-night
+ {;; enkia Tokyo Night (Night bg #1a1b26), roles from their color table.
+  :default {:fg [169 177 214] :bg [26 27 38]}
+  :gutter {:fg [54 59 84] :bg [26 27 38]}
+  :gutter-current {:fg [120 124 153] :bold true :bg [26 27 38]}
+  :tilde {:fg [65 72 104] :bg [26 27 38]}
+  :message {:fg [158 206 106] :bg [26 27 38]}
+  :error {:fg [247 118 142] :bg [26 27 38]}
+  :modeline {:fg [169 177 214] :bg [22 22 30]}
+  :inactive-modeline {:fg [86 95 137] :bg [22 22 30]}
+  :comment {:fg [86 95 137] :italic true}
+  :string {:fg [158 206 106]}
+  :char {:fg [158 206 106]}
+  :keyword {:fg [247 118 142]}
+  :number {:fg [255 158 100]}
+  :keyword-literal {:fg [255 158 100]}
+  :type {:fg [42 195 222]}
+  :function {:fg [122 162 247]}
+  :variable {:fg [192 202 245]}
+  :preproc {:fg [187 154 247]}
+  :paren-match {:fg [192 202 245] :bold true :bg [65 72 104]}
+  :md-header {:fg [125 207 255] :bold true}
+  :md-hr {:fg [86 95 137]}
+  :md-quote {:fg [86 95 137] :italic true}
+  :md-list {:fg [255 158 100]}
+  :md-code {:fg [125 207 255]}
+  :md-bold {:bold true}
+  :md-italic {:italic true}
+  :md-link {:fg [115 218 202] :underline true}
+  :md-url {:fg [86 95 137]}
+  :help-header {:fg [125 207 255] :bold true}
+  :help-key {:fg [187 154 247] :bold true}
+  :help-command {:fg [158 206 106]}
+  :help-doc {:fg [86 95 137] :italic true}
+  :candidate-keys {:fg [86 95 137]}
+  :region {:bg [65 72 104]}
+  :search-match {:bg [45 52 87]}
+  :search-current {:bg [61 89 161]}})
+
+(register-theme!
+ :nord
+ {;; nord0–15, roles from the official Nord syntax guidance
+  ;; (comment nord3, string nord14, keyword nord9, function nord8, ...).
+  :default {:fg [216 222 233] :bg [46 52 64]}
+  :gutter {:fg [76 86 106] :bg [46 52 64]}
+  :gutter-current {:fg [136 192 208] :bold true :bg [46 52 64]}
+  :tilde {:fg [76 86 106] :bg [46 52 64]}
+  :message {:fg [163 190 140] :bg [46 52 64]}
+  :error {:fg [191 97 106] :bg [46 52 64]}
+  :modeline {:fg [216 222 233] :bg [59 66 82]}
+  :inactive-modeline {:fg [76 86 106] :bg [46 52 64]}
+  :comment {:fg [76 86 106] :italic true}
+  :string {:fg [163 190 140]}
+  :char {:fg [208 135 112]}
+  :keyword {:fg [129 161 193]}
+  :number {:fg [180 142 173]}
+  :keyword-literal {:fg [180 142 173]}
+  :type {:fg [143 188 187]}
+  :function {:fg [136 192 208]}
+  :variable {:fg [216 222 233]}
+  :preproc {:fg [94 129 172]}
+  :paren-match {:fg [236 239 244] :bold true :bg [67 76 94]}
+  :md-header {:fg [136 192 208] :bold true}
+  :md-hr {:fg [76 86 106]}
+  :md-quote {:fg [76 86 106] :italic true}
+  :md-list {:fg [208 135 112]}
+  :md-code {:fg [143 188 187]}
+  :md-bold {:bold true}
+  :md-italic {:italic true}
+  :md-link {:fg [136 192 208] :underline true}
+  :md-url {:fg [76 86 106]}
+  :help-header {:fg [235 203 139] :bold true}
+  :help-key {:fg [129 161 193] :bold true}
+  :help-command {:fg [163 190 140]}
+  :help-doc {:fg [76 86 106] :italic true}
+  :candidate-keys {:fg [76 86 106]}
+  :region {:bg [59 66 82]}
+  :search-match {:bg [67 76 94]}
+  :search-current {:bg [94 129 172]}})

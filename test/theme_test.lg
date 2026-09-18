@@ -1,0 +1,131 @@
+(ns test.theme-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.render :as r]
+            [legmacs.theme :as theme]))
+
+;; render's on-change! hook is registered when that ns loads; requiring it
+;; here means a standalone `lg -e '(require ... test.theme-test)'` still
+;; recompiles ANSI on set-theme!, same as the full suite.
+
+(deftest default-theme-matches-the-old-hardcoded-palette
+  (testing "shipped faces compile to the RGB that used to live in render"
+    (theme/reset-theme!)
+    (is (string/includes? (get @r/fg-color-for :comment) "38;2;90;90;105"))
+    (is (string/includes? (get @r/fg-color-for :string) "38;2;150;190;120"))
+    (is (string/includes? (get @r/fg-color-for :paren-match) "38;2;255;255;255"))
+    (is (string/includes? (get @r/bg-color-for :paren-match) "48;2;80;80;40"))
+    (is (string/includes? (r/region-bg) "48;2;55;70;95"))
+    (is (string/includes? (r/search-match-bg) "48;2;80;70;40"))
+    (is (string/includes? (r/search-current-bg) "48;2;170;120;40"))))
+
+(deftest set-theme-merges-per-face
+  (testing "set-theme! recolors one face and leaves the rest alone"
+    (theme/reset-theme!)
+    (try
+      (let [comment-before (get @theme/theme :comment)
+            string-before (:fg (get @theme/theme :string))]
+        (theme/set-theme! {:string {:fg [255 1 2]}})
+        (is (= [255 1 2] (:fg (get @theme/theme :string))))
+        (is (= comment-before (get @theme/theme :comment)))
+        (is (not= string-before (:fg (get @theme/theme :string)))))
+      (finally (theme/reset-theme!)))))
+
+(deftest set-theme-vector-means-fg
+  (testing "a bare [r g b] vector is :fg for that face"
+    (theme/reset-theme!)
+    (try
+      (theme/set-theme! {:keyword [10 20 30]})
+      (is (= [10 20 30] (:fg (get @theme/theme :keyword))))
+      (finally (theme/reset-theme!)))))
+
+(deftest set-face-keeps-other-keys-on-the-same-face
+  (testing "merging :fg into :paren-match keeps its :bg and :bold"
+    (theme/reset-theme!)
+    (try
+      (theme/set-face! :paren-match {:fg [1 1 1]})
+      (let [face (get @theme/theme :paren-match)]
+        (is (= [1 1 1] (:fg face)))
+        (is (= [80 80 40] (:bg face)))
+        (is (true? (:bold face))))
+      (finally (theme/reset-theme!)))))
+
+(deftest reset-theme-restores-defaults
+  (testing "reset-theme! puts the shipped palette back"
+    (theme/reset-theme!)
+    (try
+      (theme/set-face! :string [1 2 3])
+      (theme/reset-theme!)
+      (is (= theme/default-theme @theme/theme))
+      (is (= [150 190 120] (:fg (get @theme/theme :string))))
+      (finally (theme/reset-theme!)))))
+
+(deftest set-theme-recompiles-render-ansi
+  (testing "set-face! changes the ANSI a highlighter's style emits in a frame"
+    (let [km (atom {})]
+      (modes/register-mode! :test-theme-hl km "theme hl"
+                             {:highlighter (fn [line]
+                                             [{:start 0 :end (count line) :style :string}])})
+      (theme/reset-theme!)
+      (try
+        (let [s (-> (buf/new-state nil ["hello"])
+                    (modes/switch-to-mode :test-theme-hl)
+                    (buf/ensure-visible 10 40))
+              before (get @r/fg-color-for :string)]
+          (theme/set-face! :string [255 1 2])
+          (let [after (get @r/fg-color-for :string)
+                out (r/frame s 40 12)]
+            (is (not= before after))
+            (is (string/includes? after "38;2;255;1;2"))
+            (is (string/includes? out after))
+            (is (not (string/includes? out before)))))
+        (finally (theme/reset-theme!))))))
+
+(deftest load-theme-replaces-the-palette
+  (testing "load-theme! swaps the whole map, it doesn't merge"
+    (theme/reset-theme!)
+    (try
+      (is (some? (theme/load-theme! :nord)))
+      (is (= :nord (theme/current-theme)))
+      (is (= [163 190 140] (:fg (get @theme/theme :string))))
+      (is (nil? (theme/load-theme! :no-such-theme)))
+      (is (= :nord (theme/current-theme)))
+      (theme/reset-theme!)
+      (is (= :default (theme/current-theme)))
+      (is (= theme/default-theme @theme/theme))
+      (finally (theme/reset-theme!)))))
+
+(deftest shipped-themes-are-registered
+  (testing "the MIT ports plus :default show up in the catalog"
+    (let [names (set (map name (theme/theme-names)))]
+      (is (= "default" (first (map name (theme/theme-names)))))
+      (doseq [n ["default" "catppuccin-mocha" "catppuccin-latte"
+                 "gruvbox-dark" "tokyo-night" "nord"]]
+        (is (contains? names n))))))
+
+(deftest load-theme-paints-default-background
+  (testing "a ported theme's :default bg shows up in the frame, then default drops it"
+    (theme/reset-theme!)
+    (try
+      (let [s (buf/ensure-visible (buf/new-state nil ["hello"]) 10 40)
+            before (r/frame s 40 12)]
+        (is (not (string/includes? before "48;2;239;241;245")))
+        (theme/load-theme! :catppuccin-latte)
+        (let [out (r/frame s 40 12)]
+          (is (string/includes? out "48;2;239;241;245"))
+          (is (string/includes? out "38;2;76;79;105"))))
+      (finally (theme/reset-theme!)))))
+
+(deftest register-theme-is-loadable
+  (testing "a user theme registered by name can be load-theme!'d"
+    (theme/reset-theme!)
+    (try
+      (theme/register-theme! :test-user-theme
+                             (assoc theme/default-theme :string {:fg [1 2 3]}))
+      (is (some? (theme/load-theme! :test-user-theme)))
+      (is (= [1 2 3] (:fg (get @theme/theme :string))))
+      (finally
+        (swap! theme/catalog dissoc :test-user-theme)
+        (theme/reset-theme!)))))
