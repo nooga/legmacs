@@ -1,0 +1,143 @@
+(ns test.acme-extension-test
+  (:require [test :refer :all]
+            [string]
+            [os]
+            [legmacs.buffer :as buf]
+            [legmacs.extensions.acme :as acme]
+            [legmacs.keymap :as km]
+            [legmacs.path :as path]))
+
+(deftest target-text-prefers-selection-then-expands-point
+  (testing "a path-like token touching point is expanded without a region"
+    (let [line "see \"legmacs/buffer.lg\" now"
+          s (assoc (buf/new-state nil [line])
+                   :cursor-col (string/index-of line "buffer"))]
+      (is (= "legmacs/buffer.lg" (acme/target-text s)))))
+
+  (testing "point immediately after the token still refers to it"
+    (let [line "legmacs/buffer.lg "
+          s (assoc (buf/new-state nil [line]) :cursor-col (dec (count line)))]
+      (is (= "legmacs/buffer.lg" (acme/target-text s)))))
+
+  (testing "an active region wins and can contain characters token expansion excludes"
+    (let [line "prefix path with spaces suffix"
+          start (string/index-of line "path")
+          end (+ start (count "path with spaces"))
+          s (assoc (buf/new-state nil [line]) :mark [0 start] :cursor-col end)]
+      (is (= "path with spaces" (acme/target-text s))))))
+
+(deftest path-context-resolves-relative-targets
+  (let [s (assoc (buf/new-state "/usr/glenda/src/legmacs/main.lg" [""])
+                 :default-directory "/usr/glenda/src/legmacs")]
+    (is (= "/usr/glenda/src/legmacs/legmacs/buffer.lg"
+           (path/resolve s "legmacs/buffer.lg")))
+    (is (= "/sys/src/cmd/acme/acme.c" (path/resolve s "/sys/src/cmd/acme/acme.c")))))
+
+(deftest look-opens-files-and-reuses-open-buffers
+  (let [filename (path/join (os/cwd) "legmacs/buffer.lg")
+        base (assoc (buf/new-state nil ["legmacs/buffer.lg"])
+                    :cursor-col 10
+                    :default-directory (os/cwd)
+                    :buffer-list [])
+        opened (acme/look-at-point base)]
+    (is (= :open-new (:op (:buffer-command opened))))
+    (is (= filename (:filename (:state (:buffer-command opened)))))
+    (is (= (path/directory-of filename)
+           (:default-directory (:state (:buffer-command opened)))))
+
+    (let [reused (acme/look-at-point
+                   (assoc base :buffer-list
+                          [{:id 7 :name "buffer.lg" :filename filename :modified? false :mode nil}]))]
+      (is (= {:op :switch :id 7} (:buffer-command reused))))))
+
+(deftest look-opens-directories-as-plain-editable-text
+  (let [dir (path/join (os/cwd) "legmacs")
+        s (assoc (buf/new-state nil ["legmacs/"])
+                 :cursor-col 3
+                 :default-directory (os/cwd)
+                 :buffer-list [])
+        looked (acme/look-at-point s)
+        listing (:state (:buffer-command looked))]
+    (is (= :open-new (:op (:buffer-command looked))))
+    (is (nil? (:filename listing)))
+    (is (= dir (:default-directory listing)))
+    (is (= (path/display-directory dir) (:buffer-name listing)))
+    (is (some #(= "buffer.lg" %) (:lines listing)))
+    (is (some #(= (str "modes" os/file-separator) %) (:lines listing)))
+    (is (not (:read-only? listing)))
+    (is (:modified? (buf/insert-string listing "note ")))))
+
+(deftest look-reuses-an-open-directory-buffer
+  (let [dir (path/join (os/cwd) "legmacs")
+        name (path/display-directory dir)
+        s (assoc (buf/new-state nil ["legmacs/"])
+                 :cursor-col 3
+                 :default-directory (os/cwd)
+                 :buffer-list [{:id 8 :name name :filename nil :modified? true :mode nil}])
+        looked (acme/look-at-point s)]
+    (is (= {:op :switch :id 8} (:buffer-command looked)))))
+
+(deftest look-never-creates-a-missing-target
+  (let [s (assoc (buf/new-state nil ["definitely-not-a-legmacs-path"])
+                 :cursor-col 5
+                 :default-directory (os/cwd)
+                 :buffer-list [])
+        looked (acme/look-at-point s)]
+    (is (nil? (:buffer-command looked)))
+    (is (string/includes? (:message looked) "no file or directory"))))
+
+(deftest enabling-the-extension-binds-f7-and-f8
+  (acme/enable!)
+  (is (= [:command :execute-at-point] (km/lookup @km/global-keymap "f7")))
+  (is (= [:command :look-at-point] (km/lookup @km/global-keymap "f8"))))
+
+(deftest execute-builds-a-directory-scoped-rc-command
+  (let [s (assoc (buf/new-state nil [""])
+                 :default-directory "/tmp/we're-here")]
+    (is (= "rfork e; rm -f '/env/fn#'*; path=(. /bin); cd '/tmp/we''re-here'; pwd"
+           (acme/rc-script s "pwd")))))
+
+(deftest execute-result-opens-an-editable-errors-buffer
+  (let [s (assoc (buf/new-state nil ["ls -l /"])
+                 :default-directory "/usr/glenda/src"
+                 :buffer-list [])
+        result {:exit 1 :out "one\ntwo\n" :err "oops\n"}
+        executed (acme/apply-execute-result s "ls -l /" result)
+        cmd (:buffer-command executed)
+        output (:state cmd)]
+    (is (= :append-named (:op cmd)))
+    (is (= "/usr/glenda/src/+Errors" (:name cmd)))
+    (is (= ["; ls -l /" "one" "two" "[stderr]" "oops" "[exit 1]"]
+           (:lines output)))
+    (is (= "/usr/glenda/src" (:default-directory output)))
+    (is (not (:read-only? output)))
+    (is (:modified? (buf/insert-string output "note ")))))
+
+(deftest execute-defers-the-blocking-run-behind-a-visible-message
+  (testing "F7 arms a :pending-task instead of running rc inline, and says what it's running"
+    (let [s (assoc (buf/new-state nil ["pwd"])
+                   :default-directory "/usr/glenda"
+                   :buffer-list [])
+          armed (acme/execute-at-point s)]
+      ;; nothing has run yet: no output buffer, just the frame-to-be-painted
+      (is (nil? (:buffer-command armed)))
+      (is (= "Execute: running pwd ..." (:message armed)))
+      (is (some? (:pending-task armed)))))
+
+  (testing "with no target, it reports that and arms nothing"
+    (let [s (assoc (buf/new-state nil ["   "]) :default-directory "/usr/glenda")
+          armed (acme/execute-at-point s)]
+      (is (nil? (:pending-task armed)))
+      (is (= "Execute: no command at point" (:message armed)))))
+
+  (testing "each armed task is its own closure over its own command"
+    ;; guards the CLAUDE.md AOT hazard: if execute-task's closure were
+    ;; hoisted out and shared, distinct commands would collapse onto one.
+    (let [s (fn [line] (assoc (buf/new-state nil [line])
+                              :default-directory "/usr/glenda" :buffer-list []))
+          a (acme/execute-at-point (s "pwd"))
+          b (acme/execute-at-point (s "date"))]
+      (is (fn? (:pending-task a)))
+      (is (fn? (:pending-task b)))
+      (is (not= (:pending-task a) (:pending-task b)))
+      (is (= "Execute: running date ..." (:message b))))))

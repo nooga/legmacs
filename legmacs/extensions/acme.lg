@@ -1,0 +1,233 @@
+;; legmacs.extensions.acme — an optional, keyboard-driven experiment with
+;; Acme's Look and Execute interactions.  Selected text wins; otherwise both
+;; actions expand the path-like token at point, matching Acme's button-2/3
+;; click expansion.  Look opens an existing file or directory.  Execute runs
+;; a short, non-interactive rc expression and appends its output to a plain
+;; editable, directory-scoped +Errors buffer.
+
+(ns legmacs.extensions.acme
+  (:require [string]
+            [os]
+            [legmacs.buffer :as buf]
+            [legmacs.commands :as commands]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.path :as path]))
+
+(defn path-char?
+  "Acme's conservative single-click filename alphabet: alphanumerics plus
+   underscore, dot, dash, plus, and slash.  A selected region can still name
+   a path containing other characters, including spaces."
+  [ch]
+  (or (buf/word-char? ch)
+      (contains? #{\. \- \+ \/} ch)))
+
+(defn path-bounds-at
+  "[start-col end-col] for the path-like token touching point on the current
+   line.  Point immediately after a token still refers to that token."
+  [state]
+  (let [line (buf/current-line state)
+        col (:cursor-col state)
+        len (count line)
+        char-at (fn [i] (when (and (<= 0 i) (< i len)) (nth line i)))
+        anchor (cond
+                 (path-char? (char-at col)) col
+                 (path-char? (char-at (dec col))) (dec col)
+                 :else nil)]
+    (when anchor
+      (let [start (loop [i anchor]
+                    (if (path-char? (char-at (dec i))) (recur (dec i)) i))
+            end (loop [i (inc anchor)]
+                  (if (path-char? (char-at i)) (recur (inc i)) i))]
+        [start end]))))
+
+(defn target-text
+  "The active region's text when non-empty, otherwise the path token at
+   point.  Trimming makes a deliberately swept path convenient without
+   changing the single-click/token rules."
+  [state]
+  (let [selected (when (buf/region-active? state)
+                   (string/trim (buf/region-text state)))]
+    (if (seq selected)
+      selected
+      (when-let [[start end] (path-bounds-at state)]
+        (subs (buf/current-line state) start end)))))
+
+(defn- entry-line [dir entry]
+  (let [full (path/join dir entry)
+        info (try (os/stat full) (catch e nil))]
+    (if (:dir? info) (str entry os/file-separator) entry)))
+
+(defn directory-state
+  "A plain writable buffer listing `dir`.  Its body is only text: editing or
+   deleting a line never changes the filesystem."
+  [dir]
+  (let [dir (path/strip-trailing-separators dir)
+        entries (os/ls dir)
+        lines (mapv (fn [entry] (entry-line dir entry)) entries)]
+    (assoc (buf/new-state nil lines)
+           :buffer-name (path/display-directory dir)
+           :default-directory dir
+           :directory-buffer? true)))
+
+(defn- existing-file-id [state filename]
+  (some (fn [entry]
+          (when-let [open-name (:filename entry)]
+            (when (= filename (path/absolute-path open-name)) (:id entry))))
+        (:buffer-list state)))
+
+(defn- existing-directory-id [state dir]
+  (let [name (path/display-directory dir)]
+    (some (fn [entry]
+            (when (and (nil? (:filename entry)) (= name (:name entry)))
+              (:id entry)))
+          (:buffer-list state))))
+
+(defn- open-file [state filename]
+  (if-let [id (existing-file-id state filename)]
+    (assoc state :buffer-command {:op :switch :id id}
+                 :message (str "Look: switched to " filename))
+    (let [[fresh message] (commands/new-file-state filename)]
+      ;; Look never creates a file.  A path that existed at stat time but
+      ;; could not be read is an error, not an empty "new file" buffer.
+      (if (string/starts-with? message "New file ")
+        (assoc state :message (str "Look: could not read " filename))
+        (assoc state :buffer-command {:op :open-new :state fresh}
+                     :message message)))))
+
+(defn- open-directory [state dir]
+  (if-let [id (existing-directory-id state dir)]
+    (assoc state :buffer-command {:op :switch :id id}
+                 :message (str "Look: switched to " (path/display-directory dir)))
+    (try
+      (assoc state :buffer-command {:op :open-new :state (directory-state dir)}
+                   :message (str "Listed " (path/display-directory dir)))
+      (catch e
+        (assoc state :message (str "Look: could not list " dir))))))
+
+(defcommand look-at-point
+  "Open the existing file or directory named by the active region or the
+   path-like token at point, interpreted in this buffer's directory context."
+  [state]
+  (if-let [target (target-text state)]
+    (let [resolved (path/resolve state target)
+          info (try (os/stat resolved) (catch e nil))]
+      (cond
+        (nil? info) (assoc state :message (str "Look: no file or directory: " target))
+        (:dir? info) (open-directory state resolved)
+        :else (open-file state resolved)))
+    (assoc state :message "Look: no target at point")))
+
+(defn rc-quote
+  "Quote one string for rc.  Inside rc single quotes, an apostrophe is
+   represented by two apostrophes."
+  [text]
+  (str "'" (string/replace text "'" "''") "'"))
+
+(defn rc-script
+  "Wrap `command` so rc evaluates it in this buffer's directory context
+   without changing the LegMacs process's own working directory.  `rc -p`
+   skips importing inherited CPU-session functions itself.  A private
+   environment group then drops fn# entries before the command runs, so rc
+   scripts launched by the command also start cleanly.  Finally the script
+   restores Acme-like local-first lookup explicitly."
+  [state command]
+  (str "rfork e; rm -f '/env/fn#'*; path=(. /bin); cd "
+       (rc-quote (path/default-directory state)) "; " command))
+
+(defn- nonblank-lines [text]
+  (if (string/blank? text) [] (buf/split-lines text)))
+
+(defn execute-result-lines
+  "Render one completed command as an appendable +Errors block.  os/sh
+   captures stdout and stderr separately, so stderr is labeled when present;
+   this first synchronous slice does not attempt stream interleaving."
+  [command result]
+  (let [out-lines (nonblank-lines (:out result))
+        err-lines (nonblank-lines (:err result))
+        exit (:exit result)
+        no-output? (and (empty? out-lines) (empty? err-lines))]
+    (vec (concat (buf/split-lines (str "; " command))
+                 out-lines
+                 (when (seq err-lines) (concat ["[stderr]"] err-lines))
+                 (cond
+                   (not (zero? exit)) [(format "[exit %d]" exit)]
+                   no-output? ["(no output)"]
+                   :else [])))))
+
+(defn errors-buffer-name [dir]
+  (str (path/display-directory dir) "+Errors"))
+
+(defn execute-output-state
+  "A writable buffer state containing one command's output block.  The
+   workspace's :append-named operation creates or appends it to the matching
+   directory-scoped +Errors buffer."
+  [dir command result]
+  (let [lines (execute-result-lines command result)
+        row (dec (count lines))]
+    (assoc (buf/new-state nil lines)
+           :buffer-name (errors-buffer-name dir)
+           :default-directory dir
+           :acme-errors-buffer? true
+           :cursor-row row
+           :cursor-col (count (nth lines row)))))
+
+(defn apply-execute-result
+  "Turn a completed rc result into the buffer command consumed by the
+   workspace.  Public separately from process launch so its state transition
+   can be tested without requiring rc on the host running the test suite."
+  [state command result]
+  (let [dir (path/default-directory state)
+        output (execute-output-state dir command result)
+        exit (:exit result)]
+    (assoc state
+           :buffer-command {:op :append-named
+                            :name (:buffer-name output)
+                            :state output}
+           :message (format "Execute: rc exited %d" exit))))
+
+(defn run-command-now
+  "Launch `command` through rc in `state`'s directory context and fold the
+   completed result into its +Errors buffer -- the actually-blocking half of
+   execute-at-point, kept separate so the state transition around it stays
+   testable via apply-execute-result on hosts without rc."
+  [state command]
+  (let [result (try
+                 (os/sh "rc" "-p" "-c" (rc-script state command))
+                 (catch e
+                   {:exit 127 :out "" :err (str "could not start rc: " e)}))]
+    (apply-execute-result state command result)))
+
+(defn execute-task
+  "run-command-now as a deferred (fn [state] -> state) task for
+   :pending-task.  A named function rather than an inline fn literal
+   because execute-at-point builds it inside an if-let, and a closure over
+   a local in a conditional branch trips let-go's AOT closure hoisting --
+   see CLAUDE.md."
+  [command]
+  (fn [state] (run-command-now state command)))
+
+(defcommand execute-at-point
+  "Run the active region, or the path-like token at point, as a
+   non-interactive rc expression in this buffer's directory context.  Output
+   is appended to an ordinary editable directory/+Errors buffer.
+
+   rc still runs to completion before legmacs reads another key, but the run
+   is armed as a :pending-task (see legmacs.buffers) instead of happening
+   inline: the frame naming the command reaches the screen first, so a slow
+   command shows \"Execute: running ...\" rather than freezing on the frame
+   from before the keystroke.  A real async job model would go here too --
+   :pending-task is the seam for it."
+  [state]
+  (if-let [command (target-text state)]
+    (assoc state
+           :pending-task (execute-task command)
+           :message (str "Execute: running " command " ..."))
+    (assoc state :message "Execute: no command at point")))
+
+(defn enable!
+  "Enable the Acme experiment's default bindings: F7 executes like button 2;
+   F8 looks like button 3.  Requiring this namespace alone only registers the
+   two commands for M-x."
+  []
+  (km/bind-key! "f7" :execute-at-point)
+  (km/bind-key! "f8" :look-at-point))

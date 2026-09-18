@@ -1,0 +1,10 @@
+;; Minimal opt-in for the Acme-inspired Look and Execute experiment.
+;;
+;; Copy this to ~/.config/legmacs/legmacs_init.lg, or merge the require and
+;; enable! call into an existing config.  The extension registers its commands
+;; when required; enable! adds the default F7 Execute and F8 Look bindings.
+
+(ns legmacs-init
+  (:require [legmacs.extensions.acme :as acme]))
+
+(acme/enable!)

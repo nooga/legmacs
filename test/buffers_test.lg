@@ -122,6 +122,22 @@
 
 (defn- send [ws cmd] (bufs/put-current ws (assoc (bufs/current ws) :buffer-command cmd)))
 
+(deftest append-named-creates-reuses-and-accumulates-output
+  (let [first-state (assoc (buf/new-state nil ["; pwd" "/tmp"])
+                           :buffer-name "/tmp/+Errors")
+        second-state (assoc (buf/new-state nil ["; echo hi" "hi"])
+                            :buffer-name "/tmp/+Errors")
+        ws (bufs/new-workspace (buf/new-state nil ["source"]))
+        ws (send ws {:op :append-named :name "/tmp/+Errors" :state first-state})
+        output-id (:current ws)
+        ws (send ws {:op :append-named :name "/tmp/+Errors" :state second-state})]
+    (is (= output-id (:current ws)))
+    (is (= 2 (count (:order ws))))
+    (is (= ["; pwd" "/tmp" "" "; echo hi" "hi"]
+           (:lines (bufs/current ws))))
+    (is (= 4 (:cursor-row (bufs/current ws))))
+    (is (= 2 (:cursor-col (bufs/current ws))))))
+
 (deftest split-adds-a-window-on-the-same-buffer
   (testing "C-x 2's op leaves focus in the original window, both showing the buffer"
     (let [ws (bufs/new-workspace (buf/new-state "a.txt" ["one" "two"]))
@@ -206,3 +222,63 @@
       (let [ws (bufs/put-current ws (dissoc (bufs/current ws) :overlay))]
         (is (nil? (:overlay (bufs/current ws))))
         (is (nil? (:overlay ws)))))))
+
+;; :pending-task -- the "let the screen catch up, then do the slow thing"
+;; seam. main.lg's loop is the only consumer, and requiring main.lg starts
+;; the real editor (see CLAUDE.md), so the one-iteration step it performs
+;; is reproduced inline here instead.
+(defn- run-pending-step
+  "One turn of main.lg's run loop when a task is armed: dropping
+   :pending-task from the flat state is what consumes it."
+  [ws]
+  (let [task (:pending-task ws)]
+    (bufs/put-current ws (task (dissoc (bufs/current ws) :pending-task)))))
+
+(deftest pending-task-is-a-shared-field-that-round-trips
+  (testing "a command can arm a task; it lands on the workspace and in the flat view"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          task (fn [state] state)
+          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task task
+                                         :message "running ..."))]
+      (is (some? (:pending-task ws)))
+      (is (some? (:pending-task (bufs/current ws))))
+      ;; the message is on the state that gets painted *before* the task runs
+      (is (= "running ..." (:message (bufs/current ws))))))
+
+  (testing "it is shared, not per-buffer: switching buffers doesn't lose it"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task (fn [state] state)))
+          ws (send ws {:op :open-new :state (buf/new-state nil ["other"])})]
+      (is (some? (:pending-task (bufs/current ws)))))))
+
+(deftest running-a-pending-task-consumes-it-and-applies-its-state
+  (testing "the task edits like any command, and does not run twice"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          appending (fn [state] (update state :lines conj "from the task"))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task appending))
+          ws (run-pending-step ws)]
+      (is (= ["x" "from the task"] (:lines (bufs/current ws))))
+      (is (nil? (:pending-task ws)))
+      (is (nil? (:pending-task (bufs/current ws))))))
+
+  (testing "a task may open a buffer -- :buffer-command from a task works like from a command"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          opener (fn [state] (assoc state :buffer-command
+                                    {:op :open-new :state (buf/new-state nil ["output"])}))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task opener))
+          ws (run-pending-step ws)]
+      (is (= ["output"] (:lines (bufs/current ws))))
+      (is (nil? (:pending-task ws)))))
+
+  (testing "a task can arm a further task, so the loop chains rather than stalling"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          second-step (fn [state] (update state :lines conj "two"))
+          first-step (fn [state] (assoc (update state :lines conj "one")
+                                        :pending-task second-step))
+          ws (bufs/put-current ws (assoc (bufs/current ws) :pending-task first-step))
+          ws (run-pending-step ws)]
+      (is (= ["x" "one"] (:lines (bufs/current ws))))
+      (is (some? (:pending-task ws)))
+      (let [ws (run-pending-step ws)]
+        (is (= ["x" "one" "two"] (:lines (bufs/current ws))))
+        (is (nil? (:pending-task ws)))))))
