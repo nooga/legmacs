@@ -22,6 +22,12 @@
 (ns legmacs.prog-syntax
   (:require [string]))
 
+(defn- as-chars
+  "Scan input as a char vector. Callers that already have one (buffer-chars)
+   skip the copy; a string is converted once."
+  [text]
+  (if (vector? text) text (vec (seq text))))
+
 (def ^:private default-brackets {\( \) \[ \] \{ \}})
 
 (defn- marker-at?
@@ -119,7 +125,7 @@
    upto produce identically-shaped trailing spans, so a flag is the only way
    to tell them apart. Line comments don't share this ambiguity (nothing
    closes one early), so they don't need a matching flag."
-  ([text spec] (scan text (count text) spec))
+  ([text spec] (let [chars (as-chars text)] (scan chars (count chars) spec)))
   ([text upto spec]
    (let [{:keys [line-comments block-comment string-delims multiline-strings brackets]} spec
          line-comment-markers (markers-of (or line-comments []))
@@ -135,7 +141,7 @@
          block-open-v (when block-open (vec (seq block-open)))
          block-close-v (when block-close (vec (seq block-close)))
          block-first (when block-open-v (nth block-open-v 0))
-         chars (vec (seq text))
+         chars (as-chars text)
          len (min upto (count chars))]
      (loop [i 0, stack (), pairs {}, spans []]
        (if (>= i len)
@@ -220,7 +226,7 @@
         block-first (when block-open-v (nth block-open-v 0))
         comment-firsts (first-chars line-comment-markers)
         ml-firsts (first-chars (mapv :open-v multiline-strings))
-        chars (vec (seq text))
+        chars (as-chars text)
         n (count chars)
         stop (min offset n)]
     ;; every skip is capped at `stop`, so a construct that hasn't closed by
@@ -277,9 +283,9 @@
    scan of the buffer -- and it's the half that runs the instant you *type*
    a closing bracket."
   [text offset spec]
-  (let [chars (vec (seq text))
+  (let [chars (as-chars text)
         ch (when (< -1 offset (count chars)) (nth chars offset))
-        {:keys [stack code?]} (open-stack-at text offset spec)
+        {:keys [stack code?]} (open-stack-at chars offset spec)
         [open-ch open-offset] (first stack)]
     (when (and ch code? open-ch
                (= ch (get (or (:brackets spec) default-brackets) open-ch)))

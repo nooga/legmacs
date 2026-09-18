@@ -387,6 +387,30 @@
       (is (= "a^[b" (:text d)))
       (is (= [0 1 3 4] (:cols d))))))
 
+(deftest display-col-matches-line-display-map
+  (testing "display-col agrees with line-display's :cols without expanding the whole string"
+    (let [line (str (char 9) "ab" (char 9) "c")
+          cols (:cols (r/line-display line 4))]
+      (doseq [i (range (count cols))]
+        (is (= (nth cols i) (r/display-col line i 4))))))
+
+  (testing "past the end of the line continues one-for-one"
+    (let [line "ab"]
+      (is (= 2 (r/display-col line 2 4)))
+      (is (= 5 (r/display-col line 5 4))))))
+
+(deftest line-display-window-is-the-visible-slice
+  (testing "the windowed expander's :text is the scrolled slice of a full expansion"
+    (let [line (str "hello" (char 9) "world-and-more")
+          full (:text (r/line-display line 4))
+          win (:text (r/line-display-window line 4 4 8))]
+      (is (= (subs full 4 (min (count full) 12)) win))))
+
+  (testing ":cols still cover the whole line, same as line-display"
+    (let [line (str (char 9) "xyz")]
+      (is (= (:cols (r/line-display line 4))
+             (:cols (r/line-display-window line 4 0 2)))))))
+
 (deftest frames-never-contain-raw-buffer-control-characters
   (testing "a tab-indented line paints spaces; a raw tab would skip terminal
             cells and let the previous frame show through"

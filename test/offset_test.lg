@@ -28,3 +28,13 @@
             col (range (inc (count (nth (:lines sample) row))))]
       (is (= [row col] (buf/row-col-of sample (buf/offset-of sample row col)))
           (str "row " row " col " col)))))
+
+(deftest buffer-chars-matches-buffer-text
+  (testing "the cached char vector is the same characters as joining the lines"
+    (is (= (seq (buf/buffer-text sample)) (seq (buf/buffer-chars sample)))))
+
+  (testing "a cursor move reuses the same :lines, so offsets still round-trip"
+    (let [moved (assoc sample :cursor-row 2 :cursor-col 3)]
+      (is (identical? (:lines sample) (:lines moved)))
+      (is (= 10 (buf/offset-of moved 2 3)))
+      (is (= [2 3] (buf/row-col-of moved 10))))))
