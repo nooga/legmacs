@@ -45,7 +45,8 @@
 ;; (or windows) is exactly the point of one -- see legmacs.dispatch's
 ;; recording hook and legmacs.commands' start/end/call-last-kbd-macro.
 (def shared-keys [:clipboard :message :minibuffer :pending-prefix :pending-keys :overlay
-                   :kbd-macro-recording? :kbd-macro-chords :last-kbd-macro])
+                   :kbd-macro-recording? :kbd-macro-chords :last-kbd-macro
+                   :describe-key?])
 
 (defn new-workspace
   "A workspace holding one buffer (id 0, current) shown in one window
@@ -65,6 +66,7 @@
    :pending-prefix nil
    :pending-keys []
    :overlay nil
+   :describe-key? nil
    :kbd-macro-recording? false
    :kbd-macro-chords []
    :last-kbd-macro nil

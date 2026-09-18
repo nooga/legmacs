@@ -37,6 +37,10 @@
 (def tilde-fg (fg 90 90 105))
 (def message-fg (fg 140 200 140))
 (def error-fg (fg 220 120 120))
+;; M-x / describe-function candidate keys (muted on unselected rows).
+;; The selected row is full-width inverse, so it doesn't need its own
+;; key color -- tests pin this escape the same way they pin help-key.
+(def candidate-keys-fg (fg 110 110 130))
 (def region-bg (bg 55 70 95))
 (def search-match-bg (bg 80 70 40))
 (def search-current-bg (bg 170 120 40))
@@ -286,7 +290,8 @@
    ;; legmacs.modes.help's styles
    :help-header (str bold-on (fg 235 170 60))
    :help-key (str bold-on (fg 100 170 220))
-   :help-command (fg 150 190 120)})
+   :help-command (fg 150 190 120)
+   :help-doc (str italic-on (fg 140 145 160))})
 
 (def bg-color-for
   {:region region-bg
@@ -532,9 +537,68 @@
       (let [start (max 0 (min (- n cap) (- (or selection 0) (quot cap 2))))]
         [start (subvec v start (min n (+ start cap)))]))))
 
+(defn- clip-to [s n]
+  (if (<= (count s) n) s (subs s 0 (max 0 n))))
+
+(defn- clip-ellipsis
+  "Fit `s` into `n` columns, appending … when it had to shrink. Empty when
+   there's no room at all."
+  [s n]
+  (cond
+    (<= n 0) ""
+    (<= (count s) n) s
+    (<= n 1) (clip-to s n)
+    :else (str (subs s 0 (dec n)) "…")))
+
+(defn- flatten-doc
+  "A command docstring as one echo-area line: newlines (and the indent that
+   follows them in a wrapped `defcommand` string) become a single space, so
+   they never render as ^J via sanitize."
+  [s]
+  (if (string/blank? s)
+    ""
+    (string/join " " (remove string/blank?
+                             (map string/trim (string/split s "\n"))))))
+
+(def ^:private min-doc-cols 10)
+
+(defn- annotated-candidate-row
+  "Command-picker row: name, muted keys, and (on the selected row) a
+   right-aligned docstring. The selected row is inverse across all `cols`
+   -- the same full-width bar a plain candidate uses -- so a reset in the
+   middle doesn't leave a stub highlight on the name."
+  [screen-row cand selected? cols]
+  (let [prefix (if selected? "> " "  ")
+        name (clip-to (sanitize (str (:label cand))) (max 0 (- cols (count prefix))))
+        after-name (- cols (count prefix) (count name))
+        keys (let [k (sanitize (or (:keys cand) ""))]
+               (if (seq k) (clip-to k (max 0 (- after-name 2))) ""))
+        keys-w (if (seq keys) (+ 2 (count keys)) 0)
+        after-keys (- after-name keys-w)
+        raw-doc (flatten-doc (:doc cand))
+        doc (if (and selected? (seq raw-doc) (>= after-keys min-doc-cols))
+              (clip-ellipsis (sanitize raw-doc) (max 0 (dec after-keys)))
+              "")
+        fill (- cols (count prefix) (count name) keys-w
+               (if (seq doc) (inc (count doc)) 0))
+        fill-part (apply str (repeat (max 0 fill) \space))
+        keys-plain (if (seq keys) (str "  " keys) "")
+        doc-plain (if (seq doc) (str " " doc) "")]
+    (if selected?
+      (str (move-to 1 screen-row) inverse-on
+           prefix name keys-plain fill-part
+           (if (seq doc) (str italic-on doc-plain) "")
+           reset)
+      (str (move-to 1 screen-row) reset
+           prefix name
+           (if (seq keys) (str "  " candidate-keys-fg keys reset) "")
+           fill-part reset))))
+
 (defn- candidate-row [screen-row cand selected? cols]
-  (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)]
-    (str (move-to 1 screen-row) (if selected? (str inverse-on text reset) text))))
+  (if (or (seq (:keys cand)) (seq (:doc cand)))
+    (annotated-candidate-row screen-row cand selected? cols)
+    (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)]
+      (str (move-to 1 screen-row) (if selected? (str inverse-on text reset) text)))))
 
 (defn- minibuffer-view [state screen-row0 mb-rows cols]
   (let [{:keys [prompt input note candidates selection]} (:minibuffer state)

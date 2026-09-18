@@ -88,7 +88,12 @@
    ;; help / misc
    "C-g" :keyboard-quit
    "M-x" :execute-extended-command
-   "C-h" :describe-bindings})
+   "C-h b" :describe-bindings
+   "C-h C-b" :describe-bindings
+   "C-h k" :describe-key
+   "C-h f" :describe-function
+   "C-h m" :describe-mode
+   "C-h C-h" :help-for-help})
 
 (defn install! []
   (doseq [[chord command] default-bindings]

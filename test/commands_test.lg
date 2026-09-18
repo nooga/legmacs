@@ -5,6 +5,7 @@
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
             [legmacs.commands :as c]
+            [legmacs.bindings :as bindings]
             [legmacs.dispatch :as d]
             [legmacs.modes.letgo]
             [legmacs.modes.prog]))
@@ -166,6 +167,25 @@
           s (type-text s "nxtl")               ; fuzzy subsequence of next-line
           s (mb/submit s)]                       ; submit-selected? -> picks next-line
       (is (= 1 (:cursor-row s))))))
+
+(deftest m-x-candidates-show-active-bindings
+  (testing "the live M-x list annotates save-buffer with C-x C-s; :value stays the name"
+    (bindings/install!)
+    (let [s (c/execute-extended-command (buf/new-state nil ["x"]))
+          cands (get-in s [:minibuffer :candidates])
+          save (some (fn [c] (when (= "save-buffer" (:value c)) c)) cands)]
+      (is (some? save))
+      (is (= "save-buffer" (:label save)))
+      (is (string/includes? (:keys save) "C-x C-s"))
+      (is (seq (:doc save)))
+      (is (= "save-buffer" (:value save)))))
+
+  (testing "TAB still pulls the bare command name into the input, not the annotated label"
+    (bindings/install!)
+    (let [s (c/execute-extended-command (buf/new-state nil ["x"]))
+          s (type-text s "save-buffer")
+          s (mb/accept-selection s)]
+      (is (= "save-buffer" (:input (:minibuffer s)))))))
 
 (deftest find-file-submits-typed-path-not-a-fuzzy-candidate
   (testing "RET opens exactly the typed path even when a candidate is highlighted (safe new-file create)"

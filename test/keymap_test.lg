@@ -47,3 +47,21 @@
       (km/bind-key! keymap "C-a" :move-beginning-of-line)
       (is (= #{[["C-x" "C-s"] :save-buffer] [["C-a"] :move-beginning-of-line]}
              (set (km/describe-keymap @keymap)))))))
+
+(deftest chord-paths-by-command-inverts-and-shadows
+  (testing "a single keymap inverts to command -> chord strings"
+    (let [m (km/chord-paths-by-command [{"C-a" :foo "C-x" {"C-s" :save}}])]
+      (is (= ["C-a"] (get m :foo)))
+      (is (= ["C-x C-s"] (get m :save)))))
+
+  (testing "an earlier layer claims a chord-path; later layers keep unclaimed ones"
+    (let [mode {"C-x" {"C-e" :eval-last-sexp}}
+          global {"C-x" {"C-e" :end-of-line "C-s" :save-buffer}}
+          m (km/chord-paths-by-command [mode global])]
+      (is (= ["C-x C-e"] (get m :eval-last-sexp)))
+      (is (nil? (get m :end-of-line)))
+      (is (= ["C-x C-s"] (get m :save-buffer)))))
+
+  (testing "one command with several chords keeps all of them"
+    (let [m (km/chord-paths-by-command [{"C-f" :forward-char "right" :forward-char}])]
+      (is (= #{"C-f" "right"} (set (get m :forward-char)))))))

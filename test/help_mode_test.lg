@@ -9,10 +9,14 @@
             [legmacs.buffer :as buf]
             [legmacs.render :as r]
             [legmacs.modes :as modes]
+            [legmacs.keymap :as km]
             [legmacs.modes.help :as help]
+            [legmacs.modes.letgo]
             [legmacs.buffers :as bufs]
             [legmacs.bindings :as bindings]
-            [legmacs.commands :as c]))
+            [legmacs.dispatch :as d]
+            [legmacs.commands :as c]
+            [legmacs.minibuffer :as mb]))
 
 (deftest read-only-buffers-refuse-edits
   (testing "every mutation primitive is a no-op on a :read-only? buffer, with a message"
@@ -57,7 +61,20 @@
   (testing "the boundary tracks the actual key length, not a fixed column"
     (let [line (format "  %-18s  %s" "C-x C-really-long-chord" "cmd")
           spans (help/highlight-line line)]
-      (is (= {:style :help-key :start 2 :end 25} (first spans))))))    ; 2 + len(23)
+      (is (= {:style :help-key :start 2 :end 25} (first spans)))))    ; 2 + len(23)
+
+  (testing "a sentence of docstring prose is left unstyled"
+    (is (= [] (help/highlight-line "Save the current buffer to its file.")))
+    (is (= [{:style :help-header :start 0 :end (count "Major mode: let-go-mode")}]
+           (help/highlight-line "Major mode: let-go-mode"))))
+
+  (testing "a describe-bindings docstring line (4+ space indent) is help-doc, not a key entry"
+    (let [line (str (apply str (repeat 22 \space)) "Write the buffer to its file.")
+          spans (help/highlight-line line)]
+      (is (= 1 (count spans)))
+      (is (= :help-doc (:style (first spans))))
+      (is (= 0 (:start (first spans))))
+      (is (= (count line) (:end (first spans)))))))
 
 (deftest help-mode-frame-is-highlighted
   (testing "rendering a help-mode buffer emits the help-key color"
@@ -69,16 +86,62 @@
       (is (string/includes? out (get r/fg-color-for :help-header))))))
 
 (deftest describe-bindings-opens-a-read-only-help-buffer
-  (testing "describe-bindings signals a *Help* buffer in help-mode, read-only, listing bindings"
+  (testing "describe-bindings signals a *Help* buffer in help-mode, read-only, listing global bindings"
     (bindings/install!)
     (let [s (c/describe-bindings (buf/new-state nil ["x"]))
-          cmd (:buffer-command s)]
+          cmd (:buffer-command s)
+          text (string/join "\n" (:lines (:state cmd)))]
       (is (= :help (:op cmd)))
       (is (= "*Help*" (:name cmd)))
       (is (:read-only? (:state cmd)))
       (is (= :help (:mode (:state cmd))))
-      (is (= "Key bindings" (first (:lines (:state cmd)))))
-      (is (string/includes? (str (:lines (:state cmd))) "save-buffer")))))
+      (is (= "Global" (first (:lines (:state cmd)))))
+      (is (string/includes? text "save-buffer"))
+      (is (string/includes? text "C-x C-s"))
+      (is (string/includes? text "prompting for a filename"))
+      (is (not (string/includes? text "^J"))))))
+
+(deftest describe-bindings-lists-active-mode-maps
+  (testing "a let-go-mode buffer's *Help* has a major-mode section with C-x C-e"
+    (bindings/install!)
+    (let [s (modes/switch-to-mode (buf/new-state nil ["x"]) :let-go)
+          s (c/describe-bindings s)
+          text (string/join "\n" (:lines (:state (:buffer-command s))))]
+      (is (string/includes? text "Major mode: let-go-mode"))
+      (is (string/includes? text "eval-last-sexp"))
+      (is (string/includes? text "Global"))
+      (is (string/includes? text "save-buffer")))))
+
+(deftest describe-function-shows-doc-and-bindings
+  (testing "describe-function opens *Help* with the command's docstring and keys"
+    (bindings/install!)
+    (let [s (c/describe-function (buf/new-state nil ["x"]))
+          s (reduce mb/insert-char s (seq "save-buffer"))
+          s (mb/submit s)
+          text (string/join "\n" (:lines (:state (:buffer-command s))))]
+      (is (= :help (:op (:buffer-command s))))
+      (is (string/includes? text "save-buffer"))
+      (is (string/includes? text "C-x C-s"))
+      (is (string/includes? text (km/command-doc :save-buffer))))))
+
+(deftest c-h-is-a-help-prefix
+  (testing "C-h b still opens *Help* with bindings; C-h alone is a prefix"
+    (bindings/install!)
+    (let [s (d/dispatch (buf/new-state nil ["x"]) "C-h")]
+      (is (some? (:pending-prefix s)))
+      (is (nil? (:buffer-command s)))
+      (let [s (d/dispatch s "b")
+            text (string/join "\n" (:lines (:state (:buffer-command s))))]
+        (is (= :help (:op (:buffer-command s))))
+        (is (string/includes? text "save-buffer"))))))
+
+(deftest describe-mode-lists-major-and-minors
+  (testing "describe-mode names the major mode and quotes its doc"
+    (let [s (modes/switch-to-mode (buf/new-state nil ["x"]) :let-go)
+          s (c/describe-mode s)
+          text (string/join "\n" (:lines (:state (:buffer-command s))))]
+      (is (string/includes? text "Major mode: let-go-mode"))
+      (is (string/includes? text "eval-last-sexp")))))
 
 (deftest help-op-reuses-the-named-buffer
   (testing "opening *Help* twice reuses the one buffer and refreshes its content"

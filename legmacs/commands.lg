@@ -12,6 +12,7 @@
             [legmacs.minibuffer :as mb]
             [legmacs.completion :as completion]
             [legmacs.modes :as modes]
+            [legmacs.modes.help :as help]
             [legmacs.dispatch :as dispatch]
             [legmacs.modes.repl :as repl]))
 
@@ -663,27 +664,109 @@
 
 ;; --- misc ------------------------------------------------------------------
 
+(defn- command-keys
+  "The chords that would fire `name` in `state` right now, joined for the
+   M-x annotation -- or nil if the command is unbound."
+  [state name]
+  (let [chords (sort (or (get (km/chord-paths-by-command (dispatch/keymaps-for state))
+                              (keyword name))
+                         []))]
+    (when (seq chords) (string/join ", " chords))))
+
+(defn- command-candidate [state name]
+  {:label name
+   :value name
+   :keys (command-keys state name)
+   :doc (km/command-doc (keyword name))})
+
+(defn- command-candidates-on-change
+  "M-x / describe-function live list: fuzzy-match names, stash keys and
+   docstring on each candidate so render can mute the bindings and show
+   the selected command's doc on the right. :value stays the bare name
+   so RET still invokes."
+  [state input]
+  (assoc-in state [:minibuffer :candidates]
+            (vec (map (fn [n] (command-candidate state n))
+                      (completion/command-completer input)))))
+
+(defn- open-command-prompt [state prompt on-submit]
+  (mb/open state prompt on-submit
+           {:submit-selected? true
+            :completer completion/command-completer
+            :on-change command-candidates-on-change}))
+
+(defn- command-help-lines [state cmd-name]
+  (let [kw (keyword cmd-name)
+        doc (or (km/command-doc kw) "No documentation.")
+        chords (sort (or (get (km/chord-paths-by-command (dispatch/keymaps-for state)) kw) []))]
+    (vec (concat [(km/command-name-str kw)]
+                 (if (seq chords)
+                   (map (fn [c] (str "  " c)) chords)
+                   ["  (not currently bound)"])
+                 ["" doc]))))
+
+(defn- mode-heading [kind mode-kw]
+  (str kind ": " (name mode-kw) "-mode"))
+
+(defn- one-line-doc
+  "A `defcommand` docstring as one help-line: newlines and the indent on
+   wrapped continuation lines become a single space."
+  [s]
+  (when-not (string/blank? s)
+    (string/join " " (remove string/blank?
+                             (map string/trim (string/split s "\n"))))))
+
+(def ^:private binding-doc-indent
+  "Aligns under format-binding-line's command column (2 + 18 + 2)."
+  (apply str (repeat 22 \space)))
+
+(defn- binding-entry-lines
+  "The key/command row, plus a muted docstring line when `cmd` has one."
+  [path-or-str cmd]
+  (let [entry (km/format-binding-line path-or-str cmd)
+        doc (when (keyword? cmd) (one-line-doc (km/command-doc cmd)))]
+    (if (seq doc)
+      [entry (str binding-doc-indent doc)]
+      [entry])))
+
+(defn- binding-lines [keymap]
+  (let [pairs (sort-by (fn [[path _]] (string/join " " path))
+                       (km/describe-keymap (or keymap {})))]
+    (mapcat (fn [[path cmd]] (binding-entry-lines path cmd)) pairs)))
+
+(defn- binding-section [title keymap]
+  (let [entries (vec (binding-lines keymap))]
+    (when (seq entries)
+      (into [title ""] entries))))
+
+(defn- mode-help-section [state kind mode-kw]
+  (let [doc (or (modes/describe-mode mode-kw) "No documentation.")
+        entries (vec (binding-lines (modes/resolve-keymap mode-kw state)))]
+    (concat [(mode-heading kind mode-kw) doc ""]
+            (if (seq entries) entries ["  (no key bindings)"])
+            [""])))
+
 (defcommand keyboard-quit
   "C-g: cancel whatever's in progress -- a minibuffer prompt, a pending
-   prefix key, or an active region, in that order."
+   prefix key, describe-key, or an active region, in that order."
   [state]
   (cond
     (mb/active? state) (mb/cancel state)
-    (:pending-prefix state) (assoc state :pending-prefix nil :pending-keys [] :message "Quit")
+    (or (:pending-prefix state) (:describe-key? state))
+    (assoc state :pending-prefix nil :pending-keys [] :describe-key? nil :message "Quit")
     (buf/region-active? state) (-> state (assoc :mark nil) (set-message "Quit"))
     :else (set-message state "Quit")))
 
 (defcommand execute-extended-command
-  "M-x: run a command by name."
+  "M-x: run a command by name. The live list shows each command's current
+   key bindings alongside the name."
   [state]
-  (mb/open state "M-x "
-           (fn [state input]
-             (let [cmd-name (string/trim input)]
-               (if (string/blank? cmd-name)
-                 state
-                 (km/run-command state (keyword cmd-name)))))
-           {:submit-selected? true
-            :completer completion/command-completer}))
+  (open-command-prompt state "M-x "
+                       (fn [state input]
+                         (let [cmd-name (string/trim input)]
+                           (if (string/blank? cmd-name)
+                             state
+                             (km/run-command state (keyword cmd-name)))))))
 
 (defcommand toggle-minor-mode
   "Prompt for a registered mode by name and toggle it as a minor mode in
@@ -711,21 +794,63 @@
         (assoc :read-only? ro)
         (set-message (if ro "Buffer is now read-only" "Buffer is now writable")))))
 
-(defn pop-to-help
-  "Open -- or refresh and switch to -- a read-only, help-mode buffer named
-   `name` showing `lines`. The named-singleton :help op (see legmacs.buffers)
-   reuses the one buffer across calls instead of piling up copies."
-  [state name lines]
-  (let [buf (-> (buf/new-state nil (vec lines))
-                (modes/switch-to-mode :help)
-                (assoc :buffer-name name :read-only? true))]
-    (assoc state :buffer-command {:op :help :name name :state buf})))
-
 (defcommand describe-bindings
   "Show the current key bindings in a read-only, syntax-highlighted *Help*
-   buffer -- scroll it, search it (C-s), switch away and back like any other
-   buffer, rather than a one-shot overlay."
+   buffer -- mode maps first, then global -- so you can scroll it, search
+   it (C-s), and switch away and back like any other buffer."
   [state]
-  (let [pairs (sort-by (fn [[path _]] (string/join " " path)) (km/describe-keymap @km/global-keymap))
-        entries (map (fn [[path cmd]] (format "  %-18s  %s" (string/join " " path) (name cmd))) pairs)]
-    (pop-to-help state "*Help*" (into ["Key bindings" ""] entries))))
+  (let [major (:mode state)
+        minors (or (:minor-modes state) [])
+        major-sec (when major
+                    (binding-section (mode-heading "Major mode" major)
+                                     (modes/resolve-keymap major state)))
+        minor-secs (keep (fn [m]
+                           (binding-section (mode-heading "Minor mode" m)
+                                            (modes/resolve-keymap m state)))
+                         minors)
+        global-sec (binding-section "Global" @km/global-keymap)
+        sections (vec (keep identity (concat [major-sec] minor-secs [global-sec])))
+        lines (vec (apply concat (interpose [""] sections)))]
+    (help/pop-to-help state "*Help*" (if (seq lines) lines ["Key bindings" ""]))))
+
+(defcommand describe-key
+  "Show the command bound to the next key sequence (C-h k). The next
+   chord(s) are captured, not run."
+  [state]
+  (assoc state :describe-key? true :message "Describe key: "))
+
+(defcommand describe-function
+  "Show a command's docstring and the keys that currently invoke it (C-h f)."
+  [state]
+  (open-command-prompt state "Describe command: "
+                       (fn [state input]
+                         (let [cmd-name (string/trim input)]
+                           (cond
+                             (string/blank? cmd-name) state
+                             (km/command-fn (keyword cmd-name))
+                             (help/pop-to-help state "*Help*" (command-help-lines state cmd-name))
+                             :else (assoc state :message (str "No such command: " cmd-name)))))))
+
+(defcommand describe-mode
+  "Show the current major and minor modes, their docs, and their keys (C-h m)."
+  [state]
+  (let [major (:mode state)
+        minors (or (:minor-modes state) [])
+        lines (vec (concat
+                    (when major (mode-help-section state "Major mode" major))
+                    (mapcat (fn [m] (mode-help-section state "Minor mode" m)) minors)
+                    (when (and (nil? major) (empty? minors))
+                      ["(no modes active)"])))]
+    (help/pop-to-help state "*Help*" lines)))
+
+(defcommand help-for-help
+  "List the C-h help prefix bindings (C-h C-h)."
+  [state]
+  (let [sub (get @km/global-keymap "C-h")
+        pairs (if (map? sub)
+                (sort-by (fn [[path _]] (string/join " " path)) (km/describe-keymap sub))
+                [])
+        entries (mapcat (fn [[path cmd]]
+                          (binding-entry-lines (string/join " " (into ["C-h"] path)) cmd))
+                        pairs)]
+    (help/pop-to-help state "*Help*" (into ["Help" ""] entries))))
