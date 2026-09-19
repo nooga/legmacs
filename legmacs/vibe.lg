@@ -5,7 +5,11 @@
 ;;
 ;;   (vibe "a fn that reverses a vector")   ; an ordinary function. Returns
 ;;                                          ; the generated code as a string,
-;;                                          ; so C-x C-e works on it too.
+;;                                          ; so C-x C-e works on it too --
+;;                                          ; including after `(ns foo)`,
+;;                                          ; because vibe is interned into
+;;                                          ; let-go.core (a live baseline
+;;                                          ; refer every ns already has).
 ;;
 ;;   C-c C-v                                ; vibe-replace: find the (vibe ...)
 ;;                                          ; form around point, run it, and
@@ -971,6 +975,22 @@
      (rewrite-clojure-ns
       (strip-fences (request-completion cfg provider
                                         (user-message request *vibe-context*)))))))
+
+(defn- export-vibe-unqualified!
+  "Intern `vibe` into let-go.core so it resolves in every namespace.
+
+   `(ns weather)` leaves legmacs.main's `:refer [vibe]` behind, and C-c C-v
+   then `eval`s `(vibe ...)` in that new ns -- \"Can't resolve vibe\".
+   let-go.core is a live baseline refer (Lookup walks it at compile time),
+   so one intern here covers namespaces that already exist *and* ones a
+   later `(ns ...)` creates. Referring all of legmacs.vibe would leak
+   vibe-replace, marker, config, and the rest."
+  []
+  (let [exported (intern 'let-go.core 'vibe vibe)]
+    (alter-meta! exported merge (or (meta #'vibe) {}))
+    exported))
+
+(export-vibe-unqualified!)
 
 ;; --- finding the (vibe ...) form ----------------------------------------
 

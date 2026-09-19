@@ -13,9 +13,11 @@
 ;; free. `load-string`ing a buffer that opens with `(ns foo)` -- every real
 ;; .lg file does -- relocates the current namespace permanently, and one
 ;; C-c C-e would otherwise cost you every alias above for the rest of the
-;; session -- the next C-x C-e fails with "Can't resolve ... in this
-;; context". eval-buffer puts it back; C-x C-e deliberately doesn't, so an
-;; explicit `(in-ns 'foo)` still moves you.
+;; session. eval-buffer always restores the editor ns after the load.
+;; C-x C-e / C-j then eval in that buffer's `(ns ...)` (CIDER-style) so
+;; `@a` after a C-c C-e still sees `foo/a`, and restore afterwards so the
+;; editor doesn't move. No ns form: eval in the current *ns*, so an
+;; explicit `(in-ns 'foo)` still sticks. The *repl* buffer is the same.
 
 (ns legmacs.modes.letgo
   (:require [string]
@@ -285,6 +287,34 @@
 (defn- format-result [v]
   (try (pr-str v) (catch e (str "#<unprintable " (ex-message e) ">"))))
 
+(defn- capturing-out
+  "Run `thunk` with *out* and *err* rebound to a capture buffer.
+
+   The editor paints the TTY through *out* (term/write). A scratch
+   (go (println ...)) inherits the caller's *out* via future*/go*
+   snapshotting the spawning context -- without this, those bytes land
+   on the alternate screen and the next frame never comes until a key.
+   Spawned goroutines keep the capture handle after this returns; the
+   editor's own term/write still uses the root stdout binding."
+  [thunk]
+  (let [result (atom nil)]
+    (with-out-str
+      (binding [*err* *out*]
+        (reset! result (thunk))))
+    @result))
+
+(defn eval-form
+  "eval `form` with *out*/*err* captured (see capturing-out)."
+  [form]
+  (capturing-out (fn [] (eval form))))
+
+(defn load-in-editor
+  "load-string `s` with *out*/*err* captured (see capturing-out). The
+   *repl* buffer uses this so a typed (go (println ...)) cannot clobber
+   the frame either."
+  [s]
+  (capturing-out (fn [] (load-string s))))
+
 (defn- last-sexp-before-point [state]
   (let [text (buf/text-before-cursor state)]
     (try
@@ -292,13 +322,74 @@
         (if (seq forms) [:ok (last forms)] [:none nil]))
       (catch e [:error (ex-message e)]))))
 
+(defn preserving-ns
+  "Run `thunk`, then put the current namespace back where it was.
+
+   Loading a file that opens with an `(ns ...)` form *switches the running
+   namespace and never switches back* -- and since legmacs evaluates in its
+   own live namespace, that would leave every alias the editor set up
+   (`buf/`, `km/`, `dispatch/`, `render/`) unresolvable for the rest of the
+   session: one C-c C-e on any ordinary .lg file and C-x C-e stops
+   working. Emacs's load-file doesn't relocate you either.
+
+   C-x C-e / C-j wrap this around an (in-ns buffer-ns) when the buffer
+   has an ns form, so a def interned by eval-buffer is visible without
+   leaving the editor stuck in that ns. No ns form: they eval in the
+   current *ns*, and an explicit `(in-ns 'foo)` still moves you.
+
+   Written the long way round because let-go's `finally` can't propagate an
+   exception -- see CLAUDE.md."
+  [thunk]
+  (let [saved (ns-name *ns*)
+        outcome (try {:ok (thunk)} (catch e {:err e}))]
+    (in-ns saved)
+    (if (contains? outcome :err) (throw (:err outcome)) (:ok outcome))))
+
+(defn- ns-form-name
+  "The namespace symbol in a `(ns ...)` form, or nil."
+  [form]
+  (when (and (seq? form) (= 'ns (first form)))
+    (let [n (second form)]
+      (cond
+        (symbol? n) n
+        (and (seq? n) (= 'with-meta (first n))) (second n)
+        :else nil))))
+
+(defn- buffer-ns-name
+  "The name in the first top-level `(ns ...)` form, or nil if the buffer
+   has none (or can't be read)."
+  [state]
+  (try
+    (loop [forms (seq (read-all-string (buf/buffer-text state)))]
+      (when forms
+        (or (ns-form-name (first forms))
+            (recur (next forms)))))
+    (catch e
+      (try (ns-form-name (read-string (buf/buffer-text state)))
+           (catch e2 nil)))))
+
+(defn- eval-form-in-ns
+  "eval `form` after (in-ns ns-sym), then restore the editor ns.
+   Own named fn so eval-form-in-state's if-let contains a call, not a
+   capturing fn literal (let-go AOT hoist, nooga/let-go#766)."
+  [ns-sym form]
+  (preserving-ns (fn [] (in-ns ns-sym) (eval-form form))))
+
+(defn- eval-form-in-state
+  "eval `form` in the buffer's ns when it has an ns form, then restore
+   the editor ns. Without an ns form, eval in whatever *ns* is now."
+  [state form]
+  (if-let [ns-sym (buffer-ns-name state)]
+    (eval-form-in-ns ns-sym form)
+    (eval-form form)))
+
 (defn- run-eval [state f]
   (let [[status form] (last-sexp-before-point state)]
     (case status
       :none (assoc state :message "No preceding sexp")
       :error (assoc state :message (str "Read error: " form))
       (try
-        (f state form (eval form))
+        (f state form (eval-form-in-state state form))
         (catch e (assoc state :message (str "Eval error: " (ex-message e))))))))
 
 (defcommand eval-last-sexp
@@ -316,33 +407,11 @@
   (run-eval state (fn [state _form result]
                      (buf/insert-string state (str "\n" (format-result result))))))
 
-(defn preserving-ns
-  "Run `thunk`, then put the current namespace back where it was.
-
-   Loading a file that opens with an `(ns ...)` form *switches the running
-   namespace and never switches back* -- and since legmacs evaluates in its
-   own live namespace, that would leave every alias the editor set up
-   (`buf/`, `km/`, `dispatch/`, `render/`) unresolvable for the rest of the
-   session: one C-c C-e on any ordinary .lg file and C-x C-e stops
-   working. Emacs's load-file doesn't relocate you either.
-
-   Deliberately *not* applied to C-x C-e / C-j: `(in-ns 'foo)` typed and
-   evaluated on purpose should still move you, and so should the *repl*
-   buffer, where relocating is the point.
-
-   Written the long way round because let-go's `finally` can't propagate an
-   exception -- see CLAUDE.md."
-  [thunk]
-  (let [saved (ns-name *ns*)
-        outcome (try {:ok (thunk)} (catch e {:err e}))]
-    (in-ns saved)
-    (if (contains? outcome :err) (throw (:err outcome)) (:ok outcome))))
-
 (defcommand eval-buffer
   "Evaluate the entire buffer, top to bottom, as one `load-string`."
   [state]
   (try
-    (let [result (preserving-ns (fn [] (load-string (buf/buffer-text state))))]
+    (let [result (preserving-ns (fn [] (load-in-editor (buf/buffer-text state))))]
       (assoc state :message (str "=> " (format-result result))))
     (catch e (assoc state :message (str "Eval error: " (ex-message e))))))
 

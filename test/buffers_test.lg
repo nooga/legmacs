@@ -449,3 +449,35 @@
     (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
           ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) (fn [s] s)))]
       (is (= :pending-task (bufs/loop-wait ws))))))
+
+(defn- wait-until
+  "Spin until `pred` is true or `n` 10ms ticks elapse. Returns whether it
+   became true -- tests that start a future need this because the dec
+   happens on the other goroutine."
+  [pred n]
+  (loop [i n]
+    (cond
+      (pred) true
+      (zero? i) false
+      :else (do (sleep 10) (recur (dec i))))))
+
+(deftest a-scratch-future-keeps-the-loop-polling
+  ;; Regression: C-x C-e of (go ...) / (future ...) is not a spawn-task job,
+  ;; so loop-wait used to return :read-key and park in term/read-key. A
+  ;; background println then wrote onto the TTY with no frame coming to
+  ;; paint over it, which looked like a hard freeze.
+  (testing "install-spawn-tracking! is idempotent"
+    (is (true? (bufs/install-spawn-tracking!)))
+    (is (true? (bufs/install-spawn-tracking!))))
+
+  (testing "an in-flight future is live-spawns? and loop-wait is :poll, not :read-key"
+    (bufs/install-spawn-tracking!)
+    (let [p (promise)
+          fut (future (deref p))
+          ws (bufs/new-workspace (buf/new-state nil ["x"]))]
+      (is (bufs/live-spawns?))
+      (is (= :poll (bufs/loop-wait ws)))
+      (deliver p :ok)
+      (is (true? (wait-until (fn [] (not (bufs/live-spawns?))) 50)))
+      (is (= :ok @fut))
+      (is (= :read-key (bufs/loop-wait ws))))))
