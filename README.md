@@ -37,8 +37,9 @@ started:
 - a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
   running transcript instead of building one by hand with `C-j`
 - `(vibe "...")` (`C-c C-v`): write what you want where you want it, and an
-  LLM writes the code over the call -- with the rest of your buffer as
-  context (see [Vibe coding](#vibe-coding))
+  LLM writes the code over the call -- with the rest of your buffer, a
+  live let-go ns catalog, and `ns-publics`/`var-doc` tools as context
+  (see [Vibe coding](#vibe-coding))
 - keyboard macros, a mark ring, interactive query-replace, dabbrev-expand,
   comment-dwim, and bracketed paste
 - structural expand-region for let-go, growing the selection one
@@ -104,14 +105,19 @@ Type a call where you want the code, put point in it, press `C-c C-v`:
 ```clojure
 (defn triple [x] (* 3 x))
 
-(defn double [x]
+(defn double
+  "Double x."
+  [x]
   (* 2 x))
 ```
 
 One undo puts the call back. The model gets your whole buffer with the call
-site swapped for a marker, so it writes code that fits *that spot* --
-surrounding defns, aliases, and indentation included, not a generic answer
-to the prompt in isolation.
+site swapped for a marker, a live catalog of let-go namespaces, and tools
+to inspect them (`ns-publics`, `var-doc`), so it writes code that fits
+*that spot* — surrounding defns, aliases, indentation, and the real
+`string/`/`json/`/`os/` names, not JVM Clojure. Missing `(:require ...)`
+entries are added to the file's ns form in the same undo step. Every
+`defn` it writes should have a docstring.
 
 `vibe` is also just a function: `C-x C-e` on `(vibe "a quicksort")` echoes
 the generated code instead of splicing it, and it composes like anything
@@ -128,13 +134,19 @@ another:
 
 ```clojure
 {:key "sk-..."
- :model "gpt-5.6-sol"}
+ :model "gpt-5.6-sol"
+ :reasoning-effort :high}
 ```
 
 The file is merged into vibe's config wholesale, so the other knobs work
 from there too -- `:provider` (`:openai` or `:anthropic`, both ship in
-`legmacs.vibe/providers`), `:url` for anything speaking the OpenAI
-chat-completions shape (llama.cpp, ollama, openrouter, groq), `:max-tokens`,
+`legmacs.vibe/providers`), `:reasoning-effort` (`:none` / `:low` /
+`:medium` / `:high`, default `:medium`), `:url` for anything speaking
+OpenAI's HTTP (llama.cpp, ollama, openrouter, groq -- a `chat/completions`
+URL selects the older API shape automatically), `:api` (`:responses` is
+the default and the one gpt-5.6 needs for tools + reasoning;
+`:chat-completions` if you must), `:max-tokens`,
+`:tools` (`false` if the endpoint cannot do tool calls),
 and `:system` if you want to rewrite the instructions the model gets:
 
 ```clojure

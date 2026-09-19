@@ -210,14 +210,18 @@ work that must paint first uses `:pending-task` — a fn or vector of fns,
 place of reading a key*. I/O that can run off-thread uses `:async-jobs`:
 `bufs/spawn-task` starts a `(future …)` immediately with an `io` thunk
 (no editor state) and a `:then` `(fn [state outcome] -> state)` applied
-later by `bufs/drain-jobs` on the main thread. Goroutines never touch
-buffers. Outcome is `{:ok v}` / `{:err e}` because let-go's future
-delivers nil on throw. While jobs are in flight the loop peeks
-`term/key-pending?` and sleeps 20ms instead of parking in `read-chord`,
-so typing continues. Idle is still a blocking read. C-g
-(`bufs/discard-jobs`) drops results without killing HTTP/`os/sh`. Named
-functions, not inline `fn` literals, when building the closure inside a
-conditional — see the AOT-hoisting gotcha below.
+later by `bufs/drain-jobs` on the main thread *before* the next frame is
+painted — drain-then-paint, not the other way around, or a finished job
+sits on screen until the next keystroke. `bufs/loop-wait` is the idle
+decision (`:quit` / `:pending-task` / `:poll` / `:read-key`) so that
+order is testable without a TTY. Goroutines never touch buffers. Outcome
+is `{:ok v}` / `{:err e}` because let-go's future delivers nil on throw.
+While jobs are in flight the loop peeks `term/key-pending?` and sleeps
+20ms instead of parking in `read-chord`, so typing continues. Idle is
+still a blocking read. C-g (`bufs/discard-jobs`) drops results without
+killing HTTP/`os/sh`. Named functions, not inline `fn` literals, when
+building the closure inside a conditional — see the AOT-hoisting gotcha
+below.
 
 **Windows (splits) are the same wrapping trick one level up.** The
 workspace holds a window tree (`legmacs.windows` — pure data + layout
@@ -250,13 +254,21 @@ round-trip. `vibe-replace` does no I/O: it snapshots the form and
 `(bufs/spawn-task … "vibing...")`, so it's as pure and testable as any
 other command. The future `eval`s the form (in `legmacs.main`, same as
 `C-x C-e`) with the call site bound in `vibe/*vibe-context*` (a dynamic
-var, so two overlapping vibes don't clobber each other), then
-`resolve-vibe` splices the returned string over the form as one undo
-step. Two guards there are load-bearing: `resolve-vibe` re-checks that a
-`(vibe` form still opens at `start` before touching the buffer, and it
-refuses to splice a non-string result (let-go's `eval` *returns* compile
-errors as an `#error` value instead of raising them, so a typo'd prompt
-would otherwise be pasted into your code).
+var, so two overlapping vibes don't clobber each other). The user
+message includes a live catalog of canonical let-go namespaces
+(`string/` not `clojure.string/`) and the file's `:require` aliases; the
+model can also call `list-namespaces` / `ns-publics` / `var-doc` against
+the running VM (OpenAI goes through `/v1/responses` so tools can sit
+next to `:reasoning-effort`, default `:medium`; a `chat/completions` URL
+selects the older shape). Then `resolve-vibe` rewrites any JVM-Clojure prefixes,
+splices the string over the form, and inserts missing `(:require ...)`
+entries into the ns form — one undo step. Two guards there are
+load-bearing: `resolve-vibe` re-checks that a `(vibe` form still opens
+at `start` before touching the buffer, and it refuses to splice a
+non-string result (let-go's `eval` *returns* compile errors as an
+`#error` value instead of raising them, so a typo'd prompt would
+otherwise be pasted into your code). The system prompt also requires a
+docstring on every `defn` / `defn-` / `defcommand`.
 
 Full per-file breakdown and the complete default keymap are in
 [README.md](README.md); read it before making structural changes.

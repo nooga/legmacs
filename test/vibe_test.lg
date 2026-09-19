@@ -164,6 +164,13 @@
       (is (string/includes? (:message s*) "vibe error"))
       (is (string/includes? (:message s*) "unknown vibe provider"))))
 
+  (testing "a long API error is not truncated; the echo area wraps it"
+    (let [msg (apply str (repeat 80 "xy"))
+          s (buf/new-state nil ["(vibe \"a thing\")"])
+          s* (vibe/resolve-vibe s 0 16 {:err (str "HTTP 400: " msg)})]
+      (is (string/includes? (:message s*) msg))
+      (is (not (string/includes? (:message s*) "...")))))
+
   (testing "a string outcome splices over the form"
     (let [s (buf/new-state nil ["(vibe \"a thing\")"])
           s* (vibe/resolve-vibe s 0 16 {:ok "42"})]
@@ -185,3 +192,194 @@
   (testing "with-context restores *vibe-context* even when the body throws"
     (try (vibe/with-context {:text "x"} (fn [] (throw "boom"))) (catch e nil))
     (is (nil? vibe/*vibe-context*))))
+
+(deftest default-system-prompt-steers-away-from-jvm-clojure
+  (let [p vibe/default-system-prompt]
+    (is (string/includes? p "string/join"))
+    (is (string/includes? p "clojure.string"))
+    (is (string/includes? p "docstring"))
+    (is (string/includes? p "ns-publics"))))
+
+(deftest namespace-catalog-lists-live-stdlib
+  (let [cat (vibe/namespace-catalog)]
+    (is (string/includes? cat "string:"))
+    (is (string/includes? cat "join"))
+    (is (string/includes? cat "json:"))
+    (is (string/includes? cat "read-json"))))
+
+(deftest user-message-includes-the-namespace-catalog
+  (let [msg (vibe/user-message "make it go" nil)]
+    (is (string/includes? msg "----- namespaces -----"))
+    (is (string/includes? msg "string:"))))
+
+(deftest user-message-lists-the-file-requires
+  (let [text (str "(ns foo\n  (:require [string]\n            [json]))\n" vibe/marker)
+        msg (vibe/user-message "x" {:text text :filename "foo.lg" :column 0})]
+    (is (string/includes? msg "This file's ns form requires:"))
+    (is (string/includes? msg "json"))))
+
+(deftest rewrite-clojure-ns-uses-canonical-names
+  (testing "the prefixes models actually emit"
+    (is (= "string/join" (vibe/rewrite-clojure-ns "clojure.string/join")))
+    (is (= "map" (vibe/rewrite-clojure-ns "clojure.core/map")))
+    (is (= "async/chan" (vibe/rewrite-clojure-ns "clojure.core.async/chan")))
+    (is (= "io/slurp" (vibe/rewrite-clojure-ns "clojure.java.io/slurp"))))
+
+  (testing "strings and comments are left alone"
+    (is (= "\"clojure.string/join\""
+           (vibe/rewrite-clojure-ns "\"clojure.string/join\"")))
+    (is (= ";; clojure.string/join"
+           (vibe/rewrite-clojure-ns ";; clojure.string/join")))))
+
+(deftest qualified-prefixes-skip-strings-and-keywords
+  (is (= ["string" "os"]
+         (vibe/qualified-prefixes "(defn f [] (string/join (os/getenv \"FOO/BAR\")))")))
+  (is (= [] (vibe/qualified-prefixes ":string/foo")))
+  (is (= [] (vibe/qualified-prefixes "\"string/join\""))))
+
+(deftest ns-require-index-reads-libspecs
+  (let [idx (vibe/ns-require-index
+             "(ns foo\n  (:require [string]\n            [legmacs.buffer :as buf]\n            [json :as json]))")]
+    (is (= #{"string" "legmacs.buffer" "json"} (:libs idx)))
+    (is (= {"buf" "legmacs.buffer" "json" "json"} (:aliases idx))))
+
+  (testing "no ns form"
+    (is (= {:libs #{} :aliases {}} (vibe/ns-require-index "(+ 1 2)")))))
+
+(deftest ensure-requires-edits-the-ns-form
+  (testing "creates a :require clause when the ns form has none"
+    (is (= "(ns foo\n  (:require [string]))"
+           (vibe/ensure-requires "(ns foo)" ["string"]))))
+
+  (testing "appends to a one-line :require"
+    (is (= "(ns foo (:require [string] [json]))"
+           (vibe/ensure-requires "(ns foo (:require [string]))" ["json"]))))
+
+  (testing "does not duplicate a lib that is already required"
+    (is (= "(ns foo (:require [string]))"
+           (vibe/ensure-requires "(ns foo (:require [string]))" ["string"]))))
+
+  (testing "a file with no ns form is left alone"
+    (is (= "(string/join x)"
+           (vibe/ensure-requires "(string/join x)" ["string"])))))
+
+(deftest needed-libs-skips-aliases-and-unknowns
+  (let [file "(ns foo\n  (:require [legmacs.buffer :as buf]\n            [string]))"]
+    (is (= ["json"]
+           (vibe/needed-libs "(json/read-json s)" file)))
+    (is (= []
+           (vibe/needed-libs "(buf/insert-string s \"x\")" file)))
+    (is (= []
+           (vibe/needed-libs "(string/join \",\" xs)" file)))
+    (is (= []
+           (vibe/needed-libs "(no-such-ns/foo)" file)))))
+
+(deftest call-tool-inspects-the-live-runtime
+  (is (string/includes? (vibe/call-tool "list-namespaces" {}) "string"))
+  (is (string/includes? (vibe/call-tool "ns-publics" {"ns" "string"}) "join"))
+  (is (string/includes? (vibe/call-tool "ns-publics" {:ns "json"}) "read-json"))
+  (is (string/includes? (vibe/call-tool "var-doc" {"name" "string/join"})
+                        "string/join"))
+  (is (string/includes? (vibe/call-tool "ns-publics" {"ns" "nope"})
+                        "no such namespace"))
+  (is (string/includes? (vibe/call-tool "mystery" {}) "unknown tool")))
+
+(deftest resolve-vibe-adds-missing-requires-in-one-undo
+  (let [s (buf/new-state nil ["(ns foo)" "" "(vibe \"x\")"])
+        text (buf/buffer-text s)
+        [start end] (vibe/find-vibe-form text 12)
+        s* (vibe/resolve-vibe s start end
+                              {:ok "(defn bar [] (string/join \",\" xs))"})
+        out (buf/buffer-text s*)]
+    (testing "the code lands and the ns form gains the require"
+      (is (string/includes? out "(:require [string])"))
+      (is (string/includes? out "(defn bar [] (string/join \",\" xs))"))
+      (is (string/includes? (:message s*) "required string")))
+
+    (testing "one undo restores the vibe form and the original ns"
+      (is (= ["(ns foo)" "" "(vibe \"x\")"] (:lines (buf/undo s*))))))
+
+  (testing "clojure.string/ in the reply is rewritten before the require is added"
+    (let [s (buf/new-state nil ["(ns foo)" "(vibe \"x\")"])
+          text (buf/buffer-text s)
+          [start end] (vibe/find-vibe-form text 10)
+          s* (vibe/resolve-vibe s start end {:ok "clojure.string/join"})
+          out (buf/buffer-text s*)]
+      (is (string/includes? out "string/join"))
+      (is (not (string/includes? out "clojure.string")))
+      (is (string/includes? out "[string]")))))
+
+(deftest http-error-text-pulls-the-api-message
+  (testing "OpenAI's nested error.message, not the raw JSON"
+    (is (= "Function tools with reasoning_effort are not supported"
+           (vibe/http-error-text
+            "{\"error\":{\"message\":\"Function tools with reasoning_effort are not supported\",\"type\":\"invalid_request_error\"}}"))))
+
+  (testing "a non-JSON body is returned flattened, not truncated"
+    (let [raw (str "oops\n" (apply str (repeat 80 "z")))]
+      (is (string/includes? (vibe/http-error-text raw) "zzzz"))
+      (is (not (string/includes? (vibe/http-error-text raw) "\n")))
+      (is (not (string/includes? (vibe/http-error-text raw) "..."))))))
+
+(deftest openai-api-picks-responses-unless-the-url-is-chat-completions
+  (testing "the default, and an explicit override"
+    (is (= :responses (vibe/openai-api {})))
+    (is (= :chat-completions (vibe/openai-api {:api :chat-completions})))
+    (is (= :responses (vibe/openai-api {:api :responses}))))
+
+  (testing "a llama.cpp-style url infers the older shape"
+    (is (= :chat-completions
+           (vibe/openai-api {:url "http://127.0.0.1:8080/v1/chat/completions"})))))
+
+(deftest openai-body-speaks-responses-by-default
+  (let [body (vibe/openai-body {:model "gpt-5.6-luna"
+                                :system "sys"
+                                :messages [{:role "user" :content "hi"}]
+                                :max-tokens 8192
+                                :tools vibe/vibe-tools
+                                :reasoning-effort :high})]
+    (is (= "sys" (:instructions body)))
+    (is (vector? (:input body)))
+    (is (= {:effort "high"} (:reasoning body)))
+    (is (= 8192 (:max_output_tokens body)))
+    (is (false? (:store body)))
+    (is (= "function" (:type (first (:tools body)))))
+    (is (= "list-namespaces" (:name (first (:tools body)))))
+    (is (nil? (:messages body)))
+    (is (nil? (:reasoning_effort body)))))
+
+(deftest openai-chat-completions-body-still-exists
+  (let [body (vibe/openai-body {:api :chat-completions
+                                :model "gpt-5.6-luna"
+                                :system "sys"
+                                :messages [{:role "user" :content "hi"}]
+                                :max-tokens 100
+                                :tools vibe/vibe-tools
+                                :reasoning-effort :high})]
+    (testing "tools on chat/completions coerce effort to none"
+      (is (= "none" (:reasoning_effort body)))
+      (is (seq (:messages body)))
+      (is (nil? (:input body))))))
+
+(deftest openai-responses-parse-reads-output-items
+  (testing "plain text"
+    (let [p (vibe/openai-responses-parse
+             {"output" [{"type" "message"
+                         "content" [{"type" "output_text" "text" "(+ 1 2)"}]}]})]
+      (is (= "(+ 1 2)" (:content p)))
+      (is (= [] (:tool-calls p)))))
+
+  (testing "a function_call keeps the raw output so the next turn can echo it"
+    (let [item {"type" "function_call"
+                "call_id" "call_1"
+                "name" "ns-publics"
+                "arguments" "{\"ns\":\"os\"}"}
+          p (vibe/openai-responses-parse {"output" [item]})]
+      (is (= "ns-publics" (:name (first (:tool-calls p)))))
+      (is (= "os" (get (:args (first (:tool-calls p))) "ns")))
+      (is (= [item] (:output p))))))
+
+(deftest effort-str-accepts-keywords-and-strings
+  (is (= "medium" (vibe/effort-str :medium)))
+  (is (= "high" (vibe/effort-str "high")))
+  (is (nil? (vibe/effort-str nil))))

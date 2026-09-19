@@ -10,12 +10,17 @@
 ;;   C-c C-v                                ; vibe-replace: find the (vibe ...)
 ;;                                          ; form around point, run it, and
 ;;                                          ; replace the form's text with the
-;;                                          ; string it returned.
+;;                                          ; string it returned. Missing
+;;                                          ; (:require ...) entries for the
+;;                                          ; namespaces the code uses are
+;;                                          ; added to the file's ns form in
+;;                                          ; the same undo step.
 ;;
 ;; The interesting part is the context: vibe-replace hands the model the whole
-;; buffer with the call site swapped for a marker, so the answer is written to
-;; fit *that spot* — surrounding defns, aliases, indentation and all — rather
-;; than in a vacuum.
+;; buffer with the call site swapped for a marker, plus a live catalog of
+;; loaded let-go namespaces (and tools to inspect them), so the answer is
+;; written to fit *that spot* — surrounding defns, aliases, indentation and
+;; all — rather than in a vacuum, and rather than as JVM Clojure.
 ;;
 ;; Setup is one file, ~/.config/legmacs/vibe.edn:
 ;;
@@ -45,9 +50,27 @@
   "<<<VIBE:HERE>>>")
 
 (def default-system-prompt
-  (str "You write let-go code. let-go is a Clojure dialect running on a Go VM: "
-       "most of clojure.core is there, plus namespaces like string/, json/, "
-       "http/, os/ and term/.\n\n"
+  (str "You write let-go code. let-go is a Clojure dialect on a Go VM, not JVM Clojure.\n\n"
+       "Namespaces:\n"
+       "- Canonical names are short: string, json, http, os, io, term, async, set, "
+       "walk, edn, pprint, test, math, net. Qualify them as string/join, "
+       "json/read-json, os/getenv, http/get, io/slurp.\n"
+       "- Never write clojure.string, clojure.java.io, clojure.core.async, "
+       "clojure.set, clojure.walk, clojure.pprint, or clojure.core. "
+       "clojure.string/join does not invoke — the real fn is string/join. "
+       "clojure.core is already referred; write map not clojure.core/map.\n"
+       "- Prefer an existing :as alias (buf/ not legmacs.buffer/). If you need a "
+       "namespace the file does not require, use its canonical prefix and do not "
+       "edit the ns form; missing requires are added for you.\n"
+       "- json/read-json takes an optional {:keywords? true}. json/write-json "
+       "accepts keyword or string map keys.\n"
+       "- (throw \"msg\") is a plain string. Catch with (or (ex-message e) (str e)).\n"
+       "- Do not use finally for cleanup that must run on throw; reify the outcome "
+       "then clean up.\n"
+       "- No top-level forward references: a defn body may only refer to names "
+       "defined above it.\n"
+       "- count, subs, and string/index-of on a string are O(n) (rune-indexed). "
+       "Do not call them per character in a scan; convert to a char vector once.\n\n"
        "You get a source file with the marker " marker " at exactly one spot, "
        "and a request. Reply with the code that should replace that marker.\n\n"
        "Rules:\n"
@@ -56,8 +79,35 @@
        "- The code must read as balanced, complete form(s) in that position.\n"
        "- Match the file's existing style, naming and aliases.\n"
        "- Do not repeat any other part of the file.\n"
-       "- let-go has no forward references at the top level: a defn body may "
-       "only refer to names defined above it.\n"))
+       "- Every defn, defn-, and defcommand must have a docstring.\n"
+       "- Tools list-namespaces, ns-publics, and var-doc inspect the live runtime. "
+       "Use them when the namespace catalog is not enough or you need arglists.\n"))
+
+;; Canonical JVM-Clojure prefixes the model emits, mapped to let-go's real
+;; names. Longest match first so clojure.core.async/ is not eaten by
+;; clojure.core/.
+(def clojure-ns-rewrites
+  [["clojure.core.async/" "async/"]
+   ["clojure.java.io/" "io/"]
+   ["clojure.string/" "string/"]
+   ["clojure.set/" "set/"]
+   ["clojure.walk/" "walk/"]
+   ["clojure.edn/" "edn/"]
+   ["clojure.zip/" "zip/"]
+   ["clojure.data/" "data/"]
+   ["clojure.pprint/" "pprint/"]
+   ["clojure.test/" "test/"]
+   ["clojure.core/" ""]])
+
+(def stdlib-libs
+  "Short names we always offer in the catalog when the ns is loaded."
+  ["string" "json" "http" "os" "io" "term" "async" "set" "walk" "edn"
+   "pprint" "test" "math" "net" "hash" "graph" "transit" "bencode"
+   "storage" "unix" "syscall" "pods" "xxh3"])
+
+(def skip-catalog-ns
+  #{"user" "core" "clojure.core" "gogen" "resolver" "rt" "ir" "ir.data"
+    "disasm" "profile" "js" "let-go.core" "let-go.types" "let-go.semver"})
 
 ;; --- providers -----------------------------------------------------------
 ;;
@@ -69,37 +119,297 @@
 ;; Request bodies are built with *keyword* keys on purpose: let-go's
 ;; json/write-json double-quotes string map keys ({"a" 1} serialises as
 ;; {"\"a\"": 1}), but keywordizes correctly.
+;;
+;; :parse turns a decoded response into {:content s :tool-calls [...]}.
+;; :body accepts :messages (a growing chat) and optional :tools.
 
-(defn- openai-body [{:keys [model system user max-tokens]}]
-  {:model model
-   :max_completion_tokens max-tokens
-   :messages [{:role "system" :content system}
-              {:role "user" :content user}]})
+(def vibe-tools
+  [{:name "list-namespaces"
+    :description (str "Names of loaded let-go namespaces you can require. "
+                      "Returns canonical short names (string, json, os), never clojure.string.")
+    :parameters {:type "object" :properties {}}}
+   {:name "ns-publics"
+    :description "Public var names in a loaded namespace, e.g. os or string or legmacs.buffer."
+    :parameters {:type "object"
+                 :properties {:ns {:type "string"
+                                   :description "Namespace name"}}
+                 :required ["ns"]}}
+   {:name "var-doc"
+    :description (str "Docstring and arglists for a var. Pass a qualified name "
+                      "like os/getenv or string/join.")
+    :parameters {:type "object"
+                 :properties {:name {:type "string"
+                                     :description "Var name, preferably qualified"}}
+                 :required ["name"]}}])
 
-(defn- openai-extract [m]
-  (let [choices (get m "choices")]
-    (when (seq choices)
-      (get (get (first choices) "message") "content"))))
+(defn- openai-chat-tools [tools]
+  (mapv (fn [t]
+          {:type "function"
+           :function {:name (:name t)
+                      :description (:description t)
+                      :parameters (or (:parameters t)
+                                      {:type "object" :properties {}})}})
+        tools))
 
-(defn- anthropic-body [{:keys [model system user max-tokens]}]
-  {:model model
-   :max_tokens max-tokens
-   :system system
-   :messages [{:role "user" :content user}]})
+(defn- openai-responses-tools [tools]
+  ;; Flat tool items, not the chat/completions {type, function:{...}} wrapper.
+  ;; strict false: list-namespaces has an empty parameter object that
+  ;; wouldn't survive Responses' default "try to make this strict" pass.
+  (mapv (fn [t]
+          {:type "function"
+           :name (:name t)
+           :description (:description t)
+           :parameters (or (:parameters t)
+                           {:type "object" :properties {}})
+           :strict false})
+        tools))
 
-(defn- anthropic-extract [m]
-  (let [blocks (get m "content")]
-    (when (seq blocks)
-      (get (first blocks) "text"))))
+(defn- anthropic-tools [tools]
+  (mapv (fn [t]
+          {:name (:name t)
+           :description (:description t)
+           :input_schema (or (:parameters t)
+                             {:type "object" :properties {}})})
+        tools))
+
+(defn- openai-tool-call [c]
+  {:id (:id c)
+   :type "function"
+   :function {:name (:name c)
+              :arguments (json/write-json (or (:args c) {}))}})
+
+(defn- openai-message [m]
+  (let [role (:role m)]
+    (cond
+      (= role "tool")
+      {:role "tool" :tool_call_id (:tool-call-id m) :content (:content m)}
+
+      (= role "assistant")
+      (let [base {:role "assistant" :content (or (:content m) "")}]
+        (if (seq (:tool-calls m))
+          (assoc base :tool_calls (mapv openai-tool-call (:tool-calls m)))
+          base))
+
+      :else
+      {:role "user" :content (:content m)})))
+
+(defn openai-api
+  "Which OpenAI HTTP shape to speak. :responses is the current API -- the
+   one that can combine function tools with reasoning_effort on gpt-5.6-*.
+   :chat-completions is the older one, still what llama.cpp/ollama/openrouter
+   speak. Inferred from :url when it contains chat/completions; otherwise
+   :api in vibe.edn wins, defaulting to :responses."
+  [cfg]
+  (let [given (:api cfg)
+        url (str (or (:url cfg) ""))]
+    (cond
+      given (keyword given)
+      (string/includes? url "chat/completions") :chat-completions
+      :else :responses)))
+
+(defn effort-str
+  "Config value -> the string the API wants. Keywords (:medium) and
+   strings (\"medium\") both work; nil means omit the field."
+  [v]
+  (when v
+    (if (keyword? v) (name v) (str v))))
+
+(defn openai-chat-url [] "https://api.openai.com/v1/chat/completions")
+(defn openai-responses-url [] "https://api.openai.com/v1/responses")
+
+(defn- keywordize-json [v]
+  (cond
+    (map? v)
+    (into {} (map (fn [[k val]]
+                    [(if (string? k) (keyword k) k)
+                     (keywordize-json val)])
+                  v))
+    (vector? v) (mapv keywordize-json v)
+    :else v))
+
+(defn- responses-input [messages]
+  (vec
+   (mapcat (fn [m]
+             (let [role (:role m)]
+               (cond
+                 (= role "tool")
+                 [{:type "function_call_output"
+                   :call_id (:tool-call-id m)
+                   :output (or (:content m) "")}]
+                 (= role "assistant")
+                 (if (seq (:output m))
+                   (mapv keywordize-json (:output m))
+                   (when (seq (:content m))
+                     [{:role "assistant" :content (:content m)}]))
+                 :else
+                 [{:role "user" :content (:content m)}])))
+           messages)))
+
+(defn- openai-chat-body [{:keys [model system messages max-tokens tools reasoning-effort]}]
+  ;; gpt-5.6-* on this endpoint rejects tools unless effort is none. If the
+  ;; user asked for more, we still send none on a tools turn -- a 400 retry
+  ;; without tools is the other way out.
+  (let [effort (let [e (effort-str reasoning-effort)]
+                 (cond (and (seq tools) (or (nil? e) (not= e "none"))) "none"
+                       e e
+                       :else nil))
+        base {:model model
+              :max_completion_tokens max-tokens
+              :messages (into [{:role "system" :content system}]
+                              (mapv openai-message messages))}
+        base (if (seq tools)
+               (assoc base :tools (openai-chat-tools tools))
+               base)]
+    (if effort
+      (assoc base :reasoning_effort effort)
+      base)))
+
+(defn- openai-responses-body [{:keys [model system messages max-tokens tools reasoning-effort]}]
+  (let [effort (effort-str reasoning-effort)
+        base {:model model
+              :instructions system
+              :input (responses-input messages)
+              :max_output_tokens max-tokens
+              :store false}
+        base (if (seq tools)
+               (assoc base :tools (openai-responses-tools tools))
+               base)]
+    (if effort
+      (assoc base :reasoning {:effort effort})
+      base)))
+
+(defn openai-body
+  "Dispatch on :api. Public so tests can pin the wire shape."
+  [opts]
+  (if (= :chat-completions (:api opts))
+    (openai-chat-body opts)
+    (openai-responses-body opts)))
+
+(defn- as-arg-map [args]
+  (try
+    (cond (map? args) args
+          (seq (str args)) (let [v (json/read-json args)]
+                             (if (map? v) v {}))
+          :else {})
+    (catch e {})))
+
+(defn- openai-parse-call [c]
+  (let [f (get c "function")]
+    {:id (get c "id")
+     :name (get f "name")
+     :args (as-arg-map (get f "arguments"))}))
+
+(defn- openai-chat-parse [m]
+  (let [msg (get (first (get m "choices")) "message")
+        content (get msg "content")
+        raw (get msg "tool_calls")]
+    {:content (when (and (string? content) (seq content)) content)
+     :tool-calls (mapv openai-parse-call (or raw []))}))
+
+(defn- responses-text [output]
+  (string/join
+   ""
+   (mapcat (fn [item]
+             (when (= "message" (get item "type"))
+               (keep (fn [c]
+                       (when (or (= "output_text" (get c "type"))
+                                 (= "text" (get c "type")))
+                         (get c "text")))
+                     (or (get item "content") []))))
+           (or output []))))
+
+(defn openai-responses-parse
+  "Pull :content, :tool-calls, and the raw :output items (reasoning +
+   function_call) so the next turn can send them back. Public for tests."
+  [m]
+  (let [output (or (get m "output") [])
+        content (or (let [t (get m "output_text")]
+                      (when (and (string? t) (seq t)) t))
+                    (let [t (responses-text output)]
+                      (when (seq t) t)))
+        calls (vec
+               (keep (fn [item]
+                       (when (= "function_call" (get item "type"))
+                         {:id (or (get item "call_id") (get item "id"))
+                          :name (get item "name")
+                          :args (as-arg-map (get item "arguments"))}))
+                     output))]
+    {:content content
+     :tool-calls calls
+     :output output}))
+
+(defn openai-parse [m]
+  (if (get m "choices")
+    (openai-chat-parse m)
+    (openai-responses-parse m)))
+
+(defn- anthropic-assistant-content [m]
+  (let [blocks (if (seq (:content m))
+                 [{:type "text" :text (:content m)}]
+                 [])]
+    (into blocks
+          (mapv (fn [c]
+                  {:type "tool_use"
+                   :id (:id c)
+                   :name (:name c)
+                   :input (or (:args c) {})})
+                (:tool-calls m)))))
+
+(defn- anthropic-wire-messages [messages]
+  (loop [ms messages, out [], pending []]
+    (if-not (seq ms)
+      (if (seq pending)
+        (conj out {:role "user" :content pending})
+        out)
+      (let [m (first ms)]
+        (if (= "tool" (:role m))
+          (recur (rest ms) out
+                 (conj pending {:type "tool_result"
+                                :tool_use_id (:tool-call-id m)
+                                :content (:content m)}))
+          (let [out (if (seq pending)
+                      (conj out {:role "user" :content pending})
+                      out)
+                wire (if (= "assistant" (:role m))
+                       {:role "assistant" :content (anthropic-assistant-content m)}
+                       {:role "user" :content (:content m)})]
+            (recur (rest ms) (conj out wire) [])))))))
+
+(defn- anthropic-body [{:keys [model system messages max-tokens tools]}]
+  (let [base {:model model
+              :max_tokens max-tokens
+              :system system
+              :messages (anthropic-wire-messages messages)}]
+    (if (seq tools)
+      (assoc base :tools (anthropic-tools tools))
+      base)))
+
+(defn- anthropic-parse [m]
+  (let [blocks (or (get m "content") [])
+        text (string/join
+              ""
+              (keep (fn [b]
+                      (when (= "text" (get b "type"))
+                        (get b "text")))
+                    blocks))
+        calls (vec
+               (keep (fn [b]
+                       (when (= "tool_use" (get b "type"))
+                         {:id (get b "id")
+                          :name (get b "name")
+                          :args (or (get b "input") {})}))
+                     blocks))]
+    {:content (when (seq text) text)
+     :tool-calls calls}))
 
 (def providers
-  {:openai {:url "https://api.openai.com/v1/chat/completions"
+  {:openai {:url "https://api.openai.com/v1/responses"
             :model "gpt-5.6-luna"
             :key-env "OPENAI_API_KEY"
             :headers (fn [key] {"Authorization" (str "Bearer " key)
                                 "Content-Type" "application/json"})
             :body openai-body
-            :extract openai-extract}
+            :parse openai-parse}
    :anthropic {:url "https://api.anthropic.com/v1/messages"
                :model "claude-sonnet-5"
                :key-env "ANTHROPIC_API_KEY"
@@ -107,7 +417,7 @@
                                    "anthropic-version" "2023-06-01"
                                    "Content-Type" "application/json"})
                :body anthropic-body
-               :extract anthropic-extract}})
+               :parse anthropic-parse}})
 
 (def defaults
   "The bottom layer. Anything absent here falls through to the provider's
@@ -115,10 +425,22 @@
 
    :max-tokens is generous because gpt-5.6-luna is a reasoning model and
    its reasoning tokens come out of the same budget as the code you asked
-   for -- a tight limit shows up as an empty reply, not a truncated one."
+   for -- a tight limit shows up as an empty reply, not a truncated one.
+
+   :reasoning-effort is sent as Responses' reasoning.effort (none / low /
+   medium / high / ...). :medium is gpt-5.6's own default; set another in
+   vibe.edn. The older chat/completions endpoint cannot combine tools with
+   anything but none -- we still speak it when :url points there.
+
+   :tools is on by default so the model can inspect live namespaces.
+   Pointing :url at a local endpoint that does not speak tool-calls?
+   Set :tools false. A 400 on a tools turn retries once without them."
   {:provider :openai
    :max-tokens 8192
-   :system default-system-prompt})
+   :reasoning-effort :medium
+   :system default-system-prompt
+   :tools true
+   :max-tool-rounds 4})
 
 (def config
   "Programmatic overrides, on top of vibe.edn. Empty by default -- this is
@@ -135,11 +457,14 @@
 ;; variable bin/legmacs already honours for legmacs_init.lg):
 ;;
 ;;   {:key "sk-..."
-;;    :model "gpt-5.6-luna"}
+;;    :model "gpt-5.6-luna"
+;;    :reasoning-effort :medium}   ; none, low, medium, high, ...
 ;;
 ;; :key and an optional :model are the whole expected surface, but the file
-;; is merged into the config map wholesale, so :provider, :url, :max-tokens
-;; and :system work from here too without needing their own plumbing.
+;; is merged into the config map wholesale, so :provider, :url, :api
+;; (:responses or :chat-completions), :max-tokens, :reasoning-effort,
+;; :system, :tools and :max-tool-rounds work from here too without needing
+;; their own plumbing.
 ;;
 ;; Re-read on every call rather than cached at load: it's one small file
 ;; against a network round-trip, and editing your model in a legmacs buffer
@@ -192,36 +517,274 @@
             close (string/last-index-of body "```")]
         (string/trim (if close (subs body 0 close) body))))))
 
-(defn- one-line
-  "Collapse a message to something the one-line echo area can show."
+(defn format-echo
+  "Echo-area text: newlines flattened so render can wrap to the terminal
+   width and grow the echo rows. Not truncated -- a 200-char cap is what
+   hid the rest of an HTTP error on a one-line minibuffer."
   [s]
-  (let [s (string/replace (str s) "\n" " ")]
-    (if (> (count s) 200) (str (subs s 0 200) "...") s)))
+  (string/trim (string/replace (str s) "\n" " ")))
+
+(defn http-error-text
+  "Pull error.message out of an OpenAI/Anthropic JSON body when present,
+   otherwise the raw body. The echo area then wraps this instead of showing
+   a truncated blob of JSON."
+  [body]
+  (let [raw (str body)
+        extracted (try
+                    (let [m (json/read-json raw)
+                          err (get m "error")]
+                      (or (when (map? err) (get err "message"))
+                          (get m "message")))
+                    (catch e nil))]
+    (format-echo (or (when (seq extracted) extracted) raw))))
 
 (defn- error-message [e]
   (or (ex-message e) (str e)))
 
-(defn- request-completion [cfg provider user-message]
+(defn- tool-arg [args k]
+  (or (get args k)
+      (get args (keyword k))))
+
+(defn catalog-worthy?
+  "True for a namespace name we are willing to list or auto-require: lowercase,
+   not a clojure.* alias stub, not a compiler-internal ns."
+  [nm]
+  (and (seq nm)
+       (<= 97 (int (nth nm 0)) 122)
+       (not (string/starts-with? nm "clojure."))
+       (not (string/starts-with? nm "java."))
+       (not (contains? skip-catalog-ns nm))))
+
+(defn- format-var-names [ns-sym]
+  (string/join " " (sort (map str (keys (ns-publics ns-sym))))))
+
+(defn- format-ns-line [nm]
+  (let [sym (symbol nm)]
+    (if (find-ns sym)
+      (str nm ": " (format-var-names sym))
+      nm)))
+
+(defn loaded-lib-names
+  "Canonical names of loaded namespaces the model is allowed to see."
+  []
+  (sort (filter catalog-worthy?
+                (map (fn [ns] (str (ns-name ns))) (all-ns)))))
+
+(defn- available-stdlib []
+  (filter (fn [nm] (find-ns (symbol nm))) stdlib-libs))
+
+(defn- parse-libspec [spec]
+  (try
+    (cond
+      (symbol? spec) {:lib (str spec)}
+      (vector? spec)
+      (let [lib (str (first spec))
+            opts (apply hash-map (rest spec))
+            alias (:as opts)]
+        {:lib lib
+         :as (when alias (str alias))})
+      :else nil)
+    (catch e
+      (when (vector? spec)
+        {:lib (str (first spec))}))))
+
+(defn- name-char? [ch]
+  (let [c (int ch)]
+    (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)
+        (contains? #{45 95 33 63 42 43 62 60 61} c))))
+
+(defn- ns-name-char? [ch]
+  (or (name-char? ch) (= ch \.)))
+
+(defn- line-start? [text offset]
+  (or (zero? offset)
+      (= \newline (nth text (dec offset)))
+      (and (contains? #{\space \tab} (nth text (dec offset)))
+           (line-start? text (dec offset)))))
+
+(defn ns-head-at?
+  "Does a top-level `(ns ` form open at `offset`?"
+  [text offset]
+  (and (<= 0 offset)
+       (line-start? text offset)
+       (<= (+ offset 4) (count text))
+       (= "(ns" (subs text offset (+ offset 3)))
+       (not (name-char? (nth text (+ offset 3))))))
+
+(defn find-ns-form
+  "[start end) of the first top-level (ns ...) form, or nil."
+  [text]
+  (let [scanned (ls/scan text)
+        candidates (filter (fn [[o c]]
+                             (and (< o c)
+                                  (ns-head-at? text o)
+                                  (not (ls/in-string-or-comment? scanned o))))
+                           (:pairs scanned))]
+    (when (seq candidates)
+      (let [[o c] (apply min-key first candidates)]
+        [o (inc c)]))))
+
+(defn- find-require-list [text ns-start ns-end]
+  (let [region (subs text ns-start ns-end)
+        idx (string/index-of region "(:require")]
+    (when idx
+      (let [open (+ ns-start idx)
+            close (get (:pairs (ls/scan text)) open)]
+        (when (and close (< close ns-end))
+          [open (inc close)])))))
+
+(defn parse-require-list
+  "Libspecs inside a `(:require ...)` form, as {:lib :as} maps."
+  [text req-start req-end]
+  (let [form (try (read-string (subs text req-start req-end))
+                  (catch e nil))]
+    (if (seq form)
+      (vec (keep parse-libspec (rest form)))
+      [])))
+
+(defn ns-require-index
+  "Libs and :as aliases declared by the file's ns form.
+   {:libs #{\"string\" ...} :aliases {\"buf\" \"legmacs.buffer\"}}."
+  [text]
+  (if-let [[ns-s ns-e] (find-ns-form text)]
+    (if-let [[rs re] (find-require-list text ns-s ns-e)]
+      (let [specs (parse-require-list text rs re)]
+        {:libs (set (map :lib specs))
+         :aliases (into {} (keep (fn [s]
+                                   (when (:as s)
+                                     [(:as s) (:lib s)]))
+                                 specs))})
+      {:libs #{} :aliases {}})
+    {:libs #{} :aliases {}}))
+
+(defn- format-file-requires [text]
+  (let [idx (ns-require-index text)
+        libs (sort (:libs idx))
+        aliases (:aliases idx)]
+    (if-not (seq libs)
+      ""
+      (str "This file's ns form requires:\n"
+           (string/join
+            "\n"
+            (map (fn [lib]
+                   (let [alias (some (fn [[a l]] (when (= l lib) a)) aliases)
+                         extra (when (and (not (contains? (set stdlib-libs) lib))
+                                          (find-ns (symbol lib)))
+                                 (str ": " (format-var-names (symbol lib))))]
+                     (str "  " lib
+                          (when alias (str " as " alias))
+                          extra)))
+                 libs))
+           "\n"))))
+
+(defn namespace-catalog
+  "Live stdlib (and this file's requires) for the user message."
+  ([] (namespace-catalog nil))
+  ([text]
+   (str "Loaded stdlib (canonical names — never clojure.string, always string/):\n"
+        (string/join "\n" (map (fn [nm] (str "  " (format-ns-line nm)))
+                               (available-stdlib)))
+        "\n"
+        (when (seq text)
+          (format-file-requires text)))))
+
+(defn tool-list-namespaces []
+  (string/join "\n" (loaded-lib-names)))
+
+(defn tool-ns-publics [args]
+  (let [nm (str (tool-arg args "ns"))]
+    (cond
+      (not (seq nm)) "ns-publics: missing ns"
+      (not (find-ns (symbol nm))) (str "no such namespace: " nm)
+      :else (format-var-names (symbol nm)))))
+
+(defn tool-var-doc [args]
+  (let [nm (str (tool-arg args "name"))]
+    (if-not (seq nm)
+      "var-doc: missing name"
+      (let [v (resolve (symbol nm))]
+        (if-not v
+          (str "no such var: " nm)
+          (let [m (or (meta v) {})
+                doc (:doc m)
+                arglists (:arglists m)]
+            (str nm
+                 (when arglists (str "\n" (pr-str arglists)))
+                 "\n"
+                 (or doc "loaded, no docstring."))))))))
+
+(defn call-tool
+  "Run a vibe tool by name. args is a map (string or keyword keys) or a
+   JSON object string. Always returns a string the model can read."
+  [name args]
+  (let [args (as-arg-map args)]
+    (cond
+      (= name "list-namespaces") (tool-list-namespaces)
+      (= name "ns-publics") (tool-ns-publics args)
+      (= name "var-doc") (tool-var-doc args)
+      :else (str "unknown tool: " name))))
+
+(defn- openai-endpoint [cfg provider]
+  (or (:url cfg)
+      (when (= :chat-completions (openai-api cfg))
+        (openai-chat-url))
+      (:url provider)))
+
+(defn- completion-turn [cfg provider messages tools]
   (let [key (api-key cfg provider)
         model (or (:model cfg) (:model provider))
-        url (or (:url cfg) (:url provider))]
+        url (openai-endpoint cfg provider)
+        api (openai-api cfg)]
     (when-not key
       (throw (str "no API key -- put {:key \"...\"} in " (config-path)
                   " (or export " (:key-env provider) ")")))
     (let [body ((:body provider) {:model model
                                   :system (:system cfg)
-                                  :user user-message
-                                  :max-tokens (:max-tokens cfg)})
+                                  :messages messages
+                                  :max-tokens (:max-tokens cfg)
+                                  :tools tools
+                                  :reasoning-effort (:reasoning-effort cfg)
+                                  :api api})
           resp (http/post url (json/write-json body)
                           {:headers ((:headers provider) key)})
           status (:status resp)]
       (when-not (and (<= 200 status) (< status 300))
-        (throw (str "HTTP " status ": " (one-line (:body resp)))))
+        ;; Some endpoints (chat/completions on gpt-5.6, local servers) 400
+        ;; on tools. One retry without them still has the namespace catalog.
+        (if (and (= 400 status) (seq tools))
+          (completion-turn cfg provider messages nil)
+          (throw (str "HTTP " status ": " (http-error-text (:body resp))))))
       (let [parsed (json/read-json (:body resp))
-            content ((:extract provider) parsed)]
-        (when-not (seq content)
-          (throw (str "no content in response: " (one-line (:body resp)))))
-        content))))
+            result ((:parse provider) parsed)]
+        (when (and (not (seq (:content result)))
+                   (not (seq (:tool-calls result))))
+          (throw (str "no content in response: " (http-error-text (:body resp)))))
+        result))))
+
+(defn- append-tool-round [messages parsed]
+  (into (conj messages {:role "assistant"
+                        :content (:content parsed)
+                        :tool-calls (:tool-calls parsed)
+                        :output (:output parsed)})
+        (mapv (fn [c]
+                {:role "tool"
+                 :tool-call-id (:id c)
+                 :content (call-tool (:name c) (:args c))})
+              (:tool-calls parsed))))
+
+(defn- request-completion [cfg provider user-message]
+  (loop [messages [{:role "user" :content user-message}]
+         round 0]
+    (let [max-rounds (or (:max-tool-rounds cfg) 4)
+          use-tools (and (:tools cfg) (< round max-rounds))
+          parsed (completion-turn cfg provider messages
+                                  (when use-tools vibe-tools))]
+      (if (and (seq (:tool-calls parsed)) use-tools)
+        (recur (append-tool-round messages parsed) (inc round))
+        (let [content (:content parsed)]
+          (when-not (seq content)
+            (throw "no content in response"))
+          content)))))
 
 ;; --- call-site context ---------------------------------------------------
 ;;
@@ -252,16 +815,142 @@
   "The prompt actually sent. Splitting this out (pure, no I/O) is what
    makes the interesting half of vibe testable."
   [request ctx]
-  (if-not ctx
-    (str "Request: " request "\n\n"
-         "There is no surrounding file; reply with standalone let-go code.")
-    (str "Request: " request "\n\n"
-         "File: " (or (:filename ctx) "*scratch*") "\n"
-         "The " marker " below starts at column " (:column ctx)
-         ", so indent any continuation lines to match.\n\n"
-         "----- begin file -----\n"
-         (:text ctx)
-         "\n----- end file -----")))
+  (str "Request: " request "\n\n"
+       (if-not ctx
+         "There is no surrounding file; reply with standalone let-go code.\n\n"
+         (str "File: " (or (:filename ctx) "*scratch*") "\n"
+              "The " marker " below starts at column " (:column ctx)
+              ", so indent any continuation lines to match.\n\n"
+              "----- begin file -----\n"
+              (:text ctx)
+              "\n----- end file -----\n\n"))
+       "----- namespaces -----\n"
+       (namespace-catalog (when ctx (:text ctx)))))
+
+(defn- span-covering [spans i]
+  (some (fn [sp]
+          (when (and (<= (:start sp) i) (< i (:end sp)))
+            sp))
+        spans))
+
+(defn- rewrite-at [text n i]
+  (some (fn [[from to]]
+          (let [m (count from)]
+            (when (and (<= (+ i m) n)
+                       (= from (subs text i (+ i m)))
+                       (or (zero? i)
+                           (not (ns-name-char? (nth text (dec i))))))
+              [m to])))
+        clojure-ns-rewrites))
+
+(defn rewrite-clojure-ns
+  "Replace JVM-Clojure qualified prefixes with let-go's canonical names,
+   leaving strings and comments alone. clojure.core/ is stripped."
+  [code]
+  (let [spans (:spans (ls/scan code))
+        n (count code)]
+    (loop [i 0, out ""]
+      (cond
+        (>= i n) out
+        :else
+        (if-let [sp (span-covering spans i)]
+          (recur (:end sp) (str out (subs code i (:end sp))))
+          (if-let [[m to] (rewrite-at code n i)]
+            (recur (+ i m) (str out to))
+            (recur (inc i) (str out (nth code i)))))))))
+
+(defn- symbol-end [text n i]
+  (loop [j i]
+    (if (and (< j n)
+             (or (ns-name-char? (nth text j))
+                 (= \/ (nth text j))))
+      (recur (inc j))
+      j)))
+
+(defn- letter-or-sym-start? [ch]
+  (let [c (int ch)]
+    (or (<= 97 c 122) (<= 65 c 90)
+        (contains? #{42 43 33 63 95 61 45} c))))
+
+(defn qualified-prefixes
+  "Namespace prefixes of qualified symbols in `code`, skipping strings,
+   comments, and keywords."
+  [text]
+  (let [scanned (ls/scan text)
+        n (count text)]
+    (loop [i 0, acc []]
+      (cond
+        (>= i n) (vec (distinct acc))
+        (ls/in-string-or-comment? scanned i)
+        (recur (inc i) acc)
+        (= \: (nth text i))
+        (recur (symbol-end text n (inc i)) acc)
+        (letter-or-sym-start? (nth text i))
+        (let [j (symbol-end text n i)
+              s (subs text i j)
+              slash (string/index-of s "/")]
+          (if (and slash (pos? slash) (< slash (dec (count s))))
+            (recur j (conj acc (subs s 0 slash)))
+            (recur j acc)))
+        :else
+        (recur (inc i) acc)))))
+
+(defn needed-libs
+  "Canonical namespace names `code` uses that `file-text`'s ns form does
+   not already require or alias, and that are actually loaded."
+  [code file-text]
+  (let [idx (ns-require-index file-text)
+        known-alias? (set (keys (:aliases idx)))
+        known-lib? (:libs idx)]
+    (vec
+     (distinct
+      (filter (fn [p]
+                (and (not (known-alias? p))
+                     (not (known-lib? p))
+                     (catalog-worthy? p)
+                     (find-ns (symbol p))))
+              (qualified-prefixes code))))))
+
+(defn- trailing-indent [inner]
+  (let [i (string/last-index-of inner "\n")]
+    (if i
+      (let [line (subs inner (inc i))
+            n (count line)
+            w (loop [j 0]
+                (if (and (< j n) (contains? #{\space \tab} (nth line j)))
+                  (recur (inc j))
+                  j))]
+        (subs line 0 w))
+      "  ")))
+
+(defn add-require
+  "Insert `[lib]` into the file's `(:require ...)`, creating the clause if
+   needed. Returns `text` unchanged when there is no ns form."
+  [text lib]
+  (if-let [[ns-s ns-e] (find-ns-form text)]
+    (if-let [[req-s req-e] (find-require-list text ns-s ns-e)]
+      (let [close (dec req-e)
+            inner (subs text (inc req-s) close)
+            spec (str "[" lib "]")
+            insert (if (string/includes? inner "\n")
+                     (str "\n" (trailing-indent inner) spec)
+                     (str " " spec))]
+        (str (subs text 0 close) insert (subs text close)))
+      (let [close (dec ns-e)
+            insert (str "\n  (:require [" lib "])")]
+        (str (subs text 0 close) insert (subs text close))))
+    text))
+
+(defn ensure-requires
+  "Add each of `libs` to the ns form that is not already required."
+  [text libs]
+  (reduce (fn [t lib]
+            (let [idx (ns-require-index t)]
+              (if (contains? (:libs idx) lib)
+                t
+                (add-require t lib))))
+          text
+          libs))
 
 (defn vibe
   "Ask the configured model for let-go code and return it as a string.
@@ -279,15 +968,11 @@
          provider (get providers (:provider cfg))]
      (when-not provider
        (throw (str "unknown vibe provider " (pr-str (:provider cfg)))))
-     (strip-fences (request-completion cfg provider
-                                       (user-message request *vibe-context*))))))
+     (rewrite-clojure-ns
+      (strip-fences (request-completion cfg provider
+                                        (user-message request *vibe-context*)))))))
 
 ;; --- finding the (vibe ...) form ----------------------------------------
-
-(defn- name-char? [ch]
-  (let [c (int ch)]
-    (or (<= 97 c 122) (<= 65 c 90) (<= 48 c 57)
-        (contains? #{45 95 33 63 42 43 62 60 61} c))))
 
 (defn vibe-head-at?
   "Does a `(vibe ` form open at `offset`? Checks the character after the
@@ -331,6 +1016,35 @@
           (assoc :cursor-row row :cursor-col col :goal-col nil)
           buf/clamp-cursor))))
 
+(defn apply-vibe-code
+  "Rewrite JVM-Clojure prefixes, splice `code` over [start end), and add
+   any missing requires to the ns form. One undo step."
+  [state start end code]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [code (rewrite-clojure-ns (string/trim code))
+          text (buf/buffer-text state)
+          spliced (str (subs text 0 start) code (subs text end))
+          libs (needed-libs code spliced)
+          new-text (ensure-requires spliced libs)
+          ns-at (first (find-ns-form spliced))
+          shift (if (and ns-at (< ns-at start))
+                  (- (count new-text) (count spliced))
+                  0)
+          added (sort (remove (:libs (ns-require-index spliced))
+                              (:libs (ns-require-index new-text))))
+          state (-> (buf/push-undo state)
+                    (assoc :lines (buf/split-lines new-text) :modified? true))
+          [row col] (buf/row-col-of state (+ start shift (count code)))]
+      (-> state
+          (assoc :cursor-row row :cursor-col col :goal-col nil)
+          buf/clamp-cursor
+          (assoc :message
+                 (if (seq added)
+                   (str "vibed " (count code) " chars, required "
+                        (string/join ", " added))
+                   (str "vibed " (count code) " chars")))))))
+
 ;; --- the command ---------------------------------------------------------
 
 (defn eval-vibe-form
@@ -352,7 +1066,7 @@
    buffer may have moved while the future ran. Does no I/O."
   [state start end outcome]
   (if-let [err (:err outcome)]
-    (assoc state :message (str "vibe error: " (one-line (error-message err))))
+    (assoc state :message (str "vibe error: " (format-echo (error-message err))))
     (let [text (buf/buffer-text state)]
       (if-not (and start end (<= end (count text)) (vibe-head-at? text start))
         (assoc state :message "vibe: form moved before it could run")
@@ -363,9 +1077,8 @@
           ;; miserable way to find out.
           (if-not (string? result)
             (assoc state :message (str "vibe: expected a string, got "
-                                       (one-line (pr-str result))))
-            (-> (splice-offsets state start end result)
-                (assoc :message (str "vibed " (count result) " chars")))))))))
+                                       (format-echo (pr-str result))))
+            (apply-vibe-code state start end result)))))))
 
 (defn vibe-then
   "resolve-vibe as a (fn [state outcome] -> state) for spawn-task."
@@ -382,7 +1095,8 @@
   "Replace the (vibe \"...\") form around point with what the model writes.
    Snapshots the form and starts the HTTP call in a future so the editor
    keeps reading keys -- spawn-task (see legmacs.buffers), not a blocking
-   pending-task."
+   pending-task. Namespaces the code uses that the file does not require
+   are added to the ns form in the same undo step."
   [state]
   (let [text (buf/buffer-text state)
         point (buf/offset-of state (:cursor-row state) (:cursor-col state))]

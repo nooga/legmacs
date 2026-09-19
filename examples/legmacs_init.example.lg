@@ -45,5 +45,6 @@
 ;; win over vibe.edn.
 ;;
 ;; (require '[legmacs.vibe :as vibe])
-;; (swap! vibe/config assoc :model "gpt-5.6-sol")
+;; (swap! vibe/config assoc :model "gpt-5.6-sol" :reasoning-effort :high)
+;; (swap! vibe/config assoc :tools false) ; llama.cpp / local OpenAI-compat
 ;; (swap! vibe/config update :system str "\nPrefer threading macros.\n")
