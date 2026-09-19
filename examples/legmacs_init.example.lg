@@ -30,8 +30,9 @@
 (km/bind-key! "C-c d" :insert-doubled)
 
 ;; Switch the whole palette (same as M-x load-theme). Shipped names:
-;; default, catppuccin-mocha, catppuccin-latte, gruvbox-dark, tokyo-night, nord.
-;; (theme/load-theme! :catppuccin-mocha)
+;; default, acme, catppuccin-mocha, catppuccin-latte, gruvbox-dark,
+;; tokyo-night, nord.
+;; (theme/load-theme! :acme)
 
 ;; Recolor a face; a bare [r g b] vector is :fg. Merges per face, so this
 ;; doesn't wipe the rest of the palette. (theme/reset-theme!) restores the

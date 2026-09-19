@@ -28,6 +28,9 @@
 ;;     https://github.com/enkia/tokyo-night-vscode-theme
 ;;   Nord                      © Sven Greb / Arctic Ice Studio
 ;;     https://github.com/nordtheme/nord
+;;   Acme                      Plan 9 / 9front named colors from
+;;     /sys/include/draw.h and acme.c iconinit. Acme itself has no
+;;     syntax highlighting; syntax faces stay inside that palette.
 
 (ns legmacs.theme)
 
@@ -352,3 +355,46 @@
   :region {:bg [59 66 82]}
   :search-match {:bg [67 76 94]}
   :search-current {:bg [94 129 172]}})
+
+(register-theme!
+ :acme
+ {;; Plan 9 Acme. Body is allocimagemix(DPaleyellow, DWhite) → #FFFFEA;
+  ;; tag (the mode line) is mix(DPalebluegreen, DWhite) → #EAFFFF.
+  ;; Selection is DDarkyellow; syntax uses the rest of draw.h so the
+  ;; frame stays in that palette even though Acme itself doesn't highlight.
+  :default {:fg [0 0 0] :bg [255 255 234]}
+  :gutter {:fg [153 153 76] :bg [255 255 234]}          ; DYellowgreen
+  :gutter-current {:fg [0 0 153] :bold true :bg [255 255 234]} ; DMedblue (modbutton)
+  :tilde {:fg [153 153 76] :bg [255 255 234]}
+  :message {:fg [0 102 0] :bg [255 255 234]}            ; button-3 look
+  :error {:fg [170 0 0] :bg [255 255 234]}              ; button-2 execute
+  :modeline {:fg [0 0 0] :bg [234 255 255]}             ; tag
+  :inactive-modeline {:fg [136 136 204] :bg [234 255 255]} ; DPurpleblue on tag
+  :comment {:fg [136 136 204] :italic true}             ; DPurpleblue
+  :string {:fg [0 102 0]}
+  :char {:fg [68 136 68]}                               ; DDarkgreen
+  :keyword {:fg [0 0 153]}                              ; DMedblue
+  :number {:fg [0 136 136]}                             ; DBluegreen
+  :keyword-literal {:fg [0 93 187]}                     ; DGreyblue
+  :type {:fg [0 0 85]}                                  ; DDarkblue
+  :function {:fg [0 0 187]}                             ; DPaleblue
+  :variable {:fg [0 0 0]}
+  :preproc {:fg [136 136 204]}
+  :paren-match {:fg [0 0 0] :bold true :bg [238 238 158]} ; DDarkyellow
+  :md-header {:fg [0 0 153] :bold true}
+  :md-hr {:fg [153 153 76]}
+  :md-quote {:fg [136 136 204] :italic true}
+  :md-list {:fg [0 136 136]}
+  :md-code {:fg [0 102 0]}
+  :md-bold {:bold true}
+  :md-italic {:italic true}
+  :md-link {:fg [0 0 187] :underline true}
+  :md-url {:fg [136 136 204]}
+  :help-header {:fg [0 0 153] :bold true}
+  :help-key {:fg [0 0 153] :bold true}
+  :help-command {:fg [0 102 0]}
+  :help-doc {:fg [136 136 204] :italic true}
+  :candidate-keys {:fg [153 153 76]}
+  :region {:bg [238 238 158]}                           ; body HIGH
+  :search-match {:bg [158 238 238]}                     ; DPalegreygreen (tag HIGH)
+  :search-current {:bg [136 204 136]}})                 ; DMedgreen

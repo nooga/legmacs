@@ -56,6 +56,13 @@
   [t spec]
   (merge (get t :default {}) spec))
 
+(defn- ui-face-spec
+  "The face map for a UI key. :candidate-sel falls back to :region so a
+   theme that paints selection doesn't have to declare both."
+  [t k]
+  (or (get t k)
+      (when (= k :candidate-sel) (get t :region))))
+
 (defn- compile-theme!
   "Rebuild the ANSI tables from a theme map. Named (not an fn in a cond)
    so let-go's AOT lowering doesn't hoist it."
@@ -73,12 +80,13 @@
                   {} t))
   (reset! ui-ansi
           (reduce (fn [m k]
-                    (if-let [spec (get t k)]
+                    (if-let [spec (ui-face-spec t k)]
                       (let [merged (with-default t spec)]
                         (assoc m k (str (compile-face-fg merged)
                                         (when-let [c (:bg merged)] (apply bg c)))))
                       m))
-                  {} [:default :gutter :gutter-current :tilde :message :error :candidate-keys]))
+                  {} [:default :gutter :gutter-current :tilde :message :error
+                      :candidate-keys :candidate-sel]))
   (when-let [face (get t :modeline)]
     (ml/set-modeline-theme! (select-keys face [:fg :bg]))))
 
@@ -92,6 +100,7 @@
 (defn search-match-bg [] (get @bg-color-for :search-match ""))
 (defn search-current-bg [] (get @bg-color-for :search-current ""))
 (defn candidate-keys-fg [] (ui :candidate-keys))
+(defn candidate-sel [] (ui :candidate-sel))
 
 
 (defn pad-right
@@ -335,7 +344,10 @@
 
 (defn- gutter-cell [line-no width is-current?]
   (let [color (if is-current? (ui :gutter-current) (ui :gutter))]
-    (str color (right-align (str line-no) (dec width)) reset \space)))
+    ;; The separator space stays inside `color`. `reset` drops to the
+    ;; terminal's own fg/bg, so an unstyled gap here is a black stripe
+    ;; on a light theme.
+    (str color (right-align (str line-no) (dec width)) \space reset)))
 
 ;; --- span compositor --------------------------------------------------
 ;;
@@ -641,23 +653,28 @@
                (if (seq doc) (inc (count doc)) 0))
         fill-part (apply str (repeat (max 0 fill) \space))
         keys-plain (if (seq keys) (str "  " keys) "")
-        doc-plain (if (seq doc) (str " " doc) "")]
+        doc-plain (if (seq doc) (str " " doc) "")
+        row-face (if selected? (ui :candidate-sel) (ui :default))]
+    ;; Don't reset until the end of the row: CSI 0m is the terminal's
+    ;; own colors, so a mid-row reset on a light theme is a black tail.
+    ;; Inverse video has the same problem -- it swaps the terminal's
+    ;; fg/bg, not the theme's -- so the selected row is a face, not 7m.
     (if selected?
-      (str (move-to 1 screen-row) inverse-on
+      (str (move-to 1 screen-row) row-face
            prefix name keys-plain fill-part
            (if (seq doc) (str italic-on doc-plain) "")
            reset)
-      (str (move-to 1 screen-row) reset (ui :default)
+      (str (move-to 1 screen-row) row-face
            prefix name
-           (if (seq keys) (str "  " (ui :candidate-keys) keys reset) "")
+           (if (seq keys) (str "  " (ui :candidate-keys) keys row-face) "")
            fill-part reset))))
 
 (defn- candidate-row [screen-row cand selected? cols]
   (if (or (seq (:keys cand)) (seq (:doc cand)))
     (annotated-candidate-row screen-row cand selected? cols)
-    (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)]
-      (str (move-to 1 screen-row) (ui :default)
-           (if selected? (str inverse-on text reset) (str text reset))))))
+    (let [text (pad-right (str (if selected? "> " "  ") (sanitize (:label cand))) cols)
+          face (if selected? (ui :candidate-sel) (ui :default))]
+      (str (move-to 1 screen-row) face text reset))))
 
 (defn- minibuffer-view [state screen-row0 mb-rows cols]
   (let [{:keys [prompt input note candidates selection]} (:minibuffer state)
@@ -708,12 +725,12 @@
         visible (take body-rows lines)
         more (- (count lines) (count visible))]
     (apply str
-           (move-to 1 1) bold-on (pad-right (str " " title) cols) reset
+           (move-to 1 1) (ui :default) bold-on (pad-right (str " " title) cols) reset
            (concat
-            (map-indexed (fn [i l] (str (move-to 1 (+ 2 i)) (pad-right (str "  " l) cols))) visible)
-            (map (fn [i] (str (move-to 1 (+ 2 (count visible) i)) (pad-right "" cols)))
+            (map-indexed (fn [i l] (str (move-to 1 (+ 2 i)) (ui :default) (pad-right (str "  " l) cols) reset)) visible)
+            (map (fn [i] (str (move-to 1 (+ 2 (count visible) i)) (ui :default) (pad-right "" cols) reset))
                  (range (- body-rows (count visible))))
-            [(str (move-to 1 rows) inverse-on
+            [(str (move-to 1 rows) (ui :candidate-sel)
                   (pad-right (if (pos? more) (format " %d more -- press any key" more) " press any key to continue") cols)
                   reset)]))))
 

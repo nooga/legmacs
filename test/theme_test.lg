@@ -101,7 +101,7 @@
   (testing "the MIT ports plus :default show up in the catalog"
     (let [names (set (map name (theme/theme-names)))]
       (is (= "default" (first (map name (theme/theme-names)))))
-      (doseq [n ["default" "catppuccin-mocha" "catppuccin-latte"
+      (doseq [n ["default" "acme" "catppuccin-mocha" "catppuccin-latte"
                  "gruvbox-dark" "tokyo-night" "nord"]]
         (is (contains? names n))))))
 
@@ -116,6 +116,23 @@
         (let [out (r/frame s 40 12)]
           (is (string/includes? out "48;2;239;241;245"))
           (is (string/includes? out "38;2;76;79;105"))))
+      (finally (theme/reset-theme!)))))
+
+(deftest acme-theme-paints-plan9-yellow
+  (testing "acme covers the terminal with paleyellow/white and a cyan tag"
+    (theme/reset-theme!)
+    (try
+      (is (some? (theme/load-theme! :acme)))
+      (is (= :acme (theme/current-theme)))
+      (is (= [255 255 234] (:bg (get @theme/theme :default))))
+      (is (= [0 0 0] (:fg (get @theme/theme :default))))
+      (is (= [234 255 255] (:bg (get @theme/theme :modeline))))
+      (is (= [238 238 158] (:bg (get @theme/theme :region))))
+      (let [s (buf/ensure-visible (buf/new-state nil ["hello"]) 10 40)
+            out (r/frame s 40 12)]
+        (is (string/includes? out "48;2;255;255;234"))
+        (is (string/includes? out "38;2;0;0;0"))
+        (is (string/includes? out "48;2;234;255;255")))
       (finally (theme/reset-theme!)))))
 
 (deftest register-theme-is-loadable

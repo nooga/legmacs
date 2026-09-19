@@ -4,7 +4,8 @@
             [legmacs.buffer :as buf]
             [legmacs.modes :as modes]
             [legmacs.render :as r]
-            [legmacs.buffers :as bufs]))
+            [legmacs.buffers :as bufs]
+            [legmacs.theme :as theme]))
 
 (deftest pad-right-behavior
   (testing "pads short strings, truncates long ones, leaves exact-width alone"
@@ -113,7 +114,7 @@
       (is (string/includes? out "C-x C-s"))
       (is (string/includes? out "Save the current buffer to its file."))
       (is (string/includes? out (r/candidate-keys-fg)))
-      (is (string/includes? out r/inverse-on))
+      (is (string/includes? out (r/candidate-sel)))
       (is (string/includes? out "forward-char"))
       (is (string/includes? out "C-f"))
       (is (not (string/includes? out "Move point right.")))))
@@ -141,14 +142,14 @@
       (is (string/includes? out "…"))
       (is (not (string/includes? out doc)))))
 
-  (testing "a plain {:label} candidate (swiper, files) still inverse-highlights the whole row"
+  (testing "a plain {:label} candidate (swiper, files) highlights the whole row"
     (let [s (assoc (buf/new-state nil ["x"])
                    :minibuffer {:prompt "p: " :input "" :cursor-col 0 :selection 0
                                 :candidates [{:label "plain-file.lg" :value "plain-file.lg"}]})
           s (buf/ensure-visible s 10 40)
           out (r/frame s 40 12)]
       (is (string/includes? out "plain-file.lg"))
-      (is (string/includes? out r/inverse-on)))))
+      (is (string/includes? out (r/candidate-sel))))))
 
 (deftest multi-line-message-expands-without-overflowing
   (testing "a message with newlines becomes several padded rows, not a raw newline in the frame"
@@ -433,3 +434,44 @@
           s (r/scroll-to-fit s {:text-rows 5 :text-cols 20 :mb-rows 1})]
       ;; char 30 sits at display column 120; the window is 20 wide
       (is (= 101 (:scroll-col s))))))
+
+(deftest light-theme-ui-keeps-editor-background
+  (testing "gutter, M-x, and swiper don't drop to the terminal's colors"
+    (theme/reset-theme!)
+    (try
+      (theme/load-theme! :acme)
+      (let [default-fg (get @r/fg-color-for :default)
+            default-bg "48;2;255;255;234"
+            s (buf/ensure-visible (buf/new-state nil ["hello"]) 10 40)
+            out (r/frame s 40 12)]
+        (is (string/includes? out default-bg))
+        ;; gutter used to reset before its trailing space, leaving a
+        ;; terminal-colored stripe between the number and the text.
+        (is (not (string/includes? out (str r/reset " " default-fg)))))
+      (let [s (-> (buf/new-state nil ["hello"])
+                  (assoc :minibuffer {:prompt "M-x " :input "" :cursor-col 0 :selection 0
+                                      :candidates [{:label "save-buffer" :value "save-buffer"
+                                                    :keys "C-x C-s"
+                                                    :doc "Save the current buffer."}
+                                                   {:label "forward-char" :value "forward-char"
+                                                    :keys "C-f"
+                                                    :doc "Move point right."}]})
+                  (buf/ensure-visible 10 80))
+            out (r/frame s 80 16)]
+        (is (string/includes? out "48;2;255;255;234"))
+        (is (string/includes? out (r/candidate-sel)))
+        (is (not (string/includes? out r/inverse-on)))
+        ;; unselected keys used to reset before the row fill, so the
+        ;; rest of the line was the terminal's background.
+        (is (not (string/includes? out (str "C-f" r/reset)))))
+      (let [s (-> (buf/new-state nil ["hello world"])
+                  (assoc :minibuffer {:prompt "swiper: " :input "he" :cursor-col 2
+                                      :list-kind :swiper :selection 0
+                                      :candidates [{:row 0 :col 0 :end 5 :label "1: hello"}
+                                                   {:row 0 :col 0 :end 2 :label "1: he"}]})
+                  (buf/ensure-visible 10 40))
+            out (r/frame s 40 16)]
+        (is (string/includes? out "48;2;255;255;234"))
+        (is (string/includes? out (r/candidate-sel)))
+        (is (not (string/includes? out r/inverse-on))))
+      (finally (theme/reset-theme!)))))
