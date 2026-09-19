@@ -263,13 +263,15 @@ whatever) are caught and shown in the echo area rather than crashing the
 editor.
 
 `C-c C-e` puts the current namespace back when it's done. It has to:
-`load-string`ing a buffer that opens with `(ns foo)` -- which every real
+evaluating a buffer that opens with `(ns foo)` -- which every real
 `.lg` file does -- relocates the running namespace permanently, and since
 that namespace *is* the editor's own, one `C-c C-e` on an ordinary file
 would otherwise leave `buf/`, `km/`, `dispatch/` and `vibe` unresolvable
 for the rest of the session. `C-x C-e` and `C-j` are deliberately left
 alone, as is the `*repl*` buffer: an `(in-ns 'foo)` you typed and evaluated
-on purpose should still move you.
+on purpose should still move you. A buffer with no ns form (*scratch*)
+evals in the editor ns, so lg-isms like `(now)` resolve the same as
+`C-x C-e`.
 
 `C-c C-z` opens (or switches to) `*repl*` -- a dedicated, persistent REPL
 buffer rather than a transcript you build by hand with `C-j`. It's plain
@@ -345,6 +347,15 @@ also why a bare `(vibe "...")` from the REPL still works, just without a
 file to splice requires into. JVM-Clojure prefixes in the reply
 (`clojure.string/join`) are rewritten to the canonical names before
 anything is inserted.
+
+The catalog also includes the live editor's scripting surface
+(`legmacs.keymap`, `legmacs.modeline`, `legmacs.theme`, `legmacs.modes`,
+`legmacs.buffer`, `legmacs.minibuffer`, `legmacs.modes.prog`) — the same
+APIs `legmacs-init.lg` uses. A `(vibe "clock on the modeline")` can
+therefore emit `register-modeline-segment!` / `bind-key!` / `set-theme!`
+code that fits the file. Those calls take effect when you evaluate them
+(`C-x C-e` / `C-c C-e`), the same as any other init form; vibe only
+splices the source.
 
 Setup is `~/.config/legmacs/vibe.edn` (or `$LEGMACS_CONFIG_DIR/vibe.edn` --
 the same variable `bin/legmacs` already honours for `legmacs_init.lg`):
@@ -701,6 +712,12 @@ privileged built-in path here either.
 (ml/remove-modeline-segment! :pending-keys)
 (ml/set-modeline-order! [:mode :buffer :position])
 ```
+
+A segment fn that throws, or that returns a non-string `:text` (the usual
+`(string/trim (os/sh ...))` mistake — `os/sh` returns a map), is shown as a
+red `id!` badge instead of taking down the frame. `:text` must be a string;
+for a live clock, `(.Format (now) "15:04")` is cheap enough to run every
+paint, `os/sh` is not.
 
 A minor mode's `:status`/`:status-right` lighters (see keycast above) still
 work unchanged: they're aggregated into the built-in `:modes-status`/

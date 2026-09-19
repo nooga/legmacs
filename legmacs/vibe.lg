@@ -68,6 +68,8 @@
        "edit the ns form; missing requires are added for you.\n"
        "- json/read-json takes an optional {:keywords? true}. json/write-json "
        "accepts keyword or string map keys.\n"
+       "- os/sh returns {:exit n :out s :err s}, not a string. Use "
+       "(:out (os/sh \"date\" \"+%H:%M\")), then string/trim that.\n"
        "- (throw \"msg\") is a plain string. Catch with (or (ex-message e) (str e)).\n"
        "- Do not use finally for cleanup that must run on throw; reify the outcome "
        "then clean up.\n"
@@ -75,6 +77,32 @@
        "defined above it.\n"
        "- count, subs, and string/index-of on a string are O(n) (rune-indexed). "
        "Do not call them per character in a scan; convert to a char vector once.\n\n"
+       "This process is the live editor. When the request is about this editor "
+       "(keys, modeline, theme, modes, commands), use the Editor scripting catalog "
+       "and these shapes:\n"
+       "- Commands: (defcommand name \"doc\" [state] ...) then "
+       "(km/bind-key! \"C-c x\" :name). A command is (fn [state] -> state); "
+       "return new state, do not mutate a buffer atom.\n"
+       "- Modeline: (legmacs.modeline/register-modeline-segment! :id :right "
+       "(fn [state] {:text \"...\" :fg [r g b] :bg [r g b]})). Built-in ids: "
+       ":buffer, :mode, :position, :pending-keys, :async-jobs, :modes-status, "
+       ":modes-status-right. nil or \"\" omits the segment that frame. "
+       "The fn runs every frame: it must be cheap, must not throw, must not "
+       "do I/O (no os/sh, http), and :text must be a string. For a clock, "
+       "(.Format (now) \"15:04\"). now is let-go.core/now, auto-referred; "
+       "do not require it. Do not add an (ns ...) form to a file that does "
+       "not already have one.\n"
+       "- Theme: theme/set-theme! merges faces; theme/load-theme! replaces. "
+       "The :modeline face is the bar's default colors; a segment's :fg/:bg "
+       "override per block.\n"
+       "- Modes: register-mode! / register-minor-mode!. A :status / :status-right "
+       "lighter on a minor mode is the other way to put text on the bar.\n"
+       "- Prefer an existing :as alias; otherwise fully-qualify "
+       "(legmacs.modeline/register-modeline-segment!). Never (require 'legmacs.main). "
+       "Session-lasting config belongs in a legmacs-init ns at "
+       "~/.config/legmacs/legmacs_init.lg, not a random project file.\n"
+       "- Do not return a capturing fn literal from if/when/cond (AOT hoist); "
+       "name the closure.\n\n"
        "You get a source file with the marker " marker " at exactly one spot, "
        "and a request. Reply with the code that should replace that marker.\n\n"
        "Rules:\n"
@@ -108,6 +136,13 @@
   ["string" "json" "http" "os" "io" "term" "async" "set" "walk" "edn"
    "pprint" "test" "math" "net" "hash" "graph" "transit" "bencode"
    "storage" "unix" "syscall" "pods" "xxh3"])
+
+(def editor-libs
+  "Editor namespaces we always offer in the catalog when loaded.
+   Curated: the scripting surface (keys, modeline, theme, modes, buffer
+   primitives, minibuffer, language-pack hook), not every legmacs.* ns."
+  ["legmacs.keymap" "legmacs.modeline" "legmacs.theme" "legmacs.modes"
+   "legmacs.buffer" "legmacs.minibuffer" "legmacs.modes.prog"])
 
 (def skip-catalog-ns
   #{"user" "core" "clojure.core" "gogen" "resolver" "rt" "ir" "ir.data"
@@ -577,6 +612,9 @@
 (defn- available-stdlib []
   (filter (fn [nm] (find-ns (symbol nm))) stdlib-libs))
 
+(defn- available-editor []
+  (filter (fn [nm] (find-ns (symbol nm))) editor-libs))
+
 (defn- parse-libspec [spec]
   (try
     (cond
@@ -673,6 +711,7 @@
             (map (fn [lib]
                    (let [alias (some (fn [[a l]] (when (= l lib) a)) aliases)
                          extra (when (and (not (contains? (set stdlib-libs) lib))
+                                          (not (contains? (set editor-libs) lib))
                                           (find-ns (symbol lib)))
                                  (str ": " (format-var-names (symbol lib))))]
                      (str "  " lib
@@ -682,12 +721,17 @@
            "\n"))))
 
 (defn namespace-catalog
-  "Live stdlib (and this file's requires) for the user message."
+  "Live stdlib, editor scripting surface, and this file's requires."
   ([] (namespace-catalog nil))
   ([text]
    (str "Loaded stdlib (canonical names — never clojure.string, always string/):\n"
         (string/join "\n" (map (fn [nm] (str "  " (format-ns-line nm)))
                                (available-stdlib)))
+        "\n"
+        "Editor scripting (this process is the live editor; C-x C-e applies "
+        "registry mutations):\n"
+        (string/join "\n" (map (fn [nm] (str "  " (format-ns-line nm)))
+                               (available-editor)))
         "\n"
         (when (seq text)
           (format-file-requires text)))))

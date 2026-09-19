@@ -17,6 +17,10 @@
 ;;                                          with its own colors is a "block"
 ;;                                          that pops out of the bar
 ;;
+;; :text must be a string. A throw, or a non-string :text (e.g. the map
+;; os/sh returns), becomes a red "id!" badge instead of escaping into
+;; render and taking down the frame.
+;;
 ;; Segments render left-to-right in registration order unless
 ;; set-modeline-order! has changed it, each side joined by `separator`.
 
@@ -82,14 +86,40 @@
   (cond
     (nil? s) nil
     (string? s) (when (seq s) {:text s})
-    (map? s) (when (seq (:text s)) s)
+    (map? s) (when (and (string? (:text s)) (seq (:text s))) s)
     :else nil))
+
+(defn- seg-label [id]
+  (if (keyword? id) (name id) (str id)))
+
+(defn- broken-seg
+  "A visible stand-in when a segment fn throws or returns a non-string
+   :text, so a bad user/vibe segment cannot take down the frame."
+  [id]
+  {:text (str " " (seg-label id) "! ")
+   :fg [245 246 250]
+   :bg [204 90 90]})
+
+(defn- call-seg
+  "Run a segment fn. Throws and illegal :text become a broken-seg badge
+   rather than escaping into render. nil and \"\" still omit the segment."
+  [id f state]
+  (let [outcome (try {:ok (f state)} (catch e {:err e}))]
+    (if (contains? outcome :err)
+      (broken-seg id)
+      (let [v (:ok outcome)]
+        (cond
+          (nil? v) nil
+          (and (string? v) (not (seq v))) nil
+          (and (map? v) (or (nil? (:text v)) (and (string? (:text v))
+                                                  (not (seq (:text v)))))) nil
+          :else (or (normalize-seg v) (broken-seg id)))))))
 
 (defn- ordered [side state]
   (->> @segments
        (filter (fn [[_ seg]] (= side (:side seg))))
        (sort-by (fn [[_ seg]] (:order seg)))
-       (keep (fn [[_ seg]] (normalize-seg ((:fn seg) state))))))
+       (keep (fn [[id seg]] (call-seg id (:fn seg) state)))))
 
 (defn left-segments
   "Every :left segment visible this frame, as {:text :fg :bg} maps, in
@@ -129,11 +159,20 @@
      :fg [30 36 30]
      :bg [152 195 121]}))
 
+(defn- call-lighter
+  "Run a mode :status / :status-right fn. A throw omits that lighter
+   this frame rather than killing the mode line."
+  [f state]
+  (let [outcome (try {:ok (f state)} (catch e {:err e}))]
+    (when-not (contains? outcome :err)
+      (let [s (:ok outcome)]
+        (when (and (string? s) (seq s)) s)))))
+
 (defn- mode-lighters [state accessor]
   (->> (modes/active-modes state)
        (keep (fn [mode-kw]
                (when-let [f (accessor mode-kw)]
-                 (let [s (f state)] (when (seq s) s)))))
+                 (call-lighter f state))))
        (string/join " ")))
 
 (defn- modes-status-segment [state] (mode-lighters state modes/mode-status))

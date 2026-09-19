@@ -1,16 +1,17 @@
 ;; legmacs.modes.letgo — a small REPL built into the editor: evaluate
 ;; let-go code straight out of the buffer, live, in the same process.
 ;;
-;; This works because let-go's `eval`/`read-string`/`load-string` (see
-;; pkg/compiler/eval.go) compile and run an already-read form *in whatever
-;; namespace is current* -- and that's legmacs.main the whole time legmacs
-;; is running, so code typed here sees exactly the aliases main.lg set up:
-;; `buf/`, `keys/`, `km/`, `dispatch/`, `render/`, plus all of clojure.core
-;; unqualified. It's not a sandboxed toy evaluator -- it's the running
-;; editor's own namespace.
+;; This works because let-go's `eval`/`read-string` compile and run an
+;; already-read form *in whatever namespace is current* -- and that's
+;; legmacs.main the whole time legmacs is running, so code typed here sees
+;; exactly the aliases main.lg set up: `buf/`, `keys/`, `km/`, `dispatch/`,
+;; `render/`, plus clojure.core and let-go.core (now, spy, …) unqualified.
+;; It's not a sandboxed toy evaluator -- it's the running editor's own
+;; namespace. C-c C-e / *repl* eval form-by-form the same way (let-go's
+;; load-string compiles in clojure.core, which does not refer let-go.core).
 ;;
 ;; Which is also why `preserving-ns` below exists: that invariant isn't
-;; free. `load-string`ing a buffer that opens with `(ns foo)` -- every real
+;; free. Evaluating a buffer that opens with `(ns foo)` -- every real
 ;; .lg file does -- relocates the current namespace permanently, and one
 ;; C-c C-e would otherwise cost you every alias above for the rest of the
 ;; session. eval-buffer always restores the editor ns after the load.
@@ -308,12 +309,20 @@
   [form]
   (capturing-out (fn [] (eval form))))
 
+(defn- eval-each-form
+  "eval every form in `forms` in the current *ns*, returning the last
+   result. let-go's load-string compiles in clojure.core, which does not
+   refer let-go.core, so lg-isms like `now` fail and defs intern into
+   core -- that is the wrong home for *scratch* / C-c C-e / *repl*."
+  [forms]
+  (reduce (fn [_ form] (eval form)) nil forms))
+
 (defn load-in-editor
-  "load-string `s` with *out*/*err* captured (see capturing-out). The
-   *repl* buffer uses this so a typed (go (println ...)) cannot clobber
-   the frame either."
+  "Read `s` and eval each form in the current *ns*, with *out*/*err*
+   captured (see capturing-out). The *repl* buffer uses this so a typed
+   (go (println ...)) cannot clobber the frame either."
   [s]
-  (capturing-out (fn [] (load-string s))))
+  (capturing-out (fn [] (eval-each-form (read-all-string s)))))
 
 (defn- last-sexp-before-point [state]
   (let [text (buf/text-before-cursor state)]
@@ -390,7 +399,7 @@
       :error (assoc state :message (str "Read error: " form))
       (try
         (f state form (eval-form-in-state state form))
-        (catch e (assoc state :message (str "Eval error: " (ex-message e))))))))
+        (catch e (assoc state :message (str "Eval error: " (or (ex-message e) (str e)))))))))
 
 (defcommand eval-last-sexp
   "Evaluate the s-expression immediately before point; show the result in
@@ -408,12 +417,13 @@
                      (buf/insert-string state (str "\n" (format-result result))))))
 
 (defcommand eval-buffer
-  "Evaluate the entire buffer, top to bottom, as one `load-string`."
+  "Evaluate the entire buffer, top to bottom, form by form in the current
+   namespace (or the buffer's ns form, restored afterwards)."
   [state]
   (try
     (let [result (preserving-ns (fn [] (load-in-editor (buf/buffer-text state))))]
       (assoc state :message (str "=> " (format-result result))))
-    (catch e (assoc state :message (str "Eval error: " (ex-message e))))))
+    (catch e (assoc state :message (str "Eval error: " (or (ex-message e) (str e)))))))
 
 ;; --- auto-indent --------------------------------------------------------
 ;;
