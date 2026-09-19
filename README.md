@@ -46,7 +46,7 @@ started:
 - swiper-style live incremental search
 - vertico/ivy-style fuzzy completion for commands, files, and buffers
 - CRUTCH, a bundled vi-style modal minor mode (yes, modal editing, if you want it)
-- a themeable syntax/UI palette (`M-x load-theme`: Catppuccin, Gruvbox, Tokyo Night, Nord) and a segment-based mode line
+- a themeable syntax/UI palette (`M-x load-theme`: Acme, Catppuccin, Gruvbox, Tokyo Night, Nord) and a segment-based mode line
 
 All of it is built on the same public API, so any feature is also a worked
 example for the one you want to write.

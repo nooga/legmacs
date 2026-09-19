@@ -614,6 +614,7 @@ palette. The shipped names:
 | Theme | Notes |
 |---|---|
 | `default` | The original hardcoded colors. Unstyled text uses the terminal's own fg/bg. |
+| `acme` | Plan 9 Acme: pale yellow body, cyan tag, black text. Paints its own editor bg. |
 | `catppuccin-mocha` | Catppuccin Mocha (MIT, © Catppuccin Org). |
 | `catppuccin-latte` | Catppuccin Latte, the light flavor. Paints its own editor bg. |
 | `gruvbox-dark` | morhetz Gruvbox dark / medium contrast (MIT/X11). |
@@ -639,8 +640,8 @@ palette was data.
 (theme/set-face! :comment {:italic true})   ; keeps the :fg from above
 
 ;; add your own, then M-x load-theme sees it
-(theme/register-theme! :acme {:default {:fg [0 0 0] :bg [255 255 234]}
-                              :string {:fg [32 100 32]}})
+(theme/register-theme! :paper {:default {:fg [30 30 30] :bg [248 244 232]}
+                               :string {:fg [32 100 32]}})
 
 ;; the shipped default, matching the colors that used to be hardcoded
 (theme/reset-theme!)
@@ -652,7 +653,9 @@ face; `load-theme!` replaces. The faces highlighters emit (`:string`,
 `:keyword`, `:md-header`, `:help-key`, `:region`, ...) share a keyword with
 the span style. UI-only faces (`:default`, `:gutter`, `:gutter-current`,
 `:tilde`, `:message`, `:error`, `:modeline`, `:inactive-modeline`,
-`:candidate-keys`) are looked up by render directly. Unknown keys you `set-theme!` are stored and
+`:candidate-keys`, `:candidate-sel`) are looked up by render directly.
+`:candidate-sel` styles the highlighted M-x / swiper row and falls back
+to `:region` if a theme doesn't set it. Unknown keys you `set-theme!` are stored and
 compiled, so a mode you add can introduce a new style without a render
 change.
 
