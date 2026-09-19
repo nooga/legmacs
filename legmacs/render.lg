@@ -114,7 +114,9 @@
 
 (defn sanitize
   "Replace control characters in `s` with caret notation (^[ for ESC, ^M
-   for CR, ^? for DEL). Everything headed for the echo area goes through
+   for CR, ^? for DEL). Tab is indent, not a control glyph -- it becomes
+   four spaces so a CompileError's \"\\tcaused by\" chain is readable
+   instead of `^I`. Everything headed for the echo area goes through
    this: a message can carry control bytes from sources the key decoder
    never sees (an eval result containing (char 27), a swiper label from a
    file with control characters) and writing them raw would let the
@@ -123,6 +125,7 @@
   (apply str (map (fn [ch]
                     (let [c (int ch)]
                       (cond
+                        (= c 9) "    "
                         (< c 32) (str "^" (char (+ c 64)))
                         (= c 127) "^?"
                         :else (str ch))))

@@ -168,7 +168,11 @@
 
   (testing "explicit newlines still split into rows -- only the bytes inside
             each line are escaped"
-    (is (= ["a" "^[x"] (vec (r/message-lines (str "a\n" (char 27) "x") 40))))))
+    (is (= ["a" "^[x"] (vec (r/message-lines (str "a\n" (char 27) "x") 40)))))
+
+  (testing "a tab is indent, not caret-I -- CompileError chains use \\tcaused by"
+    (is (= ["    caused by boom"] (vec (r/message-lines (str (char 9) "caused by boom") 40))))
+    (is (not (string/includes? (r/sanitize (str (char 9) "caused by")) "^I")))))
 
 (defn- fit [s cols rows] (r/scroll-to-fit s (r/dims s cols rows)))
 

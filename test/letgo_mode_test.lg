@@ -75,10 +75,9 @@
 
 (deftest eval-last-sexp-sees-defs-after-an-ns-form
   ;; Regression: C-x C-e / C-j evaluate one already-read form via `eval`,
-  ;; while C-c C-e `load-string`s the whole buffer. load-string compiles
-  ;; and runs each form in order, so `(ns foo)` is in force for later
-  ;; forms; a C-x C-e of `(x)` after separately evaluating `(ns foo)` and
-  ;; `(defn x [] 1)` has to land in the same namespace or it reports
+  ;; while C-c C-e evals every form in order. `(ns foo)` is in force for
+  ;; later forms; a C-x C-e of `(x)` after separately evaluating `(ns foo)`
+  ;; and `(defn x [] 1)` has to land in the same namespace or it reports
   ;; "Can't resolve x in this context" even though eval-buffer of the
   ;; same three lines returns 1.
   (testing "sequential C-x C-e of ns, defn, then a call finds the defn"
@@ -132,7 +131,7 @@
       (is (= "=> 1" (:message s))))))
 
 (deftest eval-last-sexp-after-eval-buffer-uses-the-buffer-ns
-  ;; C-c C-e load-string's the buffer (defs land in foo) then preserving-ns
+  ;; C-c C-e evals the buffer (defs land in foo) then preserving-ns
   ;; puts *ns* back to the editor. C-x C-e of @a used to compile in the
   ;; editor ns and report "Can't resolve a". Eval last-sexp in the
   ;; buffer's (ns ...) instead, like CIDER.
@@ -154,6 +153,27 @@
           s (lg-mode/eval-buffer (buf/new-state nil lines))
           s (eval-last-at-row s 2)]
       (is (= "=> 42" (:message s))))))
+
+(deftest eval-buffer-scratch-resolves-lg-isms
+  ;; let-go's load-string compiles in clojure.core, which does not refer
+  ;; let-go.core -- so `(now)` in *scratch* (no ns form) used to fail
+  ;; "Can't resolve now" on C-c C-e. Form-by-form eval in the current
+  ;; *ns* is what C-x C-e already did.
+  (testing "C-c C-e of a no-ns-form buffer can call now"
+    (let [s (lg-mode/eval-buffer
+             (buf/new-state nil ["(.Format (now) \"15:04\")"]))]
+      (is (string/starts-with? (:message s) "=> "))
+      (is (not (string/includes? (:message s) "Can't resolve")))))
+
+  (testing "a defn using now interned in the current ns, not core"
+    (let [s (lg-mode/eval-buffer
+             (buf/new-state nil ["(defn letgo-mode-test-clock [state]"
+                                 "  {:text (.Format (now) \"15:04\")})"
+                                 "(letgo-mode-test-clock nil)"]))]
+      (is (string/starts-with? (:message s) "=> "))
+      (is (string/includes? (:message s) ":text"))
+      (is (fn? @(resolve 'letgo-mode-test-clock)))
+      (is (nil? (ns-resolve (find-ns 'core) 'letgo-mode-test-clock))))))
 
 (deftest let-go-mode-is-registered-for-dot-lg-files
   (testing ".lg is in the auto-mode-alist, pointing at :let-go"

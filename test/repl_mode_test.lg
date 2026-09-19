@@ -54,7 +54,8 @@
                 (type-text "(* x x)") (d/dispatch "RET")
                 (d/dispatch ")") (d/dispatch "RET")
                 (type-text "(f 5)") (d/dispatch "RET"))]
-      (is (string/includes? (string/join "\n" (:lines s)) "#'core/f"))
+      (is (string/includes? (string/join "\n" (:lines s))
+                           (str "#'" (ns-name *ns*) "/f")))
       (is (= "25" (nth (:lines s) (- (count (:lines s)) 3)))))))
 
 (deftest eval-errors-print-in-the-transcript-not-just-the-echo-area

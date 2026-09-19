@@ -8,9 +8,10 @@
 ;; It's plain let-go-mode (major mode :let-go) for content -- highlighting,
 ;; auto-pairing, paren-matching, auto-indent are exactly what a normal .lg
 ;; buffer gets, for free -- plus one minor mode, :repl, that shadows RET:
-;;   - a complete top-level form -> evaluate it (load-string, so a form
-;;     spanning several typed expressions works the same as eval-buffer),
-;;     print the result, and open a fresh prompt right after it
+;;   - a complete top-level form -> evaluate it (same as eval-buffer:
+;;     each form in the current *ns*, so a multi-expression paste works
+;;     and lg-isms like `now` resolve), print the result, and open a
+;;     fresh prompt right after it
 ;;   - an incomplete one (an open bracket -- ls/depth-at > 0) -> insert a
 ;;     newline and auto-indent instead, exactly like ordinary let-go-mode,
 ;;     so a multi-line form can keep being typed

@@ -80,3 +80,27 @@
       (is (= before (count (ml/left-segments state))))
       (ml/remove-modeline-segment! :nil-seg)
       (ml/remove-modeline-segment! :blank-seg))))
+
+(deftest a-throwing-segment-does-not-kill-the-bar
+  (testing "the os/sh-into-trim mistake becomes a badge instead of crashing render"
+    (let [state (buf/new-state "a.txt" [""])
+          left-before (ml/left-segments state)]
+      (ml/register-modeline-segment! :clock :right
+        (fn [_] (string/trim {:exit 0 :out "12:34\n" :err ""})))
+      (try
+        (let [right (ml/right-segments state)
+              texts (map :text right)]
+          (is (some (fn [t] (string/includes? t "clock!")) texts))
+          (is (= left-before (ml/left-segments state))))
+        (finally
+          (ml/remove-modeline-segment! :clock)))))
+
+  (testing "a non-string :text is the same class of bug, same badge"
+    (let [state (buf/new-state "a.txt" [""])]
+      (ml/register-modeline-segment! :clock :right
+        (fn [_] {:text {:exit 0 :out "12:34\n"}}))
+      (try
+        (is (some (fn [t] (string/includes? t "clock!"))
+                  (map :text (ml/right-segments state))))
+        (finally
+          (ml/remove-modeline-segment! :clock))))))

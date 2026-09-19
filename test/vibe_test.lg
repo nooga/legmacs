@@ -2,6 +2,14 @@
   (:require [test :refer :all]
             [string]
             [legmacs.buffer :as buf]
+            ;; Loaded so the catalog's editor-libs block is populated the
+            ;; same way a real session sees them (vibe itself only requires
+            ;; buffer/keymap; modeline/theme/modes live elsewhere).
+            [legmacs.modeline]
+            [legmacs.theme]
+            [legmacs.modes]
+            [legmacs.minibuffer]
+            [legmacs.modes.prog]
             ;; :refer too, mirroring main.lg: eval-vibe-form `eval`s the
             ;; form in whatever namespace is current, so `vibe` has to
             ;; resolve here for the error-path test to reach the real fn.
@@ -226,7 +234,15 @@
     (is (string/includes? p "string/join"))
     (is (string/includes? p "clojure.string"))
     (is (string/includes? p "docstring"))
-    (is (string/includes? p "ns-publics"))))
+    (is (string/includes? p "ns-publics"))
+    (is (string/includes? p "this editor"))
+    (is (string/includes? p "defcommand"))
+    (is (string/includes? p "register-modeline-segment!"))
+    (is (string/includes? p "os/sh returns"))
+    (is (string/includes? p "every frame"))
+    (is (string/includes? p "(.Format (now)"))
+    (is (string/includes? p "let-go.core/now"))
+    (is (string/includes? p "Do not add an (ns"))))
 
 (deftest namespace-catalog-lists-live-stdlib
   (let [cat (vibe/namespace-catalog)]
@@ -235,10 +251,29 @@
     (is (string/includes? cat "json:"))
     (is (string/includes? cat "read-json"))))
 
+(deftest namespace-catalog-lists-editor-scripting
+  (let [cat (vibe/namespace-catalog)]
+    (is (string/includes? cat "Editor scripting"))
+    (is (string/includes? cat "legmacs.modeline:"))
+    (is (string/includes? cat "register-modeline-segment!"))
+    (is (string/includes? cat "legmacs.keymap:"))
+    (is (string/includes? cat "string:"))))
+
 (deftest user-message-includes-the-namespace-catalog
   (let [msg (vibe/user-message "make it go" nil)]
     (is (string/includes? msg "----- namespaces -----"))
     (is (string/includes? msg "string:"))))
+
+(deftest user-message-scratch-carries-editor-catalog
+  (testing "no ns form still includes the editor block, so a top-level vibe in *scratch* can emit register-modeline-segment!"
+    (let [msg (vibe/user-message "clock on the modeline"
+                                 {:text vibe/marker
+                                  :filename "*scratch*"
+                                  :column 0})]
+      (is (string/includes? msg "*scratch*"))
+      (is (not (string/includes? msg "This file's ns form requires:")))
+      (is (string/includes? msg "Editor scripting"))
+      (is (string/includes? msg "legmacs.modeline:")))))
 
 (deftest user-message-lists-the-file-requires
   (let [text (str "(ns foo\n  (:require [string]\n            [json]))\n" vibe/marker)
