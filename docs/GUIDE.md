@@ -332,11 +332,19 @@ so one `C-_` puts your prompt back.
 
 What makes the answers usable is the context. `vibe-replace` sends the
 whole buffer with the call site swapped for a `<<<VIBE:HERE>>>` marker,
-plus the column that marker starts at, so the model writes code shaped to
-fit that exact spot rather than a generic answer to the prompt. `vibe`
-itself can't see any of that (it's just a function), so `vibe-replace`
-parks the call site in an atom for the duration of the eval -- which is
-also why a bare `(vibe "...")` from the REPL still works, just contextless.
+plus the column that marker starts at, plus a live catalog of let-go's
+canonical namespaces (`string/`, `json/`, `os/`, never `clojure.string/`)
+and the file's existing `:require` aliases. The model can also call
+`list-namespaces`, `ns-publics`, and `var-doc` against the running VM
+before it writes code. The splice is one undo step: the generated
+forms replace the call, and any namespace those forms use that the file
+does not already require is inserted into the `ns` form. `vibe` itself
+can't see the buffer (it's just a function), so `vibe-replace` parks the
+call site in `*vibe-context*` for the duration of the eval -- which is
+also why a bare `(vibe "...")` from the REPL still works, just without a
+file to splice requires into. JVM-Clojure prefixes in the reply
+(`clojure.string/join`) are rewritten to the canonical names before
+anything is inserted.
 
 Setup is `~/.config/legmacs/vibe.edn` (or `$LEGMACS_CONFIG_DIR/vibe.edn` --
 the same variable `bin/legmacs` already honours for `legmacs_init.lg`):
@@ -354,9 +362,13 @@ rather than being read key by key, so everything else works from there too:
 | `:key` | API key. Falls back to the provider's env var (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) if absent. |
 | `:model` | Model id. Defaults to the provider's (`gpt-5.6-luna` / `claude-sonnet-5`). |
 | `:provider` | `:openai` (default) or `:anthropic`. |
-| `:url` | Endpoint. Point it at llama.cpp/ollama/openrouter/groq and keep `:provider :openai`, since they speak the same shape. |
+| `:url` | Endpoint. Default is OpenAI `/v1/responses`. Point it at llama.cpp/ollama/openrouter/groq (`.../v1/chat/completions`) and the older chat-completions shape is inferred. Or set `:api` explicitly. |
+| `:api` | `:responses` (default) or `:chat-completions`. Responses is the current OpenAI API and the one that can combine function tools with reasoning on gpt-5.6-*. |
 | `:max-tokens` | Default 8192. Reasoning models spend this budget on reasoning *and* output, so a small value shows up as an empty reply, not a truncated one. |
 | `:system` | The instructions the model gets. Replace to change house style. |
+| `:tools` | `true` (default): the model may call `list-namespaces` / `ns-publics` / `var-doc`. Set `false` for local endpoints that do not speak tool calls. A 400 on a tools turn retries once without them. |
+| `:max-tool-rounds` | Cap on tool-call turns before the model has to answer. Default 4. |
+| `:reasoning-effort` | How hard the model thinks: `none`, `low`, `medium` (default), `high`, and whatever else the model accepts (`xhigh`, `max`, ...). Keywords or strings. Sent as Responses `reasoning.effort`. On chat/completions, tools force `none` because that endpoint rejects the combination. |
 
 Config is four layers, each beating the one before it: `legmacs.vibe/defaults`,
 then vibe.edn, then the `legmacs.vibe/config` atom (for `legmacs-init.lg`:
@@ -370,7 +382,8 @@ in ..." message instead.
 
 A provider in `legmacs.vibe/providers` is four keys and two functions
 (`:body` builds the request map, `:extract` pulls the text out of the
-parsed response), so adding one is a `swap!`.
+parsed response — or `{:text ... :calls [...]}` when the model asked
+for tools), so adding one is a `swap!`.
 
 Vibe has to wait on a network round-trip, and it stays out of the
 pure pipeline the same way Acme Execute does: `vibe-replace` performs no
@@ -775,7 +788,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
-| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer as context, and splice the answer over the call. `spawn-task` runs the HTTP call in a future so the editor stays interactive. |
+| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer, a live ns catalog, and `ns-publics`/`var-doc` tools as context, splice the answer over the call, and add missing `(:require ...)`s. `spawn-task` runs the HTTP call in a future so the editor stays interactive. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |
