@@ -31,9 +31,12 @@
 ;; realized result through a (fn [state outcome] -> state). Goroutines
 ;; never touch buffers. The loop drains *before* painting so a just-finished
 ;; job is visible without a keystroke, then only blocks on read-chord when
-;; both queues are empty; while jobs are in flight it peeks
-;; term/key-pending? and sleeps a tick. C-g discards in-flight jobs
-;; (results dropped, processes not killed).
+;; both queues are empty *and* no user go/future is still live; while
+;; jobs (or those spawns) are in flight it peeks term/key-pending? and
+;; sleeps a tick. C-g discards in-flight jobs (results dropped, processes
+;; not killed). A scratch `(go ...)`/`(future ...)` is not a job --
+;; install-spawn-tracking! wraps the natives so the loop still polls
+;; instead of parking in read-chord until the user types.
 ;;
 ;; Windows (split panes, see legmacs.windows) ride the exact same
 ;; mechanism. The workspace holds one window tree; each window shows a
@@ -480,6 +483,65 @@
                  state (assoc state :async-jobs (as-jobs (:async-jobs state)))]
              (put-current workspace state))))))))
 
+;; --- user go/future tracking ---------------------------------------------
+;; spawn-task is the blessed async path, but C-x C-e of (go ...) / (future ...)
+;; from *scratch* is the one people actually type. Those natives return at
+;; once; without a job on :async-jobs the loop would then park in
+;; read-chord, so a background println fights the TTY and a live modeline
+;; never repaints. Counting live spawns lets loop-wait keep polling.
+
+(def ^:private live-spawns (atom 0))
+(def ^:private spawn-tracking-installed? (atom false))
+
+(defn live-spawns?
+  "True when a go*/future* started after install-spawn-tracking! is still
+   running. Independent of :async-jobs -- a scratch (go (loop ...)) never
+   becomes a job."
+  []
+  (pos? @live-spawns))
+
+(defn- tracked-body
+  "Thunk wrapper: run `thunk`, then drop the live-spawn count. Reifies the
+   outcome so a throw still decrements -- let-go's finally cannot both
+   clean up and propagate (see CLAUDE.md)."
+  [thunk]
+  (fn []
+    (let [outcome (try {:ok (thunk)} (catch e {:err e}))]
+      (swap! live-spawns dec)
+      (if (contains? outcome :err)
+        (throw (:err outcome))
+        (:ok outcome)))))
+
+(defn- make-tracked-spawn
+  "A (fn [thunk] ...) that incs the live count and calls `orig` (the real
+   go*/future*) with a wrapper that decs when the body returns. Own named
+   fn so install-spawn-tracking!'s `when-not` contains calls, not capturing
+   fn literals (let-go AOT hoist, nooga/let-go#766)."
+  [orig]
+  (fn [thunk]
+    (swap! live-spawns inc)
+    (orig (tracked-body thunk))))
+
+(defn- replace-spawn-var!
+  "Point `v` at a tracking wrapper around `orig`. constantly + named
+   make-tracked-spawn, not an fn form in a conditional."
+  [v orig]
+  (alter-var-root v (constantly (make-tracked-spawn orig))))
+
+(defn install-spawn-tracking!
+  "Wrap go* and future* so loop-wait can poll while they run. Idempotent.
+   async/go* is a copy of the native taken at boot, not the core var, so
+   it is wrapped separately with the same original."
+  []
+  (when-not @spawn-tracking-installed?
+    (replace-spawn-var! #'future* future*)
+    (let [orig-go* go*]
+      (replace-spawn-var! #'go* orig-go*)
+      (when-let [av (find-var 'async/go*)]
+        (replace-spawn-var! av orig-go*)))
+    (reset! spawn-tracking-installed? true))
+  true)
+
 (defn loop-wait
   "What the editor should do after painting `workspace`. Drain realized
    jobs *before* asking this -- otherwise a just-finished job stays on
@@ -487,11 +549,12 @@
 
    :quit          -- leave the loop
    :pending-task  -- run the main-thread queue head (already painted)
-   :poll          -- jobs still in flight; peek stdin or sleep
+   :poll          -- jobs or user go/future still in flight; peek stdin or sleep
    :read-key      -- idle; block on the next chord"
   [workspace]
   (cond
     (:quit? workspace) :quit
     (:pending-task workspace) :pending-task
     (jobs-running? workspace) :poll
+    (live-spawns?) :poll
     :else :read-key))

@@ -117,7 +117,7 @@
            :goal-col nil)))
 
 (defn- repl-eval-text [text]
-  (try [:ok (format-result (load-string text))]
+  (try [:ok (format-result (letgo/load-in-editor text))]
        (catch e [:error (ex-message e)])))
 
 (defcommand repl-return

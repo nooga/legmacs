@@ -188,6 +188,34 @@
           (is (string/includes? (str (or (ex-message err) err)) "unknown vibe provider")))
         (finally (reset! vibe/config saved))))))
 
+(defn- with-ns [ns-sym f]
+  (let [saved (ns-name *ns*)
+        outcome (try {:ok (do (in-ns ns-sym) (f))} (catch e {:err e}))]
+    (in-ns saved)
+    (if (contains? outcome :err) (throw (:err outcome)) (:ok outcome))))
+
+(deftest vibe-resolves-after-switching-namespace
+  ;; Regression: C-c C-v evals the (vibe ...) form in whatever *ns* is
+  ;; current. After `(ns weather)` that is no longer legmacs.main, so
+  ;; unqualified `vibe` used to fail with "Can't resolve vibe".
+  (testing "a freshly created ns still resolves unqualified vibe"
+    (is (some? (with-ns 'vibe-test-fresh-ns (fn [] (resolve 'vibe))))))
+
+  (testing "eval-vibe-form in that ns fails on the provider, not on resolving vibe"
+    (let [saved @vibe/config]
+      (try
+        (swap! vibe/config assoc :provider :nope)
+        (let [err (with-ns 'vibe-test-eval-ns
+                    (fn []
+                      (try (vibe/eval-vibe-form "(vibe \"a thing\")" {})
+                           nil
+                           (catch e e))))]
+          (is (some? err))
+          (let [msg (str (or (ex-message err) err))]
+            (is (string/includes? msg "unknown vibe provider"))
+            (is (not (string/includes? msg "Can't resolve vibe")))))
+        (finally (reset! vibe/config saved))))))
+
 (deftest context-is-cleared-after-use
   (testing "with-context restores *vibe-context* even when the body throws"
     (try (vibe/with-context {:text "x"} (fn [] (throw "boom"))) (catch e nil))

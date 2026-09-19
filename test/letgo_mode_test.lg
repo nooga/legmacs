@@ -13,6 +13,12 @@
   (let [row (dec (count (:lines state)))]
     (assoc state :cursor-row row :cursor-col (count (nth (:lines state) row)))))
 
+(defn- cursor-end-of-row [state row]
+  (assoc state :cursor-row row :cursor-col (count (nth (:lines state) row))))
+
+(defn- eval-last-at-row [state row]
+  (lg-mode/eval-last-sexp (cursor-end-of-row state row)))
+
 (deftest eval-last-sexp-shows-result-in-message
   (testing "evaluates the sexp before point, leaves the buffer untouched"
     (let [s (at-end (buf/new-state nil ["(+ 1 2 3)"]))
@@ -66,6 +72,88 @@
                                                      "(/ 1 0)"]))]
       (is (string/includes? (:message s) "Eval error"))
       (is (= before (ns-name *ns*))))))
+
+(deftest eval-last-sexp-sees-defs-after-an-ns-form
+  ;; Regression: C-x C-e / C-j evaluate one already-read form via `eval`,
+  ;; while C-c C-e `load-string`s the whole buffer. load-string compiles
+  ;; and runs each form in order, so `(ns foo)` is in force for later
+  ;; forms; a C-x C-e of `(x)` after separately evaluating `(ns foo)` and
+  ;; `(defn x [] 1)` has to land in the same namespace or it reports
+  ;; "Can't resolve x in this context" even though eval-buffer of the
+  ;; same three lines returns 1.
+  (testing "sequential C-x C-e of ns, defn, then a call finds the defn"
+    (lg-mode/preserving-ns
+     (fn []
+       (let [lines ["(ns letgo-mode-test-seq-eval)"
+                    "(defn x [] 1)"
+                    "(x)"]
+             s (buf/new-state nil lines)
+             s (eval-last-at-row s 0)
+             s (eval-last-at-row s 1)
+             s (eval-last-at-row s 2)]
+         (is (= "=> 1" (:message s)))
+         (is (fn? @(ns-resolve 'letgo-mode-test-seq-eval 'x)))
+         (is (= 1 ((ns-resolve 'letgo-mode-test-seq-eval 'x))))))))
+
+  (testing "C-j on the call after C-x C-e of ns and defn inserts 1"
+    (lg-mode/preserving-ns
+     (fn []
+       (let [lines ["(ns letgo-mode-test-seq-eval-j)"
+                    "(defn x [] 1)"
+                    "(x)"]
+             s (buf/new-state nil lines)
+             s (eval-last-at-row s 0)
+             s (eval-last-at-row s 1)
+             s (lg-mode/eval-print-last-sexp (at-end s))]
+         (is (= "1" (last (:lines s))))))))
+
+  (testing "the same sequence through dispatch's C-x C-e, like a real session"
+    (lg-mode/preserving-ns
+     (fn []
+       (let [cxce (fn [state]
+                    (-> state
+                        (modes/switch-to-mode :let-go)
+                        (dispatch/dispatch "C-x")
+                        (dispatch/dispatch "C-e")))
+             lines ["(ns letgo-mode-test-seq-eval-dispatch)"
+                    "(defn x [] 1)"
+                    "(x)"]
+             s (buf/new-state nil lines)
+             s (cxce (cursor-end-of-row s 0))
+             s (cxce (cursor-end-of-row s 1))
+             s (cxce (cursor-end-of-row s 2))]
+         (is (= "=> 1" (:message s)))))))
+
+  (testing "eval-buffer of the same three lines still works, and is the control"
+    (let [s (lg-mode/eval-buffer
+             (buf/new-state nil ["(ns letgo-mode-test-seq-eval-buf)"
+                                 "(defn x [] 1)"
+                                 "(x)"]))]
+      (is (= "=> 1" (:message s))))))
+
+(deftest eval-last-sexp-after-eval-buffer-uses-the-buffer-ns
+  ;; C-c C-e load-string's the buffer (defs land in foo) then preserving-ns
+  ;; puts *ns* back to the editor. C-x C-e of @a used to compile in the
+  ;; editor ns and report "Can't resolve a". Eval last-sexp in the
+  ;; buffer's (ns ...) instead, like CIDER.
+  (testing "C-c C-e then C-x C-e of @a sees the atom interned in the buffer ns"
+    (let [before (ns-name *ns*)
+          lines ["(ns letgo-mode-test-eval-buf-atom)"
+                 "(def a (atom 7))"
+                 "@a"]
+          s (buf/new-state nil lines)
+          s (lg-mode/eval-buffer s)
+          s (eval-last-at-row s 2)]
+      (is (= "=> 7" (:message s)))
+      (is (= before (ns-name *ns*)))))
+
+  (testing "C-x C-e of a bare name after eval-buffer also finds it"
+    (let [lines ["(ns letgo-mode-test-eval-buf-var)"
+                 "(def a 42)"
+                 "a"]
+          s (lg-mode/eval-buffer (buf/new-state nil lines))
+          s (eval-last-at-row s 2)]
+      (is (= "=> 42" (:message s))))))
 
 (deftest let-go-mode-is-registered-for-dot-lg-files
   (testing ".lg is in the auto-mode-alist, pointing at :let-go"
@@ -159,15 +247,15 @@
 
   (testing "typing a closer that's already right under point moves over it instead of doubling it"
     (let [s (reduce dispatch/dispatch
-                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
-                     ["(" "f" "o" "o" ")"])]
+                    (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                    ["(" "f" "o" "o" ")"])]
       (is (= ["(foo)"] (:lines s)))
       (is (= 5 (:cursor-col s)))))
 
   (testing "nested pairs skip-over correctly all the way out"
     (let [s (reduce dispatch/dispatch
-                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
-                     ["(" "(" ")" ")"])]
+                    (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                    ["(" "(" ")" ")"])]
       (is (= ["(())"] (:lines s)))
       (is (= 4 (:cursor-col s)))))
 
@@ -184,14 +272,14 @@
 
   (testing "backspacing when point isn't between an empty pair is a normal delete"
     (let [s (reduce dispatch/dispatch
-                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
-                     ["a" "b" "DEL"])]
+                    (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                    ["a" "b" "DEL"])]
       (is (= ["a"] (:lines s)))))
 
   (testing "inside an (unterminated) string, an opener doesn't pair"
     (let [s (reduce dispatch/dispatch
-                     (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
-                     ["\"" "("])]
+                    (modes/switch-to-mode (buf/new-state nil [""]) :let-go)
+                    ["\"" "("])]
       (is (= ["\"("] (:lines s))))))
 
 (deftest lisp-indentation-aligns-to-the-open-form
@@ -351,3 +439,21 @@
   (testing "a line with no quote on it can't change anything"
     (is (= :string (lg-mode/highlight-carry :string "(no quotes here)")))
     (is (nil? (lg-mode/highlight-carry nil "(no quotes here)")))))
+
+(deftest eval-last-sexp-does-not-wait-for-a-future
+  ;; C-x C-e of (future (sleep ...)) must return the pending promise, not
+  ;; block the editor thread until the body finishes. @(future ...) on
+  ;; the main thread is a different form and still blocks, like Emacs.
+  (testing "eval-last-sexp of a long sleep future returns immediately"
+    (let [t0 (System/nanoTime)
+          s (lg-mode/eval-last-sexp (at-end (buf/new-state nil ["(future (sleep 3000))"])))
+          ms (/ (- (System/nanoTime) t0) 1000000.0)]
+      (is (< ms 500))
+      (is (string/includes? (:message s) "pending"))))
+
+  (testing "eval-last-sexp of a go block returns a chan, not the body's value"
+    (let [t0 (System/nanoTime)
+          s (lg-mode/eval-last-sexp (at-end (buf/new-state nil ["(go (sleep 3000))"])))
+          ms (/ (- (System/nanoTime) t0) 1000000.0)]
+      (is (< ms 500))
+      (is (string/includes? (:message s) "chan")))))

@@ -29,7 +29,8 @@
             [legmacs.modes.help]
             ;; :refer, not just :as -- (vibe "...") typed into a buffer is
             ;; read and evaluated *in this namespace* (see legmacs.modes.letgo's
-            ;; docstring), so the name has to resolve here unqualified.
+            ;; docstring). vibe.lg also intern's `vibe` into let-go.core so a
+            ;; later `(ns foo)` still resolves it unqualified (C-c C-v / C-x C-e).
             [legmacs.vibe :refer [vibe]]
             [legmacs.dispatch :as dispatch]
             [legmacs.render :as render]
@@ -124,10 +125,12 @@
    is painted, so a splice shows up without waiting for a keystroke. A
    :pending-task still takes the place of reading a key for one iteration
    -- main-thread work that asked to paint first. While :async-jobs are
-   in flight the loop peeks term/key-pending? instead of parking in
-   read-chord, so typing continues; a short sleep avoids a busy-spin
-   until the next completion or keystroke. Idle (no jobs, no pending-task)
-   is a blocking read-chord, same as before."
+   in flight -- or a scratch go/future is still live -- the loop peeks
+   term/key-pending? instead of parking in read-chord, so typing continues
+   and the frame keeps being painted (a background println cannot sit on
+   the TTY until the next key). A short sleep avoids a busy-spin until
+   the next completion or keystroke. Idle (no jobs, no live spawns, no
+   pending-task) is a blocking read-chord."
   [workspace]
   (loop [workspace workspace]
     (let [workspace (bufs/drain-jobs workspace dispatch/run-after-commands)
@@ -160,6 +163,7 @@
 
 (defn main []
   (bindings/install!)
+  (bufs/install-spawn-tracking!)
   (load-user-config!)
   (let [workspace (build-workspace *command-line-args*)]
     (init-terminal!)
