@@ -376,7 +376,8 @@ Vibe has to wait on a network round-trip, and it stays out of the
 pure pipeline the same way Acme Execute does: `vibe-replace` performs no
 I/O at all, it snapshots the form and `(bufs/spawn-task … "vibing...")`.
 The HTTP call runs in a future; `main.lg` keeps reading keys, and
-`drain-jobs` splices the answer on the main thread when it arrives. C-g
+`drain-jobs` splices the answer on the main thread *before the next
+frame is painted*, so the replacement shows up without a keystroke. C-g
 discards the result (it does not abort the request). A throw in the apply
 step is an echo-area message, not a crash. The mode line shows `vibing...`
 so you still know work is in flight after the echo area has been cleared

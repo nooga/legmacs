@@ -120,28 +120,25 @@
    command set. render! draws every window but likewise returns just a
    workspace with per-window scroll positions brought up to date.
 
-   After each frame, drain-jobs applies any futures that have finished
-   (I/O ran off-thread; the splice stays on this one). A :pending-task
-   still takes the place of reading a key for one iteration -- main-thread
-   work that asked to paint first. While :async-jobs are in flight the
-   loop peeks term/key-pending? instead of parking in read-chord, so
-   typing continues; a short sleep avoids a busy-spin until the next
-   completion or keystroke. Idle (no jobs, no pending-task) is a blocking
-   read-chord, same as before."
+   drain-jobs applies any futures that have finished *before* the frame
+   is painted, so a splice shows up without waiting for a keystroke. A
+   :pending-task still takes the place of reading a key for one iteration
+   -- main-thread work that asked to paint first. While :async-jobs are
+   in flight the loop peeks term/key-pending? instead of parking in
+   read-chord, so typing continues; a short sleep avoids a busy-spin
+   until the next completion or keystroke. Idle (no jobs, no pending-task)
+   is a blocking read-chord, same as before."
   [workspace]
   (loop [workspace workspace]
-    (let [workspace (render! workspace)
-          workspace (bufs/drain-jobs workspace dispatch/run-after-commands)]
-      (cond
-        (:quit? workspace) workspace
-        (:pending-task workspace)
-        (recur (bufs/run-pending-task workspace dispatch/run-after-commands))
-        (bufs/jobs-running? workspace)
-        (if (term/key-pending?)
-          (recur (handle-chord workspace))
-          (do (sleep job-poll-ms) (recur workspace)))
-        :else
-        (recur (handle-chord workspace))))))
+    (let [workspace (bufs/drain-jobs workspace dispatch/run-after-commands)
+          workspace (render! workspace)]
+      (case (bufs/loop-wait workspace)
+        :quit workspace
+        :pending-task (recur (bufs/run-pending-task workspace dispatch/run-after-commands))
+        :poll (if (term/key-pending?)
+                (recur (handle-chord workspace))
+                (do (sleep job-poll-ms) (recur workspace)))
+        :read-key (recur (handle-chord workspace))))))
 
 (defn- open-additional-buffer [workspace path]
   (bufs/put-current workspace

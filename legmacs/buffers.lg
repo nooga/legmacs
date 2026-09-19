@@ -29,10 +29,11 @@
 ;; goroutine while the user keeps typing. spawn-task starts a future
 ;; immediately (HTTP, rc, ...); drain-jobs on the main thread applies each
 ;; realized result through a (fn [state outcome] -> state). Goroutines
-;; never touch buffers. The loop only blocks on read-chord when both
-;; queues are empty; while jobs are in flight it peeks term/key-pending?
-;; and sleeps a tick so completions show up without a keystroke. C-g
-;; discards in-flight jobs (results dropped, processes not killed).
+;; never touch buffers. The loop drains *before* painting so a just-finished
+;; job is visible without a keystroke, then only blocks on read-chord when
+;; both queues are empty; while jobs are in flight it peeks
+;; term/key-pending? and sleeps a tick. C-g discards in-flight jobs
+;; (results dropped, processes not killed).
 ;;
 ;; Windows (split panes, see legmacs.windows) ride the exact same
 ;; mechanism. The workspace holds one window tree; each window shows a
@@ -478,3 +479,19 @@
                  state (after state)
                  state (assoc state :async-jobs (as-jobs (:async-jobs state)))]
              (put-current workspace state))))))))
+
+(defn loop-wait
+  "What the editor should do after painting `workspace`. Drain realized
+   jobs *before* asking this -- otherwise a just-finished job stays on
+   screen until the next keystroke (paint, drain, then block on read-chord).
+
+   :quit          -- leave the loop
+   :pending-task  -- run the main-thread queue head (already painted)
+   :poll          -- jobs still in flight; peek stdin or sleep
+   :read-key      -- idle; block on the next chord"
+  [workspace]
+  (cond
+    (:quit? workspace) :quit
+    (:pending-task workspace) :pending-task
+    (jobs-running? workspace) :poll
+    :else :read-key))

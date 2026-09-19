@@ -414,3 +414,38 @@
           s (bufs/discard-jobs s)]
       (is (nil? (:async-jobs s)))
       (is (not (bufs/jobs-running? s))))))
+
+(deftest a-finished-job-settles-without-a-keystroke
+  (testing "loop-wait after drain is :read-key, so the splice is already on the workspace that main.lg paints"
+    ;; paint-then-drain-then-block: the job finishes during :poll's sleep,
+    ;; drain applies it, and blocking on read-chord before painting hid the
+    ;; splice until the user typed. Drain first; then wait is idle.
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          p (promise)
+          then (fn [state outcome] (update state :lines conj (:ok outcome)))
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                {:promise p :then then :label "vibing..."}))]
+      (is (= :poll (bufs/loop-wait ws)))
+      (deliver p {:ok "hi"})
+      (let [ws (bufs/drain-jobs ws)]
+        (is (= ["x" "hi"] (:lines (bufs/current ws))))
+        (is (not (bufs/jobs-running? ws)))
+        (is (nil? (:async-jobs (bufs/current ws))))
+        (is (= :read-key (bufs/loop-wait ws))))))
+
+  (testing "still in flight -> :poll, so the loop sleeps instead of parking in read-chord"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          p (promise)
+          then (fn [state outcome] state)
+          ws (bufs/put-current ws (bufs/add-job (bufs/current ws)
+                                                {:promise p :then then :label "t"}))]
+      (is (= :poll (bufs/loop-wait (bufs/drain-jobs ws))))
+      (is (= ["x"] (:lines (bufs/current ws))))))
+
+  (testing "idle, no jobs -> :read-key"
+    (is (= :read-key (bufs/loop-wait (bufs/new-workspace (buf/new-state nil ["x"]))))))
+
+  (testing "a blocking pending-task still wins over idle"
+    (let [ws (bufs/new-workspace (buf/new-state nil ["x"]))
+          ws (bufs/put-current ws (bufs/arm-task (bufs/current ws) (fn [s] s)))]
+      (is (= :pending-task (bufs/loop-wait ws))))))
