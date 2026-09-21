@@ -59,6 +59,7 @@
    :variable {:fg [120 205 235]}
    :preproc {:fg [205 120 190]}
    :paren-match {:fg [255 255 255] :bold true :bg [80 80 40]}
+   :eval-highlight {:bg [45 85 75] :bold true}
    ;; markdown
    :md-header {:fg [235 170 60] :bold true}
    :md-hr {:fg [110 110 130]}
@@ -212,6 +213,7 @@
    :help-doc {:fg overlay1 :italic true}
    :candidate-keys {:fg overlay1}
    :region {:bg surface1}
+   :eval-highlight {:bg teal :bold true}
    :search-match {:bg surface2}
    :search-current {:bg overlay0}})
 
@@ -272,6 +274,7 @@
   :help-doc {:fg [146 131 116] :italic true}
   :candidate-keys {:fg [146 131 116]}
   :region {:bg [80 73 69]}
+  :eval-highlight {:bg [69 92 80] :bold true}
   :search-match {:bg [102 92 84]}
   :search-current {:bg [124 80 20]}})
 
@@ -312,6 +315,7 @@
   :help-doc {:fg [86 95 137] :italic true}
   :candidate-keys {:fg [86 95 137]}
   :region {:bg [65 72 104]}
+  :eval-highlight {:bg [40 95 91] :bold true}
   :search-match {:bg [45 52 87]}
   :search-current {:bg [61 89 161]}})
 
@@ -353,6 +357,7 @@
   :help-doc {:fg [76 86 106] :italic true}
   :candidate-keys {:fg [76 86 106]}
   :region {:bg [59 66 82]}
+  :eval-highlight {:bg [65 98 100] :bold true}
   :search-match {:bg [67 76 94]}
   :search-current {:bg [94 129 172]}})
 
@@ -396,5 +401,6 @@
   :help-doc {:fg [136 136 204] :italic true}
   :candidate-keys {:fg [153 153 76]}
   :region {:bg [238 238 158]}                           ; body HIGH
+  :eval-highlight {:bg [136 204 136] :bold true}        ; DMedgreen
   :search-match {:bg [158 238 238]}                     ; DPalegreygreen (tag HIGH)
   :search-current {:bg [136 204 136]}})                 ; DMedgreen

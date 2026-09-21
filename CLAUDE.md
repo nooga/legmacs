@@ -248,26 +248,30 @@ every-cell-written-no-clear frame invariant. The flat single-state
 `render/frame` still exists and must stay byte-identical to a one-window
 workspace frame — there's a test asserting exactly that.
 
-**Vibe (`C-c C-v`) is an `:async-jobs` client.** `legmacs/vibe.lg`
-(`(vibe "...")` / `C-c C-v`) is the thing that waits on a network
-round-trip. `vibe-replace` does no I/O: it snapshots the form and
-`(bufs/spawn-task … "vibing...")`, so it's as pure and testable as any
-other command. The future `eval`s the form (in `legmacs.main`, same as
-`C-x C-e`) with the call site bound in `vibe/*vibe-context*` (a dynamic
-var, so two overlapping vibes don't clobber each other). The user
+**Generic eval-and-replace (`C-c C-v`) is an `:async-jobs` client.**
+`legmacs.modes.letgo/eval-replace-sexp` discovers the region or structural
+form at point, highlights it, snapshots its source, and evaluates it through
+`bufs/spawn-task`. Completion verifies that the source span is unchanged
+before replacing it. Ordinary values use `pr-str`; functions that need
+source-aware application return `replacement-result` with a registered
+result-kind handler. This async/result seam is also the intended boundary
+for a future nREPL backend: `register-eval-backend!` installs an async-safe
+`(fn [request] -> value)` and `use-eval-backend!` selects it. Requests carry
+the source plus filename/column/namespace context; backends never touch live
+buffer state.
+
+`legmacs.vibe/vibe` uses that protocol rather than owning a special key
+command. Under the dynamic `letgo/*eval-replace-context*` it derives its
+own buffer marker context and returns a tagged `:vibe` result; outside it,
+vibe remains an ordinary blocking string-returning function. The user
 message includes a live catalog of canonical let-go namespaces
 (`string/` not `clojure.string/`) and the file's `:require` aliases; the
 model can also call `list-namespaces` / `ns-publics` / `var-doc` against
 the running VM (OpenAI goes through `/v1/responses` so tools can sit
 next to `:reasoning-effort`, default `:medium`; a `chat/completions` URL
-selects the older shape). Then `resolve-vibe` rewrites any JVM-Clojure prefixes,
-splices the string over the form, and inserts missing `(:require ...)`
-entries into the ns form — one undo step. Two guards there are
-load-bearing: `resolve-vibe` re-checks that a `(vibe` form still opens
-at `start` before touching the buffer, and it refuses to splice a
-non-string result (let-go's `eval` *returns* compile errors as an
-`#error` value instead of raising them, so a typo'd prompt would
-otherwise be pasted into your code). The system prompt also requires a
+selects the older shape). Its registered handler rewrites JVM-Clojure
+prefixes, splices the string, and inserts missing `(:require ...)` entries
+into the ns form in one undo step. The system prompt also requires a
 docstring on every `defn` / `defn-` / `defcommand`.
 
 Full per-file breakdown and the complete default keymap are in

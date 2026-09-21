@@ -80,7 +80,7 @@ not held together.
 | `C-x k` | kill (close) the current buffer |
 | `C-x <right>` / `C-x <left>` | cycle to the next / previous buffer |
 | `C-c C-z` | open (or switch to) the `*repl*` buffer |
-| `C-c C-v` | vibe-replace: run the `(vibe "...")` form around point and replace it with the code it returns |
+| `C-c C-v` | in let-go-mode, asynchronously evaluate the region/form at point and replace it with its result |
 | `C-x 2` | split the current window in two, one above the other |
 | `C-x 3` | split the current window in two, side by side |
 | `C-x o` | move to the next window (cycles top-to-bottom, left-to-right) |
@@ -234,6 +234,7 @@ forms that aren't also valid let-go:
 |---|---|
 | `C-x C-e` | evaluate the s-expression before point, show the result in the echo area |
 | `C-j` | evaluate the s-expression before point, insert the result right there |
+| `C-c C-v` | asynchronously evaluate the region or form at point and replace it with the result |
 | `C-c C-e` | evaluate the whole buffer |
 | `RET` | newline, aligned under the form it's inside |
 | `TAB` | re-indent the current line the same way |
@@ -249,6 +250,13 @@ using `legmacs.lisp-syntax`'s scanner to tell "point is inside an
 in-progress string" apart from "point sits right after a string that just
 closed", since the two look identical from the buffer's text alone until you
 track whether that trailing quote was ever seen.
+
+Point does not need to sit precisely after a close delimiter: the eval
+commands use the shared Lisp scanner to find the innermost form containing
+point, also accepting point immediately after its close. An active region
+wins and may contain several forms. The evaluated span flashes for ordinary
+`C-x C-e`/`C-j` eval and stays highlighted while an asynchronous `C-c C-v`
+job is in flight; the echo area and mode line also say `evaluating...`.
 
 Eval isn't a sandboxed toy evaluator: it runs in-process, in the same
 namespace the editor itself is running in (`legmacs.main`), using let-go's
@@ -324,15 +332,17 @@ these features, is the same `register-mode!`/`register-auto-mode!` call.
 
 ### Vibing (`C-c C-v`)
 
-[`legmacs/vibe.lg`](../legmacs/vibe.lg) adds one function and one command.
+[`legmacs/vibe.lg`](../legmacs/vibe.lg) adds one ordinary function to the
+generic let-go evaluator.
 The function is ordinary: `(vibe "a quicksort")` asks the configured model
 for let-go code and returns it as a string, so `C-x C-e` on it echoes the
-code, and it composes (`(str (vibe "a") (vibe "b"))` is fine). The command,
-`C-c C-v`, finds the innermost `(vibe ...)` form around point, runs it, and
-replaces the form's text with the string it returned -- as one undo step,
-so one `C-_` puts your prompt back.
+code, and it composes (`(str (vibe "a") (vibe "b"))` is fine). `C-c C-v`
+is let-go-mode's universal eval-and-replace command: it works on `(vibe ...)`
+exactly as it works on `(+ 1 2)`, replacing the form as one undo step so one
+`C-_` puts the source back.
 
-What makes the answers usable is the context. `vibe-replace` sends the
+What makes the answers usable is the context. While the generic evaluator
+runs it, `vibe` derives the call site from `*eval-replace-context*` and sends the
 whole buffer with the call site swapped for a `<<<VIBE:HERE>>>` marker,
 plus the column that marker starts at, plus a live catalog of let-go's
 canonical namespaces (`string/`, `json/`, `os/`, never `clojure.string/`)
@@ -340,10 +350,8 @@ and the file's existing `:require` aliases. The model can also call
 `list-namespaces`, `ns-publics`, and `var-doc` against the running VM
 before it writes code. The splice is one undo step: the generated
 forms replace the call, and any namespace those forms use that the file
-does not already require is inserted into the `ns` form. `vibe` itself
-can't see the buffer (it's just a function), so `vibe-replace` parks the
-call site in `*vibe-context*` for the duration of the eval -- which is
-also why a bare `(vibe "...")` from the REPL still works, just without a
+does not already require is inserted into the `ns` form. A bare
+`(vibe "...")` from the REPL still works, just without a
 file to splice requires into. JVM-Clojure prefixes in the reply
 (`clojure.string/join`) are rewritten to the canonical names before
 anything is inserted.
@@ -396,16 +404,22 @@ A provider in `legmacs.vibe/providers` is four keys and two functions
 parsed response — or `{:text ... :calls [...]}` when the model asked
 for tools), so adding one is a `swap!`.
 
-Vibe has to wait on a network round-trip, and it stays out of the
-pure pipeline the same way Acme Execute does: `vibe-replace` performs no
-I/O at all, it snapshots the form and `(bufs/spawn-task … "vibing...")`.
-The HTTP call runs in a future; `main.lg` keeps reading keys, and
+Vibe has to wait on a network round-trip, so the generic `C-c C-v` command
+snapshots the chosen form and runs its eval through `bufs/spawn-task`.
+The HTTP call (or any other evaluation) runs in a future; `main.lg` keeps reading keys, and
 `drain-jobs` splices the answer on the main thread *before the next
 frame is painted*, so the replacement shows up without a keystroke. C-g
 discards the result (it does not abort the request). A throw in the apply
-step is an echo-area message, not a crash. The mode line shows `vibing...`
+step is an echo-area message, not a crash. The mode line shows `evaluating...`
 so you still know work is in flight after the echo area has been cleared
-by typing.
+by typing. The same async boundary is where a future nREPL evaluator plugs
+in: form discovery, highlighting, stale-source checks, and main-thread
+application do not depend on the in-process backend. Register an
+async-safe `(fn [request] -> value)` with `register-eval-backend!` and select
+it with `use-eval-backend!`; the request carries `:source` plus filename,
+column, and namespace context. An nREPL backend can therefore send source
+and map its response to a value or `(replacement-result :source text)` when
+the server has already printed a replacement-ready value.
 
 Any file ending in `.md` or `.markdown` opens into **markdown-mode**
 (highlighting only, no key bindings of its own, so every global key still
@@ -803,9 +817,9 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes.lg`](../legmacs/modes.lg) | Mode registry: a keymap that shadows the global one, a line highlighter (stateless, or carrying state across lines for multi-line constructs), an after-every-command hook, a mode-line lighter, plus filename → mode auto-detection. Majors go in the buffer's `:mode` slot; minor modes stack in `:minor-modes` and shadow the major. |
 | [`legmacs/indent.lg`](../legmacs/indent.lg) | Where should this line start? One pure function driven by the language's `:indent` rules (bracket depth, or the line above plus keyword rules, or the language's own `:fn`), plus the edit that applies the answer without losing point. |
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
-| [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: in-process eval, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
+| [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: structural form discovery, in-process eval, async eval-and-replace, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
-| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")` and `C-c C-v`: ask an LLM for let-go code, with the surrounding buffer, a live ns catalog, and `ns-publics`/`var-doc` tools as context, splice the answer over the call, and add missing `(:require ...)`s. `spawn-task` runs the HTTP call in a future so the editor stays interactive. |
+| [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")`: ask an LLM for let-go code, deriving surrounding-buffer context when invoked by generic `C-c C-v`, then use a tagged eval-result handler to rewrite namespaces and add missing `(:require ...)`s. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |
 | [`legmacs/prog_syntax.lg`](../legmacs/prog_syntax.lg) | A full-buffer bracket/string/comment scanner like `legmacs.lisp-syntax`, but spec-driven instead of Lisp-specific -- what the generic structural modes below are built on. |

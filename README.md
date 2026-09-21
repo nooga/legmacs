@@ -34,9 +34,14 @@ started:
   the very same runtime, so `*scratch*` is a live REPL over the editor
   itself -- and since let-go is close enough to Clojure's reader syntax,
   `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files open into the same mode too
+- universal async eval-and-replace (`C-c C-v`): put point anywhere in a
+  form (or select several), evaluate it without blocking the editor, and
+  replace the source with its result; the active form is highlighted while
+  it runs
 - a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
   running transcript instead of building one by hand with `C-j`
-- `(vibe "...")` (`C-c C-v`): write what you want where you want it, and an
+- `(vibe "...")`: write what you want where you want it, then use the same
+  `C-c C-v` eval-and-replace chord as any other form, and an
   LLM writes the code over the call -- with the rest of your buffer, a
   live let-go ns catalog, and `ns-publics`/`var-doc` tools as context
   (see [Vibe coding](#vibe-coding))
@@ -119,7 +124,10 @@ to inspect them (`ns-publics`, `var-doc`), so it writes code that fits
 entries are added to the file's ns form in the same undo step. Every
 `defn` it writes should have a docstring.
 
-`vibe` is also just a function: `C-x C-e` on `(vibe "a quicksort")` echoes
+`C-c C-v` is not vibe-specific: use it on `(+ 1 2)` and the form becomes
+`3`. `vibe` hooks into that generic evaluator only to supply buffer context
+and retain its source-aware namespace/require cleanup. It is still just a
+function: `C-x C-e` on `(vibe "a quicksort")` echoes
 the generated code instead of splicing it, and it composes like anything
 else (`(str (vibe "a") (vibe "b"))` works).
 

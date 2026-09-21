@@ -46,6 +46,7 @@
    :mark nil
    :mark-ring ()
    :expand-stack ()
+   :eval-highlight nil
    :clipboard ""
    :quit? false})
 
