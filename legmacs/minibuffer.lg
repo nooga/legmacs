@@ -27,7 +27,8 @@
 ;; :selection is the highlighted index; select-next/select-prev move it and
 ;; re-fire :on-select. legmacs.render grows the echo area to show the list.
 
-(ns legmacs.minibuffer)
+(ns legmacs.minibuffer
+  (:refer-clojure :exclude [open]))
 
 (defn active? [state] (boolean (:minibuffer state)))
 

@@ -433,6 +433,20 @@
       (= buf-row r2) (conj {:style :paren-match :start c2 :end (inc c2)}))
     []))
 
+(defn- eval-highlight-spans-for-row
+  "The form most recently evaluated, or currently being evaluated. Stored
+   as flat offsets so a multi-line form needs no extra editor selection."
+  [state buf-row]
+  (if-let [{:keys [start end]} (:eval-highlight state)]
+    (let [[sr sc] (buf/row-col-of state start)
+          [er ec] (buf/row-col-of state end)]
+      (if (<= sr buf-row er)
+        [{:style :eval-highlight
+          :start (if (= buf-row sr) sc 0)
+          :end (cond (= sr er) ec (= buf-row er) ec :else open-ended)}]
+        []))
+    []))
+
 (defn- search-match-spans-for-row
   "Spans for every swiper match on `buf-row`, read straight off the live
    minibuffer's :candidates so they vanish automatically when the session
@@ -515,6 +529,7 @@
                  conv (fn [spans] (mapv #(display-span % cols) spans))
                  visible (pad-right dtext text-cols)
                  bg-spans (conv (concat (region-spans-for-row state buf-row)
+                                        (eval-highlight-spans-for-row state buf-row)
                                         (paren-match-spans-for-row state buf-row)
                                         (search-match-spans-for-row state buf-row)))
                  fg-spans (conv (concat syntax-spans

@@ -46,6 +46,7 @@
    :mark nil
    :mark-ring ()
    :expand-stack ()
+   :eval-highlight nil
    :clipboard ""
    :quit? false})
 
@@ -122,6 +123,16 @@
 
 ;; --- editing ---------------------------------------------------------------
 
+(defn- split-insert-text
+  "Split insertion text on newlines while preserving empty leading/trailing
+   pieces. string/split intentionally drops those in current let-go, so a
+   bare newline otherwise becomes [] and RET crashes indexing piece zero."
+  [text]
+  (loop [start 0, pieces []]
+    (if-let [i (string/index-of text "\n" start)]
+      (recur (inc i) (conj pieces (subs text start i)))
+      (conj pieces (subs text start)))))
+
 (defn insert-string
   "Insert text at the cursor, splitting on newlines if the text contains any.
    Leaves the cursor immediately after the inserted text."
@@ -132,7 +143,7 @@
         line (nth lines cursor-row)
         before (subs line 0 cursor-col)
         after (subs line cursor-col)
-        pieces (vec (string/split text "\n"))
+        pieces (split-insert-text text)
         n (count pieces)]
     (if (= n 1)
       (-> state

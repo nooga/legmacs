@@ -31,6 +31,14 @@
           s (buf/insert-newline s)]
       (is (= ["hello" " world"] (:lines s)))
       (is (= 1 (:cursor-row s)))
+      (is (= 0 (:cursor-col s)))))
+
+  (testing "leading, trailing, and repeated newlines retain their empty pieces"
+    (let [s (-> (buf/new-state nil ["ab"])
+                (assoc :cursor-col 1)
+                (buf/insert-string "\nX\n\n"))]
+      (is (= ["a" "X" "" "b"] (:lines s)))
+      (is (= 3 (:cursor-row s)))
       (is (= 0 (:cursor-col s))))))
 
 (deftest deletion

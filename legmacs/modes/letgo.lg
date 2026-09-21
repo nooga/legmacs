@@ -23,6 +23,7 @@
 (ns legmacs.modes.letgo
   (:require [string]
             [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
             [legmacs.indent :as indent]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.modes :as modes]
@@ -324,13 +325,6 @@
   [s]
   (capturing-out (fn [] (eval-each-form (read-all-string s)))))
 
-(defn- last-sexp-before-point [state]
-  (let [text (buf/text-before-cursor state)]
-    (try
-      (let [forms (read-all-string text)]
-        (if (seq forms) [:ok (last forms)] [:none nil]))
-      (catch e [:error (ex-message e)]))))
-
 (defn preserving-ns
   "Run `thunk`, then put the current namespace back where it was.
 
@@ -392,20 +386,135 @@
     (eval-form-in-ns ns-sym form)
     (eval-form form)))
 
+;; --- form discovery and evaluation --------------------------------------
+;;
+;; Eval commands share one structural answer to "what is at point?": an
+;; active region, otherwise the innermost bracketed form containing point
+;; (or ending immediately before it), otherwise a string/character/token.
+;; This is deliberately offset-based. Besides making point placement much
+;; less fussy than read-all-string over the prefix, the same span can be
+;; painted while an asynchronous evaluator (vibe today, nREPL later) runs.
+
+(def ^:dynamic *eval-replace-context*
+  "Bound while C-c C-v evaluates a form for replacement. Ordinary functions
+   can ignore it. A function such as vibe may use the buffer snapshot and
+   return replacement-result so it can customize how its value is spliced."
+  nil)
+
+(def eval-result-handlers
+  "Extensible result-kind -> (fn [state start end result-map] -> state).
+   This keeps the evaluator independent of vibe and leaves the same seam for
+   later remote/nREPL result handling."
+  (atom {}))
+
+(defn register-eval-result-handler!
+  "Register the main-thread splice handler for tagged eval results of `kind`."
+  [kind handler]
+  (swap! eval-result-handlers assoc kind handler)
+  kind)
+
+(defn replacement-result
+  "A value an evaluated function can return under *eval-replace-context* to
+   request source-aware replacement instead of ordinary pr-str formatting."
+  [kind text]
+  {:legmacs.eval/kind kind :legmacs.eval/text text})
+
+(defn- replacement-result? [v]
+  (and (map? v) (contains? v :legmacs.eval/kind) (contains? v :legmacs.eval/text)))
+
+(defn- selection-region-offsets [state]
+  (when-let [[[sr sc] [er ec]] (buf/region-bounds state)]
+    [(buf/offset-of state sr sc) (buf/offset-of state er ec)]))
+
+(defn- pair-span-at [chars scanned point]
+  (let [pairs (filter (fn [[o c]]
+                        (and (< o c) (<= o point) (<= point (inc c))))
+                      (:pairs scanned))]
+    (when (seq pairs)
+      (let [[o c] (apply max-key first pairs)
+            ;; Reader prefixes belong to the form: '(x), @(f), #(x), ~@x.
+            start (loop [s o]
+                    (if (and (pos? s)
+                             (contains? #{\' \@ \` \~ \#} (nth chars (dec s))))
+                      (recur (dec s))
+                      s))]
+        [start (inc c)]))))
+
+(defn- literal-span-at [scanned point]
+  (let [spans (filter (fn [{:keys [type start end]}]
+                        (and (not= :comment type)
+                             (<= start point) (<= point end)))
+                      (:spans scanned))]
+    (when (seq spans)
+      (let [{:keys [start end]} (apply max-key :start spans)] [start end]))))
+
+(defn- token-delimiter? [ch]
+  (or (nil? ch)
+      (contains? #{\space \tab \newline \return \, \( \) \[ \] \{ \} \" \;} ch)))
+
+(defn- token-span-at [chars scanned point]
+  (let [n (count chars)
+        anchor (cond
+                 (and (< point n) (not (token-delimiter? (nth chars point)))) point
+                 (and (pos? point) (not (token-delimiter? (nth chars (dec point))))) (dec point)
+                 :else nil)]
+    (when (and anchor (not (ls/in-string-or-comment? scanned anchor)))
+      (let [start (loop [i anchor]
+                    (if (and (pos? i) (not (token-delimiter? (nth chars (dec i)))))
+                      (recur (dec i)) i))
+            end (loop [i (inc anchor)]
+                  (if (and (< i n) (not (token-delimiter? (nth chars i))))
+                    (recur (inc i)) i))]
+        [start end]))))
+
+(defn form-span-at-point
+  "[start end) for the region or readable form at/around point. Public so a
+   future evaluator backend can reuse exactly the local evaluator's DWIM
+   selection semantics."
+  [state]
+  (or (selection-region-offsets state)
+      (let [chars (buf/buffer-chars state)
+            point (buf/offset-of state (:cursor-row state) (:cursor-col state))
+            scanned (ls/scan chars)]
+        (or (pair-span-at chars scanned point)
+            (literal-span-at scanned point)
+            (token-span-at chars scanned point)))))
+
+(defn- eval-selection [state]
+  (if-let [[start end] (form-span-at-point state)]
+    (let [text (buf/buffer-text state)
+          source (subs text start end)]
+      (try (let [forms (vec (read-all-string source))]
+             (if (seq forms)
+               [:ok start end source forms]
+               [:none nil nil nil nil]))
+           (catch e [:error start end source (or (ex-message e) (str e))])))
+    [:none nil nil nil nil]))
+
+(defn- highlight-span [state start end sticky?]
+  (assoc state :eval-highlight {:start start :end end :sticky? sticky?}))
+
+(defn- clear-highlight [state highlight]
+  (if (= highlight (:eval-highlight state)) (dissoc state :eval-highlight) state))
+
 (defn- run-eval [state f]
-  (let [[status form] (last-sexp-before-point state)]
+  (let [[status start end _source forms] (eval-selection state)]
     (case status
       :none (assoc state :message "No preceding sexp")
-      :error (assoc state :message (str "Read error: " form))
+      :error (assoc state :message (str "Read error: " forms))
       (try
-        (f state form (eval-form-in-state state form))
-        (catch e (assoc state :message (str "Eval error: " (or (ex-message e) (str e)))))))))
+        (f (highlight-span state start end false)
+           start end forms
+           (reduce (fn [_ form] (eval-form-in-state state form)) nil forms))
+        (catch e (-> state
+                     (highlight-span start end false)
+                     (assoc :message (str "Eval error: " (or (ex-message e) (str e))))))))))
 
 (defcommand eval-last-sexp
   "Evaluate the s-expression immediately before point; show the result in
    the echo area, like Emacs's C-x C-e."
   [state]
-  (run-eval state (fn [state _form result]
+  (run-eval state (fn [state _start _end _form result]
                      (assoc state :message (str "=> " (format-result result))))))
 
 (defcommand eval-print-last-sexp
@@ -413,8 +522,112 @@
    result right after it, like Emacs's C-j in lisp-interaction-mode --
    this is what makes *scratch* feel like a REPL transcript."
   [state]
-  (run-eval state (fn [state _form result]
-                     (buf/insert-string state (str "\n" (format-result result))))))
+  (run-eval state (fn [state _start end _form result]
+                     (let [[row col] (buf/row-col-of state end)]
+                       (buf/insert-string (assoc state :cursor-row row :cursor-col col)
+                                          (str "\n" (format-result result)))))))
+
+(defn- splice-offsets
+  "Replace a flat [start end) span with text as one undo step."
+  [state start end replacement]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [text (buf/buffer-text state)
+          new-text (str (subs text 0 start) replacement (subs text end))
+          state (-> (buf/push-undo state)
+                    (assoc :lines (buf/split-lines new-text) :modified? true))
+          [row col] (buf/row-col-of state (+ start (count replacement)))]
+      (-> state
+          (assoc :cursor-row row :cursor-col col :goal-col nil)
+          buf/clamp-cursor))))
+
+(defn- apply-source-result [state start end result]
+  (-> (splice-offsets state start end (:legmacs.eval/text result))
+      (assoc :message "Evaluated and replaced")))
+
+(register-eval-result-handler! :source apply-source-result)
+
+(defn- apply-replacement-result [state start end result]
+  (if (replacement-result? result)
+    (if-let [handler (get @eval-result-handlers (:legmacs.eval/kind result))]
+      (handler state start end result)
+      (assoc state :message (str "No eval result handler for " (:legmacs.eval/kind result))))
+    (-> (splice-offsets state start end (format-result result))
+        (assoc :message "Evaluated and replaced"))))
+
+(defn- in-process-eval-backend
+  "The built-in evaluator backend. A future nREPL backend receives the same
+   request map but can use :source/:namespace without touching editor state."
+  [{:keys [state forms context]}]
+  (binding [*eval-replace-context* context]
+    (reduce (fn [_ form] (eval-form-in-state state form)) nil forms)))
+
+(def eval-backends
+  "Registered eval backend functions, each (fn [request-map] -> value).
+   Backends run inside the generic async job and must not mutate buffers."
+  (atom {:in-process in-process-eval-backend}))
+
+(def current-eval-backend
+  "The backend used by C-c C-v. Kept as data so an nREPL client can install
+   and select itself without replacing the command or key binding."
+  (atom :in-process))
+
+(defn register-eval-backend!
+  "Register an async-safe evaluator function under `name`."
+  [name evaluator]
+  (swap! eval-backends assoc name evaluator)
+  name)
+
+(defn use-eval-backend!
+  "Select a registered evaluator backend. Returns name, or nil if unknown."
+  [name]
+  (when (contains? @eval-backends name)
+    (reset! current-eval-backend name)))
+
+(defn- eval-replace-value [request]
+  (if-let [backend (get @eval-backends @current-eval-backend)]
+    (backend request)
+    (throw (str "Unknown eval backend " (pr-str @current-eval-backend)))))
+
+(defn- eval-replace-io [request]
+  (fn [] (eval-replace-value request)))
+
+(defn- resolve-eval-replace [state start end source highlight outcome]
+  (let [state (clear-highlight state highlight)]
+    (if-let [err (:err outcome)]
+      (assoc state :message (str "Eval error: " (or (ex-message err) (str err))))
+      (let [text (buf/buffer-text state)]
+        (if-not (and (<= end (count text)) (= source (subs text start end)))
+          (assoc state :message "Eval: form moved before it completed")
+          (apply-replacement-result state start end (:ok outcome)))))))
+
+(defn- eval-replace-then [start end source highlight]
+  (fn [state outcome] (resolve-eval-replace state start end source highlight outcome)))
+
+(defcommand eval-replace-sexp
+  "Evaluate the region or s-expression at point asynchronously and replace
+   it with the printed result. C-c C-v is intentionally universal: vibe is
+   one ordinary function using the tagged-result extension, not a special
+   case in this command."
+  [state]
+  (if-not (buf/writable? state)
+    (assoc state :message "Buffer is read-only")
+    (let [[status start end source forms] (eval-selection state)]
+      (case status
+        :none (assoc state :message "No s-expression at point")
+        :error (assoc state :message (str "Read error: " forms))
+        (let [text (buf/buffer-text state)
+              [_row column] (buf/row-col-of state start)
+              context {:text text :source source :start start :end end
+                       :filename (:filename state) :column column
+                       :namespace (buffer-ns-name state)}
+              request {:state state :forms forms :source source :context context}
+              highlight {:start start :end end :sticky? true}
+              state (assoc state :eval-highlight highlight)]
+          (bufs/spawn-task state
+                           (eval-replace-io request)
+                           (eval-replace-then start end source highlight)
+                           "evaluating..."))))))
 
 (defcommand eval-buffer
   "Evaluate the entire buffer, top to bottom, form by form in the current
@@ -572,6 +785,7 @@
 
 (km/bind-key! keymap "C-x C-e" :eval-last-sexp)
 (km/bind-key! keymap "C-j" :eval-print-last-sexp)
+(km/bind-key! keymap "C-c C-v" :eval-replace-sexp)
 (km/bind-key! keymap "C-c C-e" :eval-buffer)
 (km/bind-key! keymap "RET" :newline-and-indent)
 (km/bind-key! keymap "TAB" :lisp-indent-line)
@@ -587,6 +801,7 @@
 
 (modes/register-mode! :let-go keymap
                        (str "let-go-mode: C-x C-e eval-last-sexp, C-j eval-print-last-sexp, "
+                            "C-c C-v eval-and-replace, "
                             "C-c C-e eval-buffer, RET auto-indents, C-c e/u expand/contract-region")
                        {:highlighter highlight-line
                         :highlight-line highlight-line-carry

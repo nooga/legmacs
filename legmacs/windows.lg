@@ -22,7 +22,8 @@
 ;; two windows showing the same buffer each keep their own cursor and
 ;; scroll, the way Emacs's window-point works.
 
-(ns legmacs.windows)
+(ns legmacs.windows
+  (:refer-clojure :exclude [index-of]))
 
 (def view-keys
   "The per-window slice of the flat editor state: everything about

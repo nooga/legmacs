@@ -238,6 +238,13 @@
           out (r/frame s 40 12)]
       (is (not (string/includes? out (r/region-bg)))))))
 
+(deftest evaluated-form-is-highlighted
+  (testing "a flat eval span paints the eval-highlight face"
+    (let [s (assoc (buf/new-state nil ["before (+ 1 2) after"])
+                   :eval-highlight {:start 7 :end 14 :sticky? true})
+          out (r/frame (buf/ensure-visible s 10 40) 40 12)]
+      (is (string/includes? out (get @r/bg-color-for :eval-highlight))))))
+
 (deftest cursor-placement-accounts-for-gutter-and-scroll
   (testing "cursor lands at gutter + (cursor-col - scroll-col), row offset by scroll-row"
     (let [s (buf/new-state nil (vec (map str (range 30))))

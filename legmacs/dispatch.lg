@@ -180,7 +180,13 @@
    text -- last-chord feeds displays like keycast's mode-line log, and
    dumping an entire pasted block there would be useless at best."
   [state chord]
-  (let [recording-before? (boolean (:kbd-macro-recording? state))
+  (let [;; A synchronous eval highlight is a one-command flash. Async eval
+        ;; marks it sticky and its completion callback clears it instead.
+        state (if (and (:eval-highlight state)
+                       (not (:sticky? (:eval-highlight state))))
+                (dissoc state :eval-highlight)
+                state)
+        recording-before? (boolean (:kbd-macro-recording? state))
         state* (cond
                  (:overlay state) (dissoc state :overlay)
                  (buf/query-replace-active? state) (buf/query-replace-answer state chord)

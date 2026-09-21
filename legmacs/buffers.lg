@@ -56,6 +56,7 @@
 ;; the world.
 
 (ns legmacs.buffers
+  (:refer-clojure :exclude [index-of])
   (:require [string]
             [os]
             [legmacs.windows :as win]))

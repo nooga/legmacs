@@ -49,6 +49,84 @@
           s (lg-mode/eval-print-last-sexp s)]
       (is (= ["(+ 1 2)" "3"] (:lines s))))))
 
+(deftest eval-form-detection-is-dwim-around-point
+  (testing "point may be anywhere inside a form, not precisely after it"
+    (let [s (assoc (buf/new-state nil ["before (+ 1 2) after"]) :cursor-col 10)]
+      (is (= [7 14] (lg-mode/form-span-at-point s)))
+      (is (= "=> 3" (:message (lg-mode/eval-last-sexp s))))))
+
+  (testing "point immediately after the close still selects that form"
+    (let [s (assoc (buf/new-state nil ["(+ 1 2) (+ 3 4)"]) :cursor-col 7)]
+      (is (= [0 7] (lg-mode/form-span-at-point s)))))
+
+  (testing "reader prefixes are part of a bracketed form"
+    (let [s (assoc (buf/new-state nil ["'(1 2 3)"]) :cursor-col 4)]
+      (is (= [0 8] (lg-mode/form-span-at-point s)))))
+
+  (testing "an active region wins and may contain more than one form"
+    (let [s (assoc (buf/new-state nil ["(+ 1 2) (+ 3 4)"])
+                   :mark [0 0] :cursor-row 0 :cursor-col 15)]
+      (is (= [0 15] (lg-mode/form-span-at-point s))))))
+
+(defn- settle-first-job [state]
+  (let [job (first (:async-jobs state))
+        outcome (deref (:promise job))]
+    ((:then job) (assoc state :async-jobs nil) outcome)))
+
+(deftest eval-replace-is-a-universal-async-command
+  (testing "an ordinary expression is highlighted, evaluated off-thread, and replaced"
+    (let [s (-> (buf/new-state nil ["before (+ 1 2) after"])
+                (assoc :cursor-col 10)
+                (modes/switch-to-mode :let-go))
+          running (lg-mode/eval-replace-sexp s)
+          done (settle-first-job running)]
+      (is (= "evaluating..." (:message running)))
+      (is (= {:start 7 :end 14 :sticky? true} (:eval-highlight running)))
+      (is (seq (:async-jobs running)))
+      (is (= ["before 3 after"] (:lines done)))
+      (is (= "Evaluated and replaced" (:message done)))
+      (is (nil? (:eval-highlight done)))))
+
+  (testing "a selected sequence evaluates in order and replaces with the last result"
+    (let [s (assoc (buf/new-state nil ["(+ 1 2) (+ 3 4)"])
+                   :mark [0 0] :cursor-row 0 :cursor-col 15)
+          done (settle-first-job (lg-mode/eval-replace-sexp s))]
+      (is (= ["7"] (:lines done)))))
+
+  (testing "the mode keymap owns C-c C-v"
+    (let [s (-> (buf/new-state nil ["(+ 2 3)"])
+                (assoc :cursor-col 3)
+                (modes/switch-to-mode :let-go)
+                (dispatch/dispatch "C-c")
+                (dispatch/dispatch "C-v"))]
+      (is (seq (:async-jobs s)))
+      (is (= "evaluating..." (:message s)))))
+
+  (testing "a read-only buffer is rejected before evaluation"
+    (let [s (lg-mode/eval-replace-sexp
+             (assoc (buf/new-state nil ["(+ 1 2)"]) :read-only? true :cursor-col 3))]
+      (is (= "Buffer is read-only" (:message s)))
+      (is (nil? (:async-jobs s))))))
+
+(deftest eval-replace-backend-is-swappable
+  (let [old @lg-mode/current-eval-backend
+        seen (atom nil)]
+    (try
+      (lg-mode/register-eval-backend! :test-remote
+                                      (fn [request]
+                                        (reset! seen request)
+                                        99))
+      (is (= :test-remote (lg-mode/use-eval-backend! :test-remote)))
+      (let [s (assoc (buf/new-state "remote.lg" ["(+ 40 2)"]) :cursor-col 4)
+            done (settle-first-job (lg-mode/eval-replace-sexp s))]
+        (is (= ["99"] (:lines done)))
+        (is (= "(+ 40 2)" (:source @seen)))
+        (is (= "remote.lg" (get-in @seen [:context :filename]))))
+      (is (nil? (lg-mode/use-eval-backend! :not-registered)))
+      (finally
+        (reset! lg-mode/current-eval-backend old)
+        (swap! lg-mode/eval-backends dissoc :test-remote)))))
+
 (deftest eval-buffer-runs-the-whole-thing
   (testing "evaluates every form top to bottom; later forms see earlier defs"
     (let [s (buf/new-state nil ["(def letgo-mode-test-a 10)" "(def letgo-mode-test-b 20)" "(+ letgo-mode-test-a letgo-mode-test-b)"])

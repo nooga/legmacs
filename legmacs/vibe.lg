@@ -11,17 +11,14 @@
 ;;                                          ; let-go.core (a live baseline
 ;;                                          ; refer every ns already has).
 ;;
-;;   C-c C-v                                ; vibe-replace: find the (vibe ...)
-;;                                          ; form around point, run it, and
-;;                                          ; replace the form's text with the
-;;                                          ; string it returned. Missing
-;;                                          ; (:require ...) entries for the
-;;                                          ; namespaces the code uses are
-;;                                          ; added to the file's ns form in
-;;                                          ; the same undo step.
+;;   C-c C-v                                ; let-go-mode's universal async
+;;                                          ; eval-and-replace command. vibe
+;;                                          ; supplies context and a tagged
+;;                                          ; source-aware result to it.
 ;;
-;; The interesting part is the context: vibe-replace hands the model the whole
-;; buffer with the call site swapped for a marker, plus a live catalog of
+;; The interesting part is the context: under generic eval-and-replace, vibe
+;; hands the model the whole buffer with the call site swapped for a marker,
+;; plus a live catalog of
 ;; loaded let-go namespaces (and tools to inspect them), so the answer is
 ;; written to fit *that spot* — surrounding defns, aliases, indentation and
 ;; all — rather than in a vacuum, and rather than as JVM Clojure.
@@ -47,7 +44,8 @@
             [legmacs.buffer :as buf]
             [legmacs.buffers :as bufs]
             [legmacs.keymap :as km :refer [defcommand]]
-            [legmacs.lisp-syntax :as ls]))
+            [legmacs.lisp-syntax :as ls]
+            [legmacs.modes.letgo :as letgo]))
 
 (def marker
   "What the call site is replaced with in the context sent to the model."
@@ -837,9 +835,8 @@
 ;; --- call-site context ---------------------------------------------------
 ;;
 ;; `vibe` is an ordinary function, so it can't see the buffer it was typed
-;; into. vibe-replace binds the call site here for the duration of the eval
-;; instead -- which also means (str (vibe "a") (vibe "b")) in one form works,
-;; and a bare (vibe "...") from a REPL still works, just contextless.
+;; into. Generic eval-and-replace exposes its call site separately; this
+;; older binding remains useful to programmatic callers and vibe-replace.
 ;;
 ;; A dynamic var, not an atom: spawn-task runs the eval in a future, and
 ;; two overlapping vibes would clobber a shared atom. Futures inherit the
@@ -858,6 +855,16 @@
   "The buffer's text with [start end) replaced by the marker."
   [text start end]
   (str (subs text 0 start) marker (subs text end)))
+
+(defn- eval-replace-vibe-context
+  "Derive vibe's prompt context from the generic eval-and-replace binding.
+   This is the only place vibe knows about the command: selection, async
+   execution, stale checks, and highlighting all stay in let-go-mode."
+  []
+  (when-let [{:keys [text start end filename column]} letgo/*eval-replace-context*]
+    {:text (context-text text start end)
+     :filename filename
+     :column column}))
 
 (defn user-message
   "The prompt actually sent. Splitting this out (pure, no I/O) is what
@@ -1003,9 +1010,10 @@
 (defn vibe
   "Ask the configured model for let-go code and return it as a string.
 
-   Called by vibe-replace (C-c C-v), which supplies the surrounding buffer
-   as context and splices the answer back over the call. Also fine on its
-   own: C-x C-e on (vibe \"...\") echoes the generated code.
+   Under let-go-mode's generic C-c C-v eval-and-replace command, derives its
+   own surrounding-buffer context and returns a tagged replacement result.
+   Otherwise it remains an ordinary string-returning function: C-x C-e on
+   (vibe \"...\") echoes the generated code and composition still works.
 
    Configuration is four layers, each beating the one before it: `defaults`,
    then vibe.edn, then the `config` atom (legmacs-init.lg), then `opts` for
@@ -1013,12 +1021,17 @@
   ([request] (vibe request {}))
   ([request opts]
    (let [cfg (merge defaults (read-config) @config opts)
-         provider (get providers (:provider cfg))]
+         provider (get providers (:provider cfg))
+         replace-ctx (eval-replace-vibe-context)
+         ctx (or *vibe-context* replace-ctx)]
      (when-not provider
        (throw (str "unknown vibe provider " (pr-str (:provider cfg)))))
-     (rewrite-clojure-ns
-      (strip-fences (request-completion cfg provider
-                                        (user-message request *vibe-context*)))))))
+     (let [code (rewrite-clojure-ns
+                 (strip-fences (request-completion cfg provider
+                                                   (user-message request ctx))))]
+       (if replace-ctx
+         (letgo/replacement-result :vibe code)
+         code)))))
 
 (defn- export-vibe-unqualified!
   "Intern `vibe` into let-go.core so it resolves in every namespace.
@@ -1109,6 +1122,11 @@
                         (string/join ", " added))
                    (str "vibed " (count code) " chars")))))))
 
+(defn- apply-vibe-result [state start end result]
+  (apply-vibe-code state start end (:legmacs.eval/text result)))
+
+(letgo/register-eval-result-handler! :vibe apply-vibe-result)
+
 ;; --- the command ---------------------------------------------------------
 
 (defn eval-vibe-form
@@ -1171,4 +1189,6 @@
                        "vibing...")
       (assoc state :message "No (vibe \"...\") form at point"))))
 
-(km/bind-key! "C-c C-v" :vibe-replace)
+;; C-c C-v is intentionally bound by let-go-mode to its generic
+;; :eval-replace-sexp command. vibe-replace remains callable by name for
+;; compatibility with old init files, but no key path treats vibe specially.
