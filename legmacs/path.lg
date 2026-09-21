@@ -4,6 +4,7 @@
 ;; this buffer's text meaning?" and joins paths using the host separator.
 
 (ns legmacs.path
+  (:refer-clojure :exclude [resolve])
   (:require [string]
             [os]))
 
