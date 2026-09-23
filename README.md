@@ -38,6 +38,8 @@ started:
   form (or select several), evaluate it without blocking the editor, and
   replace the source with its result; the active form is highlighted while
   it runs
+- an nREPL client (`C-c M-c`): point it at `lg -n` and the same eval keys
+  run in that process instead of the editor's
 - a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
   running transcript instead of building one by hand with `C-j`
 - `(vibe "...")`: write what you want where you want it, then use the same

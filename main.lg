@@ -27,6 +27,7 @@
             [legmacs.modes.crutch]
             [legmacs.modes.keycast]
             [legmacs.modes.help]
+            [legmacs.nrepl]
             ;; :refer, not just :as -- (vibe "...") typed into a buffer is
             ;; read and evaluated *in this namespace* (see legmacs.modes.letgo's
             ;; docstring). vibe.lg also intern's `vibe` into let-go.core so a

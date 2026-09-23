@@ -236,6 +236,8 @@ forms that aren't also valid let-go:
 | `C-j` | evaluate the s-expression before point, insert the result right there |
 | `C-c C-v` | asynchronously evaluate the region or form at point and replace it with the result |
 | `C-c C-e` | evaluate the whole buffer |
+| `C-c M-c` | connect to an nREPL server; every eval key above then runs there (see [nREPL](#nrepl)) |
+| `C-c C-q` | disconnect from nREPL, back to in-process eval |
 | `RET` | newline, aligned under the form it's inside |
 | `TAB` | re-indent the current line the same way |
 | `C-c e` | expand the selection outward (word → sexp → next sexp up → ...) |
@@ -412,14 +414,43 @@ frame is painted*, so the replacement shows up without a keystroke. C-g
 discards the result (it does not abort the request). A throw in the apply
 step is an echo-area message, not a crash. The mode line shows `evaluating...`
 so you still know work is in flight after the echo area has been cleared
-by typing. The same async boundary is where a future nREPL evaluator plugs
-in: form discovery, highlighting, stale-source checks, and main-thread
-application do not depend on the in-process backend. Register an
-async-safe `(fn [request] -> value)` with `register-eval-backend!` and select
-it with `use-eval-backend!`; the request carries `:source` plus filename,
-column, and namespace context. An nREPL backend can therefore send source
-and map its response to a value or `(replacement-result :source text)` when
-the server has already printed a replacement-ready value.
+by typing. The same async boundary is where other evaluators plug in: form
+discovery, highlighting, stale-source checks, and main-thread application
+do not depend on the in-process backend. Register an async-safe
+`(fn [request] -> value)` with `register-eval-backend!` and select it with
+`use-eval-backend!`; the request carries `:op` (`:eval`, or `:load` for
+`C-c C-e`), `:source`, and filename/line/column/namespace context. A
+backend whose server has already printed the value returns
+`(printed-result text out)`, which `C-c C-v` splices verbatim and the
+other commands show verbatim. While any backend other than `:in-process`
+is selected, `C-x C-e`, `C-j` and `C-c C-e` go through it asynchronously
+too, and the let-go-mode lighter names it.
+
+### nREPL
+
+[`legmacs/nrepl.lg`](../legmacs/nrepl.lg) is the one such backend that
+ships. Start a server next to your project with `lg -n` (it writes
+`.nrepl-port`), then `C-c M-c` (`M-x nrepl-connect`) in a let-go buffer:
+the prompt is pre-filled from the nearest `.nrepl-port` at or above the
+buffer's directory, and a bare port means localhost. From then on:
+
+- `C-x C-e` / `C-j` / `C-c C-v` send the form with the buffer's `ns`,
+  file, line and column; `C-c C-e` is the server's `load-file`
+- anything the form printed shows in the echo area above `=> value`
+- a server error is an ordinary `Eval error:` with the message and its
+  `caused by:` chain on one line (the source excerpt and stack are dropped)
+- evaluating in a namespace the server hasn't loaded yet says so: let-go's
+  server quietly falls back to `user` instead of failing, so defs would
+  otherwise land somewhere unexpected. `C-c C-e` the file once first
+- `C-j` checks the form is still where it was before inserting, like
+  `C-c C-v` does, and both check you're still in the same buffer
+
+`C-c C-q` (`M-x nrepl-disconnect`) goes back to in-process eval. The
+`*repl*` buffer always stays in-process: it is the editor's own REPL.
+Requests are one blocking round trip at a time inside the usual
+`spawn-task` future, so there is no background reader for the main loop to
+poll; `C-g` drops a pending result but the server still finishes the
+request (let-go's server doesn't implement `interrupt` yet).
 
 Any file ending in `.md` or `.markdown` opens into **markdown-mode**
 (highlighting only, no key bindings of its own, so every global key still
@@ -819,6 +850,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: structural form discovery, in-process eval, async eval-and-replace, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
+| [`legmacs/nrepl.lg`](../legmacs/nrepl.lg) | nREPL client (`C-c M-c` / `C-c C-q`): bencode round trips over `net`, registered as the `:nrepl` eval backend so every let-go-mode eval command runs on the server while connected. |
 | [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")`: ask an LLM for let-go code, deriving surrounding-buffer context when invoked by generic `C-c C-v`, then use a tagged eval-result handler to rewrite namespaces and add missing `(:require ...)`s. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |

@@ -42,8 +42,11 @@ lg test/run.lg
 Run a single test namespace (faster iteration than the full suite):
 
 ```sh
-lg -e "(require '[test :refer [run-tests]] '[test.region-test]) (run-tests)"
+lg -e "(require '[test :refer [run-tests]] '[test.region-test]) (run-tests 'test.region-test)"
 ```
+
+(`run-tests` with no arguments tests only `*ns*`, like Clojure's, so name
+the namespace -- a bare `(run-tests)` reports 0 tests and success.)
 
 There's no separate build/lint step — `lg` interprets `.lg` source directly.
 `test/run.lg` is a hand-maintained list of every test namespace; adding a
@@ -254,10 +257,18 @@ form at point, highlights it, snapshots its source, and evaluates it through
 `bufs/spawn-task`. Completion verifies that the source span is unchanged
 before replacing it. Ordinary values use `pr-str`; functions that need
 source-aware application return `replacement-result` with a registered
-result-kind handler. This async/result seam is also the intended boundary
-for a future nREPL backend: `register-eval-backend!` installs an async-safe
-`(fn [request] -> value)` and `use-eval-backend!` selects it. Requests carry
-the source plus filename/column/namespace context; backends never touch live
+result-kind handler. The same seam carries every other eval command: all four build one
+request (`:op` `:eval`/`:load`, `:source`, `:forms`, `:state`, and
+filename/line/column/namespace `:context`) and hand it to the selected
+backend. With `:in-process` selected, `C-x C-e`/`C-j`/`C-c C-e` still eval
+synchronously on the main thread (so editor-scripting forms take effect
+before the next frame); any other backend makes them `spawn-task` jobs too.
+Remote backends return `printed-result` (text the server printed, plus
+captured output) since the value never existed in this VM. `legmacs.nrepl`
+is that backend for nREPL: one blocking bencode round trip per request,
+serialized by a channel-token lock, inside the job's future -- so no
+long-lived reader goroutine exists for `loop-wait` to keep polling. The
+`*repl*` buffer deliberately stays in-process. Backends never touch live
 buffer state.
 
 `legmacs.vibe/vibe` uses that protocol rather than owning a special key
