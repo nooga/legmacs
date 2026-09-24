@@ -270,7 +270,16 @@ backend makes them `spawn-task` jobs too. Remote backends return
 `printed-result` (text the server printed, plus captured output) since
 the value never existed in this VM. Completion
 (`legmacs.modes.letgo-complete`, TAB/M-TAB) routes the same way through a
-per-backend `completers` registry.
+per-backend `completers` registry, and so do eldoc, doc and `M-.`
+(`legmacs.modes.letgo-lookup`, a `lookups` registry of `(fn [request] ->
+info-map)`). let-go-mode's single `:after-command` now runs
+paren-matching and then `letgo/after-command-hooks` (eldoc is one), each
+in a try so a failing hook can't break editing. eldoc runs every key, so
+it scans only back to the enclosing top-level form (a `(` in column 0)
+and reads the ns form from the buffer's first 80 lines; remote answers
+come from a short-TTL cache, fetched by a quiet `spawn-task`. Goto uses
+a `:visit` buffer-command (show buffer by `:id`/`:filename`/`:name`, or
+open `:state`, at `:row`/`:col`) and a shared `:xref-stack` for `M-,`.
 
 `legmacs.nrepl` is the nREPL backend: one connection per project root
 (buffers with a `:filename` under it resolve to it; fileless buffers like

@@ -7,6 +7,7 @@
             [legmacs.buffer :as buf]
             [legmacs.modes :as modes]
             [legmacs.modes.letgo :as lg-mode]
+            [legmacs.modes.letgo-lookup :as lookup]
             [legmacs.nrepl :as nrepl]))
 
 ;; The pure half is tested directly; the wire half against a fake server
@@ -98,6 +99,11 @@
         ns (get msg "ns" "user")]
     (case op
       "clone" (reply! c msg {"new-session" "sess-1" "status" ["done"]})
+      "info" (if (= "sq" (get msg "sym"))
+               (reply! c msg {"name" "sq" "ns" "demo.core" "doc" "Squares."
+                              "arglists-str" "[x]" "file" "file:/src/demo.lg"
+                              "line" 2 "column" 1 "status" ["done"]})
+               (reply! c msg {"status" ["done" "no-info"]}))
       ("eval" "load-file")
       (do
         ;; a straggler for some other id first: the client must skip it
@@ -208,6 +214,51 @@
                     (modes/switch-to-mode :let-go)
                     (assoc :cursor-col 7))]
           (is (= "=> 3" (:message (lg-mode/eval-last-sexp s)))))))))
+
+(deftest reply->info-shapes
+  (testing "cider-nrepl info"
+    (is (= {:name "sq" :ns "demo" :kind nil :arglists ["[x]" "[x y]"] :doc "Sq."
+            :file "file:/a.clj" :line 3 :column 1}
+           (nrepl/reply->info [{"name" "sq" "ns" "demo" "doc" "Sq." "arglists-str" "[x]\n[x y]"
+                                "file" "file:/a.clj" "line" 3 "column" 1 "status" ["done"]}]))))
+  (testing "cider-nrepl eldoc"
+    (is (= ["[f]" "[f coll]"]
+           (:arglists (nrepl/reply->info [{"name" "map" "ns" "clojure.core" "type" "function"
+                                           "eldoc" [["f"] ["f" "coll"]] "status" ["done"]}])))))
+  (testing "nREPL's built-in lookup nests its answer"
+    (is (= "Sq." (:doc (nrepl/reply->info [{"info" {"name" "sq" "doc" "Sq."} "status" ["done"]}])))))
+  (testing "nothing known"
+    (is (nil? (nrepl/reply->info [{"status" ["done" "no-info"]}])))
+    (is (nil? (nrepl/reply->info [{"status" ["done"]}])))))
+
+(deftest lookup-message-picks-the-op
+  (is (= {:op "eldoc" :sym "map" :ns "demo"}
+         (nrepl/lookup-message {:ops #{"eldoc" "info"}} "map" 'demo :eldoc)))
+  (is (= {:op "info" :sym "map" :ns "demo"}
+         (nrepl/lookup-message {:ops #{"eldoc" "info"}} "map" 'demo :info)))
+  (is (= {:op "lookup" :sym "map"} (nrepl/lookup-message {:ops #{"lookup"}} "map" nil :eldoc))))
+
+(deftest lookups-go-through-the-server
+  (with-fake-connection
+    (fn [_conn _seen]
+      (testing "eldoc: asks in the background, then shows the answer"
+        (let [s (-> (lg-buffer ["(sq 1)"] 3) (assoc :message nil))
+              asking (lookup/eldoc s)
+              done (settle-first-job asking)]
+          (is (nil? (:message asking)))
+          (is (seq (:async-jobs asking)))
+          (is (= "demo.core/sq: [x]" (:message done)))
+          (testing "and answers from its cache next time, without asking"
+            (let [again (lookup/eldoc (assoc s :message nil))]
+              (is (= "demo.core/sq: [x]" (:message again)))
+              (is (empty? (:async-jobs again)))))))
+      (testing "doc"
+        (let [done (settle-first-job (lookup/show-doc (lg-buffer ["(sq 1)"] 2)))]
+          (is (= "demo.core/sq" (first (get-in done [:buffer-command :state :lines]))))))
+      (testing "M-. in the same file moves point"
+        (let [done (settle-first-job (lookup/find-definition (lg-buffer ["(sq 1)" "(defn sq [x])"] 2)))]
+          (is (= [1 0] [(:cursor-row done) (:cursor-col done)]))
+          (is (nil? (:message done))))))))
 
 (deftest disconnected-means-in-process-again
   (is (not (nrepl/connected?)))

@@ -34,7 +34,8 @@
             [legmacs.minibuffer :as mb]
             [legmacs.path :as path]
             [legmacs.modes.letgo :as letgo]
-            [legmacs.modes.letgo-complete :as complete]))
+            [legmacs.modes.letgo-complete :as complete]
+            [legmacs.modes.letgo-lookup :as lookup]))
 
 (def default-port 2137)
 
@@ -359,6 +360,55 @@
      (request conn (completion-message conn (:prefix req) (:namespace req))))))
 
 (complete/register-completer! :nrepl nrepl-completer)
+
+;; --- lookup (eldoc, doc, M-.) ----------------------------------------------
+
+(defn lookup-message
+  "cider-nrepl's `eldoc` for eldoc when the server has it, else `info`
+   (cider-nrepl, let-go) or nREPL 1.x's built-in `lookup`."
+  [conn sym ns want]
+  (let [ops (:ops conn)
+        op (cond (and (= want :eldoc) (contains? ops "eldoc")) "eldoc"
+                 (contains? ops "info") "info"
+                 (contains? ops "lookup") "lookup"
+                 :else "info")]
+    (cond-> {:op op :sym sym}
+      ns (assoc :ns (str ns)))))
+
+(defn- eldoc-arglist [args]
+  (str "[" (string/join " " args) "]"))
+
+(defn reply->info
+  "An info map (see legmacs.modes.letgo-lookup) from `info`, `lookup`
+   (which nests its answer under \"info\") or `eldoc` replies; nil when
+   the server knows nothing about the symbol."
+  [replies]
+  (let [r (reduce (fn [acc r] (merge acc (or (get r "info") r))) {} replies)
+        status (set (mapcat #(get % "status") replies))
+        arglists (cond
+                   (seq (get r "eldoc")) (mapv eldoc-arglist (get r "eldoc"))
+                   (get r "arglists-str") (vec (remove string/blank?
+                                                       (string/split (get r "arglists-str") "\n")))
+                   :else [])]
+    (when (and (not (contains? status "no-info")) (or (get r "name") (get r "doc")))
+      {:name (get r "name")
+       :ns (get r "ns")
+       :kind (cond (get r "special-form") "special form"
+                   (get r "macro") "macro"
+                   (get r "type") (get r "type")
+                   :else nil)
+       :arglists arglists
+       :doc (or (get r "doc") (get r "docstring"))
+       :file (get r "file")
+       :line (get r "line")
+       :column (get r "column")})))
+
+(defn nrepl-lookup [req]
+  (let [conn (connection-for-request req)]
+    (reply->info
+     (request conn (lookup-message conn (:symbol req) (:namespace req) (:want req))))))
+
+(lookup/register-lookup! :nrepl nrepl-lookup)
 
 ;; --- commands ------------------------------------------------------------
 

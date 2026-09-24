@@ -242,6 +242,9 @@ forms that aren't also valid let-go:
 | `RET` | newline, aligned under the form it's inside |
 | `TAB` | re-indent the current line the same way; if that changes nothing and point is after a symbol, complete it |
 | `M-TAB` | complete the symbol at point (`C-M-i` sends this) |
+| `M-.` | jump to the definition of the symbol at point (into a jar, read-only, for Clojure libraries) |
+| `M-,` | jump back to where the last `M-.` came from |
+| `C-c C-d d` | show the symbol at point's arglists, doc and source location in `*Help*` (also `C-c C-d C-d`) |
 | `C-c e` | expand the selection outward (word → sexp → next sexp up → ...) |
 | `C-c u` | contract the selection back in, undoing the last expand |
 | `(` / `[` / `{` | insert the matching closer too, point left between them |
@@ -445,6 +448,39 @@ special forms. On an nREPL connection the server answers, using
 cider-nrepl's context-aware `complete` when it has it. A backend supplies
 its own with
 `(legmacs.modes.letgo-complete/register-completer! :backend f)`.
+
+### Eldoc, doc, and definitions
+
+While you type inside a call, the echo area shows what's being called and
+its arglists -- `legmacs.buffer/new-state: [filename lines]` -- whenever
+nothing else is using it (a result or an error always wins).
+`C-c C-d d` puts the symbol at point's arglists, docstring and source
+location in `*Help*`. `M-.` jumps to its definition, opening the file if
+it isn't open yet; `M-,` jumps back, across buffers, as many times as you
+went forward.
+
+These answer from the same place as eval and completion. In the editor's
+VM that's the var's own metadata, resolved through the buffer's `ns`,
+its aliases, and its `ns` form's `:require`s; a relative `:file` (let-go
+records `legmacs/buffer.lg`) is found from the buffer's directory
+upward, then the let-go source path. On an nREPL connection the server
+answers: with cider-nrepl (every Clojure CLI jack-in) that is full
+arglists and docs for everything including `clojure.core`, and `M-.`
+into a library opens its source straight out of the jar as a read-only
+buffer. Remote eldoc answers are cached for a few seconds, so typing
+doesn't mean a round trip per key.
+
+Two limits come from let-go rather than legmacs: its core functions
+(`map`, `str`, ...) carry no arglists or docstrings, and live in the
+runtime's embedded sources, so they get neither eldoc nor a file to
+jump to; and its nREPL server's `info` returns only a name, so on an
+`lg`/lgx connection doc and `M-.` have little to go on yet. The
+AOT-built binary (`build.sh`) currently also loses `def` metadata, so
+there in-process eldoc/doc/`M-.` know a var's name but not its arglists,
+doc or file; running from source (`lg main.lg`, `bin/legmacs`) has all
+of it.
+`(reset! legmacs.modes.letgo-lookup/eldoc-enabled? false)` turns eldoc
+off; a backend adds lookups with `register-lookup!`.
 
 ### nREPL
 
@@ -910,6 +946,7 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
 | [`legmacs/nrepl.lg`](../legmacs/nrepl.lg) | nREPL client (`C-c M-c` / `C-c C-q`): bencode round trips over `net`, one connection per project root, registered as the `:nrepl` eval backend and completer for buffers under a connected root. |
 | [`legmacs/jack_in.lg`](../legmacs/jack_in.lg) | `C-c M-j`: launch configs (lgx, Clojure CLI, Babashka, lg), project detection, and the server process's lifecycle -- spawn under `sh`, wait for the port, stop on disconnect or exit. |
+| [`legmacs/modes/letgo_lookup.lg`](../legmacs/modes/letgo_lookup.lg) | eldoc, `C-c C-d d` doc and `M-.`/`M-,` goto-definition for let-go-mode, from the editor's VM or the buffer's nREPL server. |
 | [`legmacs/modes/letgo_complete.lg`](../legmacs/modes/letgo_complete.lg) | Symbol completion for let-go-mode (`TAB` / `M-TAB`): in-process from the editor's VM, or from the buffer's nREPL server. |
 | [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")`: ask an LLM for let-go code, deriving surrounding-buffer context when invoked by generic `C-c C-v`, then use a tagged eval-result handler to rewrite namespaces and add missing `(:require ...)`s. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |

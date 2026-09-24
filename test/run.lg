@@ -32,7 +32,8 @@
             [test.vibe-test]
             [test.nrepl-test]
             [test.jack-in-test]
-            [test.letgo-complete-test]))
+            [test.letgo-complete-test]
+            [test.letgo-lookup-test]))
 
 ;; run-tests with no args only tests *ns* (test.run itself, which has none).
 (run-all-tests #"test\..*-test")

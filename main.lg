@@ -28,6 +28,7 @@
             [legmacs.modes.keycast]
             [legmacs.modes.help]
             [legmacs.modes.letgo-complete]
+            [legmacs.modes.letgo-lookup]
             [legmacs.nrepl]
             [legmacs.jack-in]
             ;; :refer, not just :as -- (vibe "...") typed into a buffer is

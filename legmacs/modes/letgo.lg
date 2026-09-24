@@ -961,6 +961,24 @@
 (km/bind-key! keymap "}" :auto-close-brace)
 (km/bind-key! keymap "DEL" :auto-delete-pair)
 
+(def after-command-hooks
+  "name -> (fn [state] -> state), run after every command in let-go-mode,
+   after paren-matching. eldoc (legmacs.modes.letgo-lookup) is one. A
+   hook that throws is skipped for that command rather than breaking it."
+  (atom {}))
+
+(defn add-after-command-hook!
+  "Register (or replace) a let-go-mode after-command hook."
+  [name f]
+  (swap! after-command-hooks assoc name f)
+  name)
+
+(defn- run-hook [state f]
+  (try (f state) (catch e state)))
+
+(defn- let-go-after-command [state]
+  (reduce run-hook (update-paren-match state) (vals @after-command-hooks)))
+
 (modes/register-mode! :let-go keymap
                        (str "let-go-mode: C-x C-e eval-last-sexp, C-j eval-print-last-sexp, "
                             "C-c C-v eval-and-replace, "
@@ -968,7 +986,7 @@
                        {:highlighter highlight-line
                         :highlight-line highlight-line-carry
                         :highlight-carry highlight-carry
-                        :after-command update-paren-match
+                        :after-command let-go-after-command
                         :status eval-backend-status})
 (modes/register-auto-mode! ".lg" :let-go)
 ;; let-go is a Clojure dialect, and shares its reader syntax closely enough

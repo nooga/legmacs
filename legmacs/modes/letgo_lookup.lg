@@ -1,0 +1,381 @@
+(ns legmacs.modes.letgo-lookup
+  "Symbol lookup for let-go-mode: eldoc, doc, and goto-definition --
+   CIDER's cider-eldoc, cider-doc (C-c C-d d), and M-. / M-,.
+
+   - eldoc: while you type inside a call, the echo area shows the called
+     function's arglists, `ns/name: [x] [x y]` (only when nothing else
+     wants the echo area)
+   - C-c C-d d (also C-c C-d C-d): the symbol at point's arglists, doc,
+     and source location in *Help*
+   - M-.: jump to the definition of the symbol at point, opening its file
+     -- or, for a Clojure library, the file inside its jar, read-only.
+     M-, jumps back (a stack, across buffers)
+
+   Like completion, lookups go to the buffer's eval backend (see
+   legmacs.modes.letgo/eval-backend-for): the editor's own VM resolves
+   the symbol in the buffer's namespace and aliases and reads the var's
+   metadata; an nREPL connection asks the server (cider-nrepl's `info`
+   and `eldoc`). A backend supplies its own with `register-lookup!`.
+
+   An info map is {:name :ns :kind :arglists [str] :doc :file :line
+   :column}; any of it may be missing. let-go's own core vars carry no
+   arglists or docs yet, and live in the runtime's embedded sources, so
+   they have eldoc/doc only where the runtime provides it and no file to
+   jump to. The AOT-built binary also drops def metadata for now, so
+   there in-process lookups know names but not arglists, docs or files."
+  (:require [string]
+            [os]
+            [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.path :as path]
+            [legmacs.commands :as commands]
+            [legmacs.modes :as modes]
+            [legmacs.modes.help :as help]
+            [legmacs.lisp-syntax :as ls]
+            [legmacs.modes.letgo :as letgo]
+            [legmacs.modes.letgo-complete :as complete]))
+
+;; --- in-process lookup ------------------------------------------------------
+
+(def ^:private special-forms
+  #{"def" "if" "do" "let*" "fn*" "loop*" "recur" "quote" "var" "throw" "try"
+    "catch" "finally" "new" "set!" "letfn*" "case*"})
+
+(defn- var-for
+  "The var `sym-str` names in `ns-sym` (or the current namespace), through
+   `aliases` too. Qualified names find private vars as well."
+  [sym-str ns-sym aliases]
+  (let [ns (or (when ns-sym (find-ns ns-sym)) *ns*)
+        aliases (merge aliases (ns-aliases ns))
+        slash (string/index-of sym-str "/")]
+    (if (and slash (pos? slash) (< slash (dec (count sym-str))))
+      (let [q (symbol (subs sym-str 0 slash))
+            target (or (get aliases q) (find-ns q))]
+        (when target (get (ns-interns target) (symbol (subs sym-str (inc slash))))))
+      (let [v (get (ns-map ns) (symbol sym-str))]
+        (when (var? v) v)))))
+
+(defn- var-name-parts
+  "[ns name] from the var's printed form, #'ns/name -- for when its
+   metadata is missing (the AOT-built binary keeps none today)."
+  [v]
+  (when-let [[_ n s] (re-matches #"#'([^/]+)/(.+)" (str v))] [n s]))
+
+(defn var-info
+  "The info map for a var, from its metadata."
+  [v]
+  (let [m (meta v)
+        [pns pname] (var-name-parts v)
+        value (try (deref v) (catch e nil))]
+    {:name (or (some-> (:name m) str) pname)
+     :ns (or (when-let [n (:ns m)] (str (ns-name n))) pns)
+     :kind (cond (:macro m) "macro" (fn? value) "function" :else "var")
+     :arglists (mapv pr-str (:arglists m))
+     :doc (:doc m)
+     :file (:file m) :line (:line m) :column (:column m)}))
+
+(defn in-process-info
+  "Info for `sym-str` in the editor's VM, as the buffer `state` sees it."
+  [sym-str ns-sym state]
+  (if-let [v (var-for sym-str ns-sym (complete/require-aliases state))]
+    (var-info v)
+    (when (contains? special-forms sym-str)
+      {:name sym-str :kind "special form"})))
+
+(defn- in-process-lookup [{:keys [symbol namespace state]}]
+  (in-process-info symbol namespace state))
+
+(def lookups
+  "backend keyword -> (fn [request] -> info-map or nil). Remote lookups run
+   inside a bufs/spawn-task future. The request is {:symbol :namespace
+   :want (:eldoc or :info) :state :backend :context {:filename
+   :directory}}."
+  (atom {:in-process in-process-lookup}))
+
+(defn register-lookup!
+  "Supply lookups for buffers evaluated by `backend`."
+  [backend lookup]
+  (swap! lookups assoc backend lookup)
+  backend)
+
+(defn- lookup-request [state sym want]
+  {:symbol sym :namespace (complete/ns-name-of state) :want want :state state
+   :backend (:backend (letgo/eval-backend-for state))
+   :context {:filename (:filename state) :directory (path/default-directory state)}})
+
+;; --- running one: now in-process, or later from a server ------------------
+
+(defn- lookup-io [f req] (fn [] (f req)))
+
+(defn- lookup-then [k sym]
+  (fn [state outcome]
+    (if-let [err (:err outcome)]
+      (assoc state :message (str "Lookup failed: " (or (ex-message err) (str err))))
+      (k (assoc state :message nil) sym (:ok outcome)))))
+
+(defn- with-info
+  "Look `sym` up for `state` and continue with (k state sym info) -- right
+   away in-process, else when the backend answers."
+  [state sym want k]
+  (let [req (lookup-request state sym want)
+        f (get @lookups (:backend req))]
+    (cond
+      (= :in-process (:backend req)) (k state sym (in-process-lookup req))
+      f (bufs/spawn-task state (lookup-io f req) (lookup-then k sym) "looking up...")
+      :else (assoc state :message (str "No lookup for " (name (:backend req)))))))
+
+(defn qualified-name [info]
+  (if (:ns info) (str (:ns info) "/" (:name info)) (str (:name info))))
+
+;; --- eldoc ---------------------------------------------------------------
+
+(def ^:private scan-back-limit
+  "How many lines eldoc scans back for the start of the top-level form."
+  300)
+
+(defn- top-level-start
+  "The nearest row at or above `row` that starts a top-level form (a `(`
+   in column 0), so eldoc scans one form rather than the whole file."
+  [lines row]
+  (let [floor (max 0 (- row scan-back-limit))]
+    (loop [r row]
+      (cond
+        (<= r floor) floor
+        (string/starts-with? (nth lines r) "(") r
+        :else (recur (dec r))))))
+
+(defn call-at-point
+  "The symbol in function position of the innermost list around point --
+   what eldoc describes -- or nil (point in a string or comment, or the
+   list's head isn't a symbol)."
+  [state]
+  (let [{:keys [lines cursor-row cursor-col]} state
+        r0 (top-level-start lines cursor-row)
+        text (str (string/join "\n" (subvec lines r0 cursor-row))
+                  (when (> cursor-row r0) "\n")
+                  (subs (nth lines cursor-row) 0 cursor-col))
+        {:keys [stack code?]} (ls/open-stack-at* text (count text))
+        paren (first (filter (fn [[ch _]] (= ch \()) stack))]
+    (when (and code? paren)
+      (let [head (re-find #"^[^\s,()\[\]{}\"';`~@^\\]+" (subs text (inc (second paren))))]
+        (when (and head
+                   (not (string/starts-with? head ":"))
+                   (not (re-matches #"[+-]?\d.*" head)))
+          head)))))
+
+(defn eldoc-string
+  "`ns/name: [x] [x y]`, or nil when there are no arglists to show."
+  [info]
+  (when (seq (:arglists info))
+    (str (qualified-name info) ": " (string/join " " (:arglists info)))))
+
+(def eldoc-enabled?
+  "Set to false to turn eldoc off."
+  (atom true))
+
+(def ^:private eldoc-ttl-ms 15000)
+
+(def ^:private eldoc-cache
+  "Remote eldoc answers, [backend directory ns symbol] -> [time string-or-nil].
+   Short-lived, since evaluating a new defn changes the answer."
+  (atom {}))
+
+(def ^:private eldoc-pending (atom #{}))
+
+(defn- now-ms [] (.UnixMilli (now)))
+
+(defn- cache-key [req]
+  [(:backend req) (get-in req [:context :directory]) (:namespace req) (:symbol req)])
+
+(defn- cached [k]
+  (when-let [[t v] (get @eldoc-cache k)]
+    (when (< (- (now-ms) t) eldoc-ttl-ms) [v])))
+
+(defn- fetch-eldoc
+  "Background half of a remote eldoc: ask, cache, clear the pending mark."
+  [f req k]
+  (fn []
+    (let [v (try (eldoc-string (f req)) (catch e nil))]
+      (swap! eldoc-cache assoc k [(now-ms) v])
+      (swap! eldoc-pending disj k)
+      v)))
+
+(declare eldoc)
+
+(defn- eldoc-arrived [state _outcome] (eldoc state))
+
+(defn- remote-eldoc [state req]
+  (let [k (cache-key req)
+        f (get @lookups (:backend req))]
+    (if-let [[v] (cached k)]
+      (if v (assoc state :message v) state)
+      (if (or (nil? f) (contains? @eldoc-pending k))
+        state
+        (do (swap! eldoc-pending conj k)
+            (bufs/spawn-task state (fetch-eldoc f req k) eldoc-arrived))))))
+
+(defn eldoc
+  "let-go-mode after-command hook: show the enclosing call's arglists in
+   the echo area -- unless something already put a message there or the
+   minibuffer is open."
+  [state]
+  (if (or (not @eldoc-enabled?) (:message state) (:minibuffer state) (:overlay state))
+    state
+    (if-let [sym (call-at-point state)]
+      (let [req (lookup-request state sym :eldoc)]
+        (if (= :in-process (:backend req))
+          (if-let [s (eldoc-string (in-process-lookup req))]
+            (assoc state :message s)
+            state)
+          (remote-eldoc state req)))
+      state)))
+
+(letgo/add-after-command-hook! :eldoc eldoc)
+
+;; --- doc -------------------------------------------------------------------
+
+(defn doc-lines
+  "The *Help* page for an info map."
+  [info]
+  (let [doc (when-let [d (:doc info)] (map #(str "  " (string/trim %)) (string/split d "\n")))
+        where (when (:file info)
+                (str "Defined in " (string/replace (:file info) #"^(jar:)?file:(//)?" "")
+                     (when (:line info) (str ":" (:line info)))))]
+    (vec (concat [(qualified-name info)]
+                 (when (:kind info) [(:kind info)])
+                 (when (seq (:arglists info)) [(string/join " " (:arglists info))])
+                 [""]
+                 (or (seq doc) ["  (no documentation)"])
+                 (when where ["" where])))))
+
+(defn- show-doc-for [state sym info]
+  (if info
+    (help/pop-to-help state "*Help*" (doc-lines info))
+    (assoc state :message (str "No documentation for " sym))))
+
+(defcommand show-doc
+  "Show the doc, arglists and source location of the symbol at point in
+   *Help* (CIDER's C-c C-d d)."
+  [state]
+  (if-let [sym (complete/symbol-at-point state)]
+    (with-info state sym :info show-doc-for)
+    (assoc state :message "No symbol at point")))
+
+;; --- goto definition -------------------------------------------------------
+
+(defn- exists? [p] (some? (os/stat p)))
+
+(defn- ancestors-of [dir]
+  (loop [d (path/absolute-path dir), out []]
+    (let [up (path/dirname d)]
+      (if (and up (not= up d)) (recur up (conj out d)) (conj out d)))))
+
+(defn- source-roots
+  "Where a relative :file could live: the buffer's directory and its
+   ancestors (a project-relative path like src/demo/core.clj), then the
+   let-go source path, then the editor's cwd."
+  [state]
+  (let [env (os/getenv "LG_SOURCE_PATHS")]
+    (distinct
+     (concat (ancestors-of (path/default-directory state))
+             (when (seq env)
+               (map path/absolute-path (remove string/blank? (string/split env os/path-separator))))
+             [(os/cwd)]))))
+
+(defn locate
+  "Where a definition's :file is: {:path abs} for a file on disk, {:jar
+   :entry} for a file inside a jar, {:embedded name} for let-go's embedded
+   sources, or nil when it can't be found."
+  [file state]
+  (cond
+    (string/starts-with? file "jar:")
+    (let [s (string/replace (subs file 4) #"^file:(//)?" "")
+          i (string/index-of s "!/")]
+      (when i {:jar (subs s 0 i) :entry (subs s (+ i 2))}))
+    (string/starts-with? file "file:") {:path (string/replace file #"^file:(//)?" "")}
+    (string/starts-with? file "<") {:embedded file}
+    (path/absolute? file) (when (exists? file) {:path file})
+    :else (some (fn [root]
+                  (let [p (path/join root file)] (when (exists? p) {:path p})))
+                (source-roots state))))
+
+(def ^:private xref-depth 50)
+
+(defn- push-xref [state]
+  (assoc state :xref-stack
+         (take xref-depth (cons {:id (:current-buffer-id state)
+                                 :row (:cursor-row state) :col (:cursor-col state)}
+                                (:xref-stack state)))))
+
+(defn- goto-here [state row col]
+  (-> state
+      buf/push-mark
+      (assoc :cursor-row row :cursor-col col :goal-col nil :recenter true)
+      buf/clamp-cursor))
+
+(defn- open-buffer-id [state abs]
+  (some (fn [b] (when (and (:filename b) (= abs (path/absolute-path (:filename b)))) (:id b)))
+        (:buffer-list state)))
+
+(defn- visit-path [state abs row col]
+  (let [current (when (:filename state) (path/absolute-path (:filename state)))]
+    (if (= current abs)
+      (goto-here (push-xref state) row col)
+      (let [id (open-buffer-id state abs)]
+        (assoc (push-xref state)
+               :buffer-command (if id
+                                 {:op :visit :id id :row row :col col}
+                                 {:op :visit :filename abs :row row :col col
+                                  :state (first (commands/new-file-state abs))}))))))
+
+(defn- jar-buffer-state [jar entry name]
+  (let [text (:out (os/sh "unzip" "-p" jar entry))]
+    (when-not (string/blank? text)
+      (-> (buf/new-state nil (buf/split-lines text))
+          (modes/switch-to-mode :let-go)
+          (assoc :buffer-name name :read-only? true
+                 :default-directory (path/directory-of jar))))))
+
+(defn- visit-jar [state jar entry row col]
+  (let [name (str entry " (" (last (string/split jar "/")) ")")]
+    (if (some #(= name (:name %)) (:buffer-list state))
+      (assoc (push-xref state) :buffer-command {:op :visit :name name :row row :col col})
+      (if-let [st (jar-buffer-state jar entry name)]
+        (assoc (push-xref state) :buffer-command {:op :visit :name name :state st :row row :col col})
+        (assoc state :message (str "Couldn't read " entry " from " jar))))))
+
+(defn- goto-info [state sym info]
+  (let [where (when-let [f (:file info)] (locate f state))
+        row (dec (or (:line info) 1))
+        col (dec (or (:column info) 1))]
+    (cond
+      (nil? info) (assoc state :message (str "No definition found for " sym))
+      (nil? (:file info)) (assoc state :message (str "No source location for " (qualified-name info)))
+      (:embedded where) (assoc state :message (str (qualified-name info) " is in let-go's embedded "
+                                                   (:embedded where) " (no file to open)"))
+      (:jar where) (visit-jar state (:jar where) (:entry where) row col)
+      (:path where) (visit-path state (:path where) row col)
+      :else (assoc state :message (str "Can't find " (:file info))))))
+
+(defcommand find-definition
+  "Jump to the definition of the symbol at point (M-.); M-, comes back."
+  [state]
+  (if-let [sym (complete/symbol-at-point state)]
+    (with-info state sym :info goto-info)
+    (assoc state :message "No symbol at point")))
+
+(defcommand pop-definition-stack
+  "Go back to where the last M-. jumped from (M-,)."
+  [state]
+  (if-let [{:keys [id row col]} (first (:xref-stack state))]
+    (let [state (assoc state :xref-stack (rest (:xref-stack state)))]
+      (if (= id (:current-buffer-id state))
+        (goto-here state row col)
+        (assoc state :buffer-command {:op :visit :id id :row row :col col})))
+    (assoc state :message "No previous location")))
+
+(km/bind-key! letgo/keymap "M-." :find-definition)
+(km/bind-key! letgo/keymap "M-," :pop-definition-stack)
+(km/bind-key! letgo/keymap "C-c C-d d" :show-doc)
+(km/bind-key! letgo/keymap "C-c C-d C-d" :show-doc)

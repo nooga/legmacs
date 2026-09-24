@@ -42,8 +42,9 @@ started:
   -- lgx, Clojure CLI (with cider-nrepl), Babashka, or plain `lg` -- and
   that project's buffers then evaluate and complete there; the server
   stops when you disconnect or quit
-- symbol completion on `TAB`/`M-TAB`, from the editor's own VM or from
-  the connected server
+- symbol completion on `TAB`/`M-TAB`, eldoc arglists as you type, doc
+  lookup (`C-c C-d d`) and goto-definition (`M-.`/`M-,`, into jars for
+  Clojure libraries), all from the editor's own VM or the connected server
 - a dedicated `*repl*` buffer (`C-c C-z`), for when you want an actual
   running transcript instead of building one by hand with `C-j`
 - `(vibe "...")`: write what you want where you want it, then use the same

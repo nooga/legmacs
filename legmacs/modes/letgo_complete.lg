@@ -59,6 +59,20 @@
                (not (re-matches #"[+-]?\d.*" prefix)))
       {:row row :start start :end end :prefix prefix})))
 
+(defn symbol-at-point
+  "The whole symbol point is in, or right after, as a string; nil on a
+   keyword, a number, or nothing."
+  [state]
+  (let [line (nth (:lines state) (:cursor-row state))
+        col (:cursor-col state)
+        ;; at the symbol's first char, prefix-at-point has nothing before
+        ;; point -- look from one char in instead
+        probe (if (and (< col (count line)) (symbol-char? (nth (seq line) col)))
+                (assoc state :cursor-col (inc col))
+                state)]
+    (when-let [{:keys [start end]} (prefix-at-point probe)]
+      (subs line start end))))
+
 (defn- in-string-or-comment? [state]
   (ls/point-in-string-or-comment-at?
    (buf/buffer-chars state)
@@ -92,13 +106,36 @@
      :doc (string/trim (str (when-let [a (:arglists m)] (string/join " " (map pr-str a)))
                             "  " (or (first-line (:doc m)) "")))}))
 
-(defn- ns-form [state]
-  (let [text (buf/buffer-text state)
-        ns? (fn [f] (and (seq? f) (= 'ns (first f))))
-        first-form (try (read-string text) (catch e nil))]
-    (if (ns? first-form)
+(def ^:private head-lines
+  "How far down the buffer ns-form looks before reading all of it. An ns
+   form is at the top and rarely this long; eldoc asks on every keystroke,
+   so reading only the head matters in a big file."
+  80)
+
+(defn- ns-form? [f] (and (seq? f) (= 'ns (first f))))
+
+(defn ns-form
+  "The buffer's (ns ...) form, or nil: the first form of its head if
+   that's it, else the first ns form anywhere."
+  [state]
+  (let [lines (:lines state)
+        head (string/join "\n" (take head-lines lines))
+        first-form (try (read-string head) (catch e nil))]
+    (if (ns-form? first-form)
       first-form
-      (try (some (fn [f] (when (ns? f) f)) (read-all-string text)) (catch e nil)))))
+      (try (some (fn [f] (when (ns-form? f) f))
+                 (read-all-string (if (<= (count lines) head-lines)
+                                    head
+                                    (buf/buffer-text state))))
+           (catch e nil)))))
+
+(defn ns-name-of
+  "The namespace symbol the buffer's ns form declares, or nil."
+  [state]
+  (let [n (second (ns-form state))]
+    (cond (symbol? n) n
+          (and (seq? n) (= 'with-meta (first n))) (second n)
+          :else nil)))
 
 (defn- spec-alias [spec]
   (when (vector? spec)

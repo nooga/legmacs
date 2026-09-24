@@ -1,0 +1,115 @@
+(ns test.letgo-lookup-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as dispatch]
+            [legmacs.path :as path]
+            [legmacs.modes.letgo]
+            [legmacs.modes.letgo-lookup :as l]))
+
+(bindings/install!)
+
+;; A buffer that requires legmacs.buffer under an alias: every lookup below
+;; resolves through the editor's own VM, where that namespace is loaded
+;; and its vars carry real :arglists/:doc/:file metadata.
+(def src ["(ns demo (:require [legmacs.buffer :as b]))"
+          "(b/new-state nil [])"
+          "(b/clamp 1 2 3)"
+          "(str \"(b/clamp \")"])
+
+(defn- lg-state
+  ([row col] (lg-state src row col))
+  ([lines row col]
+   (-> (buf/new-state (str (os/cwd) "/demo.lg") lines)
+       (modes/switch-to-mode :let-go)
+       (assoc :cursor-row row :cursor-col col :current-buffer-id 7))))
+
+(deftest call-at-point-finds-the-function-position
+  (is (= "b/new-state" (l/call-at-point (lg-state 1 13))))
+  (is (= "b/new-state" (l/call-at-point (lg-state 1 18))) "inside a nested vector")
+  (is (nil? (l/call-at-point (lg-state 3 12))) "inside a string")
+  (is (nil? (l/call-at-point (lg-state ["(:k 1)"] 0 4)))))
+
+(deftest in-process-info-reads-var-metadata
+  (let [info (l/in-process-info "b/new-state" 'demo (lg-state 1 1))]
+    (is (= "legmacs.buffer" (:ns info)))
+    (is (= "new-state" (:name info)))
+    (is (= ["[filename lines]"] (:arglists info)))
+    (is (= "function" (:kind info)))
+    (is (= "legmacs/buffer.lg" (:file info)))
+    (is (number? (:line info))))
+  (is (= "special form" (:kind (l/in-process-info "if" nil (lg-state 1 1)))))
+  (is (nil? (l/in-process-info "no-such-thing" nil (lg-state 1 1)))))
+
+(deftest eldoc-shows-arglists-when-the-echo-area-is-free
+  (is (= "legmacs.buffer/new-state: [filename lines]" (:message (l/eldoc (lg-state 1 13)))))
+  (is (= "=> 3" (:message (l/eldoc (assoc (lg-state 1 13) :message "=> 3")))))
+  (is (nil? (:message (l/eldoc (lg-state 3 12)))))
+  (testing "it runs by itself after each command in let-go-mode"
+    (is (= "legmacs.buffer/new-state: [filename lines]"
+           (:message (dispatch/dispatch (lg-state 1 12) "C-f"))))))
+
+(deftest doc-opens-help
+  (let [s (l/show-doc (lg-state 2 4))
+        lines (get-in s [:buffer-command :state :lines])]
+    (is (= :help (get-in s [:buffer-command :op])))
+    (is (= "legmacs.buffer/clamp" (first lines)))
+    (is (some #(string/starts-with? % "Defined in legmacs/buffer.lg:") lines)))
+  (is (= "No documentation for zzz" (:message (l/show-doc (lg-state ["(zzz)"] 0 2))))))
+
+(deftest locate-cases
+  (let [s (lg-state 1 1)]
+    (is (= {:jar "/m2/clojure.jar" :entry "clojure/core.clj"}
+           (l/locate "jar:file:/m2/clojure.jar!/clojure/core.clj" s)))
+    (is (= {:path "/src/a.clj"} (l/locate "file:/src/a.clj" s)))
+    (is (= {:embedded "<embedded:core>"} (l/locate "<embedded:core>" s)))
+    (testing "relative to the source path (here: the cwd the suite runs in)"
+      (is (= {:path (path/join (os/cwd) "legmacs/buffer.lg")} (l/locate "legmacs/buffer.lg" s))))
+    (is (nil? (l/locate "nowhere/at/all.lg" s)))))
+
+(deftest find-definition-and-back
+  (testing "another file: a :visit of it at the def's line, with a way back"
+    (let [s (l/find-definition (lg-state 1 5))
+          cmd (:buffer-command s)]
+      (is (= :visit (:op cmd)))
+      (is (string/ends-with? (:filename cmd) "legmacs/buffer.lg"))
+      (is (= (dec (:line (meta #'buf/new-state))) (:row cmd)))
+      (is (some #(string/starts-with? % "(ns legmacs.buffer") (:lines (:state cmd)))
+          "not yet open: loaded fresh")
+      (is (= [{:id 7 :row 1 :col 5}] (vec (:xref-stack s))))))
+  (testing "already open: switch by id instead of loading again"
+    (let [abs (path/join (os/cwd) "legmacs/buffer.lg")
+          s (l/find-definition (assoc (lg-state 1 5) :buffer-list [{:id 3 :filename abs}]))]
+      (is (= 3 (get-in s [:buffer-command :id])))
+      (is (nil? (get-in s [:buffer-command :state])))))
+  (testing "M-, returns"
+    (let [s (-> (lg-state 1 5) (assoc :xref-stack (list {:id 7 :row 2 :col 3})) l/pop-definition-stack)]
+      (is (= [2 3] [(:cursor-row s) (:cursor-col s)]))
+      (is (empty? (:xref-stack s))))
+    (let [s (-> (lg-state 1 5) (assoc :xref-stack (list {:id 2 :row 9 :col 0})) l/pop-definition-stack)]
+      (is (= {:op :visit :id 2 :row 9 :col 0} (:buffer-command s))))
+    (is (= "No previous location" (:message (l/pop-definition-stack (lg-state 1 5))))))
+  (testing "a core var has no file to open"
+    (is (string/includes? (:message (l/find-definition (lg-state ["(map inc [])"] 0 2)))
+                          "embedded")))
+  (testing "the keys"
+    (is (= :visit (get-in (dispatch/dispatch (lg-state 1 5) "M-.") [:buffer-command :op])))))
+
+(deftest visit-op-shows-a-buffer-at-a-position
+  (let [ws (bufs/new-workspace (buf/new-state nil ["scratch"]))
+        other (buf/new-state "/tmp/other.lg" ["a" "bb" "ccc"])
+        ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command
+                                       {:op :visit :filename "/tmp/other.lg" :state other :row 2 :col 1}))
+        cur (bufs/current ws)]
+    (is (= "/tmp/other.lg" (:filename cur)))
+    (is (= [2 1] [(:cursor-row cur) (:cursor-col cur)]))
+    (testing "visiting it again reuses the buffer, and clamps the position"
+      (let [ws (bufs/put-current ws (assoc cur :buffer-command {:op :switch :id 0}))
+            ws (bufs/put-current ws (assoc (bufs/current ws) :buffer-command
+                                           {:op :visit :filename "/tmp/other.lg" :row 99 :col 99}))
+            cur (bufs/current ws)]
+        (is (= 2 (count (:buffer-list cur))))
+        (is (= [2 3] [(:cursor-row cur) (:cursor-col cur)]))))))
