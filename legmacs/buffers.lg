@@ -68,7 +68,7 @@
 ;; recording hook and legmacs.commands' start/end/call-last-kbd-macro.
 (def shared-keys [:clipboard :message :minibuffer :pending-prefix :pending-keys :overlay
                    :kbd-macro-recording? :kbd-macro-chords :last-kbd-macro
-                   :describe-key? :pending-task :async-jobs])
+                   :describe-key? :pending-task :async-jobs :xref-stack])
 
 (defn new-workspace
   "A workspace holding one buffer (id 0, current) shown in one window
@@ -234,6 +234,37 @@
   (some (fn [id] (when (= name (:buffer-name (get-in workspace [:buffers id]))) id))
         (:order workspace)))
 
+(defn- find-buffer-by-filename [workspace filename]
+  (some (fn [id] (when (= filename (:filename (get-in workspace [:buffers id]))) id))
+        (:order workspace)))
+
+(defn- place-cursor
+  "Put window `wid`'s point at row/col (clamped to its buffer), recentered."
+  [workspace wid row col]
+  (let [lines (:lines (get-in workspace [:buffers (:buffer (win/find-leaf (:windows workspace) wid))]))
+        row (max 0 (min (or row 0) (dec (count lines))))
+        col (max 0 (min (or col 0) (count (nth lines row))))]
+    (update workspace :windows win/update-leaf wid
+            (fn [leaf] (update leaf :view assoc :cursor-row row :cursor-col col
+                               :goal-col nil :recenter true)))))
+
+(defn- visit
+  "The :visit op: show a buffer in the active window with point at
+   :row/:col. The buffer is :id, else the one visiting :filename, else the
+   one named :name, else :state is opened as a new one (nil :state and no
+   match: nothing happens)."
+  [workspace awin cmd]
+  (let [id (or (:id cmd)
+               (when (:filename cmd) (find-buffer-by-filename workspace (:filename cmd)))
+               (when (:name cmd) (find-buffer-by-name workspace (:name cmd))))
+        [ws id] (cond id [workspace id]
+                      (:state cmd) (add-buffer workspace (:state cmd))
+                      :else [workspace nil])]
+    (if (and id (contains? (:buffers ws) id))
+      (-> (set-window-buffer ws awin id)
+          (place-cursor awin (:row cmd) (:col cmd)))
+      ws)))
+
 (defn- reuse-named-buffer
   "The find-or-create shape shared by :help and :append-named: focus the
    buffer named (:name cmd) with `reuse-fn` applied to it, or register
@@ -261,6 +292,9 @@
       ;; The Acme extension uses this for directory-scoped +Errors buffers,
       ;; but the operation is intentionally generic process-output plumbing.
       :append-named (reuse-named-buffer workspace awin cmd appended-buffer-state)
+      ;; show a buffer (open, or opened from :state) with point at a
+      ;; position: goto-definition and its way back
+      :visit (visit workspace awin cmd)
       ;; after the kill, every window that showed the dead buffer gets
       ;; re-pointed at whatever buffer kill-buffer-op picked as current
       ;; (or the fresh fallback) -- a window is never left on a buffer
@@ -528,6 +562,24 @@
    make-tracked-spawn, not an fn form in a conditional."
   [v orig]
   (alter-var-root v (constantly (make-tracked-spawn orig))))
+
+(def exit-hooks
+  "name -> (fn [] ...) run once as the editor exits, after the terminal is
+   restored. For resources that must not outlive the editor -- a jacked-in
+   nREPL server process, for one."
+  (atom {}))
+
+(defn add-exit-hook!
+  "Register (or replace) the exit hook called `name`."
+  [name f]
+  (swap! exit-hooks assoc name f)
+  name)
+
+(defn run-exit-hooks!
+  "Run every exit hook; a throwing hook doesn't stop the others."
+  []
+  (doseq [f (vals @exit-hooks)]
+    (try (f) (catch e nil))))
 
 (defn install-spawn-tracking!
   "Wrap go* and future* so loop-wait can poll while they run. Idempotent.

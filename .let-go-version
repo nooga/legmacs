@@ -5,4 +5,4 @@
 # May be a commit SHA (reproducible) or a branch name like `main` (tracks tip).
 # legmacs's AOT build needs the gogen lowering + scripts/lg-compile tooling,
 # which live on main; bump this SHA when you want newer let-go fixes.
-a6657612002bd70b277617368985639992d1c11b
+36d57e3693075f9e63e4aff49b220331ff3fea12

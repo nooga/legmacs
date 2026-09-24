@@ -1,5 +1,5 @@
 (ns test.run
-  (:require [test :refer [run-tests]]
+  (:require [test :refer [run-all-tests]]
             [test.buffer-test]
             [test.keys-test]
             [test.keymap-test]
@@ -29,6 +29,11 @@
             [test.windows-test]
             [test.kbd-macro-test]
             [test.acme-extension-test]
-            [test.vibe-test]))
+            [test.vibe-test]
+            [test.nrepl-test]
+            [test.jack-in-test]
+            [test.letgo-complete-test]
+            [test.letgo-lookup-test]))
 
-(run-tests)
+;; run-tests with no args only tests *ns* (test.run itself, which has none).
+(run-all-tests #"test\..*-test")

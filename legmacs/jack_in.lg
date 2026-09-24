@@ -1,0 +1,347 @@
+(ns legmacs.jack-in
+  "One-command nREPL: start the right server for this buffer's project,
+   wait for it, connect, and stop it again on disconnect or editor exit.
+   CIDER's cider-jack-in, for let-go, lgx, Clojure CLI and Babashka.
+
+   C-c M-j (M-x nrepl-jack-in) finds the project root -- the nearest
+   directory with a launch config's marker file -- and picks the config:
+   one candidate is used as is; several (deps.edn is both a Clojure CLI
+   and a plain-lg project file) are narrowed by the buffer's extension,
+   then by :priority, and a real tie asks. A lone .lg file with no project
+   at all gets plain `lg -n` in its directory. M-x
+   nrepl-jack-in-command shows the command line for editing first (C-u
+   cider-jack-in). M-x nrepl-server-log shows the server's output.
+
+   Launch configs are data in `launch-configs`, added with
+   `register-launch-config!` exactly as the built-ins below are:
+
+     {:label \"Clojure CLI\" :short \"clj\"   ; prompt text / lighter tag
+      :markers [\"deps.edn\"]               ; project-root files
+      :extensions [\".clj\" ...]            ; tie-breaker by buffer file
+      :priority 20                         ; higher wins a remaining tie
+      :exe \"clojure\"                       ; checked on PATH first
+      :command (fn [port] -> argv)}        ; port chosen by the editor
+
+   The editor picks the port (os/free-port) and passes it on the command
+   line instead of discovering it afterwards, because not every server
+   writes .nrepl-port (Babashka doesn't with an OS-assigned port).
+
+   Process handling works with what let-go interop reaches today. The
+   server runs under `sh -c`: it writes its pid to a file, sends all
+   output to a log file (a pipe nobody reads would fill and block the
+   server), and `exec`s the real command so that pid is the server's.
+   Its stdin is a pipe the editor holds open -- `lg -n` exits at EOF --
+   and closing it is half of stopping it; SIGTERM to the pid is the other
+   half. Waiting for the port happens in an ordinary bufs/spawn-task job,
+   so the editor stays live through a first-run Clojure dependency
+   download."
+  (:require [string]
+            [os]
+            [legmacs.buffers :as bufs]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.minibuffer :as mb]
+            [legmacs.path :as path]
+            [legmacs.completion :as completion]
+            [legmacs.modes.help :as help]
+            [legmacs.modes.letgo :as letgo]
+            [legmacs.nrepl :as nrepl]))
+
+;; --- launch configs ------------------------------------------------------
+
+(def launch-configs
+  "name keyword -> launch config (see this namespace's docstring)."
+  (atom {}))
+
+(defn register-launch-config!
+  "Add or replace a launch config; its markers also start counting as
+   project roots for nrepl-connect."
+  [name config]
+  (swap! launch-configs assoc name (assoc config :name name))
+  (swap! nrepl/project-markers into (:markers config))
+  name)
+
+(def nrepl-version
+  "The nrepl/nrepl version injected into a Clojure CLI jack-in."
+  (atom "1.3.1"))
+
+(def cider-nrepl-version
+  "The cider/cider-nrepl version injected into a Clojure CLI jack-in; its
+   middleware is what gives Clojure servers completion, doc lookup and
+   friends."
+  (atom "0.55.7"))
+
+(def clojure-cli-aliases
+  "Aliases for a Clojure CLI jack-in, e.g. \":dev:test\" (appended to -M),
+   or nil."
+  (atom nil))
+
+(defn clojure-cli-command [port]
+  ["clojure"
+   "-Sdeps" (str "{:deps {nrepl/nrepl {:mvn/version \"" @nrepl-version "\"} "
+                 "cider/cider-nrepl {:mvn/version \"" @cider-nrepl-version "\"}}}")
+   (str "-M" (or @clojure-cli-aliases ""))
+   "-m" "nrepl.cmdline" "--port" (str port)
+   "--middleware" "[cider.nrepl/cider-middleware]"])
+
+(defn lgx-command [port] ["lgx" "nrepl" "--port" (str port)])
+(defn lg-command [port] ["lg" "-n" "-p" (str port)])
+(defn babashka-command [port] ["bb" "nrepl-server" (str port)])
+
+(register-launch-config! :lgx
+  {:label "lgx" :short "lgx" :markers ["lgx.edn"] :extensions [".lg"]
+   :priority 30 :exe "lgx" :command lgx-command})
+
+(register-launch-config! :clojure-cli
+  {:label "Clojure CLI" :short "clj" :markers ["deps.edn"]
+   :extensions [".clj" ".cljc" ".cljs" ".edn"]
+   :priority 20 :exe "clojure" :command clojure-cli-command})
+
+(register-launch-config! :babashka
+  {:label "Babashka" :short "bb" :markers ["bb.edn"] :extensions [".bb"]
+   :priority 20 :exe "bb" :command babashka-command})
+
+(register-launch-config! :let-go
+  {:label "let-go (lg)" :short "lg" :markers ["deps.edn"] :extensions [".lg"]
+   ;; plain `lg` reads deps.edn's :paths itself, and is the fallback for a
+   ;; lone .lg file with no project around it
+   :priority 10 :markerless? true :exe "lg" :command lg-command})
+
+;; --- choosing one ----------------------------------------------------------
+
+(defn- extension-of [filename]
+  (when filename
+    (when-let [i (string/last-index-of filename ".")]
+      (subs filename i))))
+
+(defn- top-priority [configs]
+  (let [top (apply max (map #(or (:priority %) 0) configs))]
+    (filterv #(= top (or (:priority %) 0)) configs)))
+
+(defn rank-configs
+  "The configs that could launch `filename`'s project, best first; more
+   than one means it's genuinely ambiguous. Configs claiming the file's
+   extension win, then the highest :priority among them. When none claims
+   it, all stay in play."
+  [configs filename]
+  (let [ext (extension-of filename)
+        claimed (filterv #(some #{ext} (:extensions %)) configs)]
+    (cond
+      (empty? configs) []
+      (seq claimed) (top-priority claimed)
+      (= 1 (count configs)) (vec configs)
+      :else (vec (sort-by #(- (or (:priority %) 0)) configs)))))
+
+(defn detect
+  "{:root dir :candidates [config ...]} for a buffer in `dir` visiting
+   `filename`: the nearest ancestor with any config's marker, and the
+   ranked configs whose markers it has. No project at all falls back to
+   :markerless? configs (plain lg) in `dir` itself. `exists?` is
+   (fn [path] -> bool), a parameter so tests needn't touch the disk."
+  [configs dir filename exists?]
+  (loop [d dir]
+    (let [here (filterv (fn [c] (some #(exists? (path/join d %)) (:markers c))) configs)]
+      (cond
+        (seq here) {:root d :candidates (rank-configs here filename)}
+        :else (let [up (path/dirname d)]
+                (if (and up (not= up d))
+                  (recur up)
+                  {:root dir
+                   :candidates (rank-configs (filterv :markerless? configs) filename)}))))))
+
+;; --- processes -------------------------------------------------------------
+
+(defn shell-quote
+  "`s` as one single-quoted sh word."
+  [s]
+  (str "'" (string/replace (str s) "'" "'\\''") "'"))
+
+(defn command-line [argv] (string/join " " (map shell-quote argv)))
+
+(defn launch-script
+  "The sh -c script that runs `cmdline` in `root`: pid first (so a failed
+   cd is still a dead pid rather than an endless wait), then every byte of
+   output to `log`, then exec so the pid is the server's."
+  [root cmdline pid-file log-file]
+  (str "echo $$ > " (shell-quote pid-file)
+       "; exec >> " (shell-quote log-file) " 2>&1"
+       "; cd " (shell-quote root) " && exec " cmdline))
+
+(def processes
+  "Servers jack-in started and hasn't stopped, by pid-file. The exit hook
+   stops whatever is left -- including one whose jack-in was C-g'd."
+  (atom {}))
+
+(defn- now-ms [] (.UnixMilli (now)))
+
+(defn spawn!
+  "Start `cmdline` in `root`. Returns the process map."
+  [root cmdline port]
+  (let [base (str (path/join (os/temp-dir) "legmacs-nrepl-") port "-" (now-ms))
+        pid-file (str base ".pid")
+        log-file (str base ".log")
+        _ (spit log-file (str "$ " cmdline "\n"))
+        cmd (os/exec "sh" "-c" (launch-script root cmdline pid-file log-file))
+        stdin (.StdinPipe cmd)
+        proc {:cmd cmd :stdin stdin :root root :command cmdline :port port
+              :pid-file pid-file :log-file log-file}]
+    (.Start cmd)
+    (swap! processes assoc pid-file proc)
+    proc))
+
+(defn pid [proc]
+  (try (parse-long (string/trim (slurp (:pid-file proc)))) (catch e nil)))
+
+(defn- pid-alive?
+  "Running, per ps -- not `kill -0`, which also succeeds on a zombie, and
+   a server that exited is exactly that until someone Waits on it."
+  [p]
+  (let [stat (string/trim (or (:out (os/sh "ps" "-o" "stat=" "-p" (str p))) ""))]
+    (and (seq stat) (not (string/starts-with? stat "Z")))))
+
+(defn alive?
+  "Still running? Before the pid file exists, yes."
+  [proc]
+  (let [p (pid proc)]
+    (or (nil? p) (pid-alive? p))))
+
+(defn stop!
+  "SIGTERM the server and close its stdin. Idempotent."
+  [proc]
+  (when-let [p (pid proc)]
+    (when (pid-alive? p) (os/sh "kill" (str p))))
+  (try (.Close (:stdin proc)) (catch e nil))
+  (swap! processes dissoc (:pid-file proc))
+  nil)
+
+(defn stop-all! []
+  (doseq [proc (vals @processes)] (stop! proc)))
+
+(defn log-lines
+  "The server log, uncolored."
+  [proc]
+  (let [text (try (slurp (:log-file proc)) (catch e ""))]
+    (string/split (nrepl/strip-ansi text) "\n")))
+
+(defn- log-tail [proc n]
+  (->> (log-lines proc) (map string/trim) (remove string/blank?) (take-last n)
+       (string/join " | ")))
+
+(def startup-timeout-ms
+  "How long jack-in waits for the port. Generous: a first Clojure CLI run
+   downloads its dependencies."
+  (atom 300000))
+
+(defn await-server
+  "Poll until the server accepts an nREPL connection, then return it.
+   Throws with the log's last lines if the process dies, or on timeout."
+  [proc timeout-ms]
+  (let [deadline (+ (now-ms) timeout-ms)]
+    (loop []
+      (let [conn (try (nrepl/open-connection "127.0.0.1" (:port proc)) (catch e nil))]
+        (cond
+          conn conn
+          (not (alive? proc)) (throw (str "server exited: " (log-tail proc 3)))
+          (> (now-ms) deadline) (throw (str "no nREPL on port " (:port proc) " after "
+                                            (quot timeout-ms 1000) "s"))
+          :else (do (sleep 250) (recur)))))))
+
+;; --- commands --------------------------------------------------------------
+
+(def last-process
+  "The most recent jack-in's process, even a failed one, for
+   nrepl-server-log."
+  (atom nil))
+
+(defn executable? [exe]
+  (zero? (:exit (os/sh "sh" "-c" (str "command -v " (shell-quote exe) " >/dev/null")))))
+
+(defn- stopper [proc] (fn [] (stop! proc)))
+
+(defn- resolve-jack-in [root config proc state outcome]
+  (if-let [err (:err outcome)]
+    (do (stop! proc)
+        (assoc state :message (str "Jack-in failed: " (or (ex-message err) (str err))
+                                   " (M-x nrepl-server-log)")))
+    (let [conn (nrepl/register-connection!
+                root (assoc (:ok outcome)
+                            :label (:label config) :short (:short config)
+                            :process proc :on-close (stopper proc)))]
+      (assoc state :message (str "Jacked in: " (nrepl/conn-label conn) " for " root)))))
+
+(defn- jack-in-then [root config proc]
+  (fn [state outcome] (resolve-jack-in root config proc state outcome)))
+
+(defn- await-io [proc]
+  (fn [] (await-server proc @startup-timeout-ms)))
+
+(defn- launch [state root config cmdline port]
+  (let [proc (spawn! root cmdline port)]
+    (reset! last-process proc)
+    (bufs/spawn-task state (await-io proc) (jack-in-then root config proc)
+                     (str "Starting " (:label config) " nREPL in " root "..."))))
+
+(defn- launch-default [state root config]
+  (if-not (executable? (:exe config))
+    (assoc state :message (str (:exe config) " not found on PATH"))
+    (let [port (os/free-port)]
+      (launch state root config (command-line ((:command config) port)) port))))
+
+(defn- edit-then-launch [root config port]
+  (fn [state input]
+    (if (string/blank? input)
+      (assoc state :message "Jack-in cancelled")
+      (launch state root config input port))))
+
+(defn- launch-edited [state root config]
+  (let [port (os/free-port)]
+    (mb/open state "Jack-in command: " (edit-then-launch root config port)
+             {:initial (command-line ((:command config) port))})))
+
+(defn- pick-then [root by-label launch-fn]
+  (fn [state input]
+    (if-let [config (get by-label (string/trim input))]
+      (launch-fn state root config)
+      (assoc state :message (str "No launch config " input)))))
+
+(defn- choose-config [state root candidates launch-fn]
+  (let [by-label (into {} (map (fn [c] [(:label c) c]) candidates))
+        labels (mapv :label candidates)]
+    (mb/open state (str "Jack-in " root " with: ") (pick-then root by-label launch-fn)
+             {:submit-selected? true
+              :completer (fn [input] (completion/fuzzy-filter input labels))})))
+
+(defn- jack-in-with [state launch-fn]
+  (let [dir (path/absolute-path (path/default-directory state))
+        {:keys [root candidates]} (detect (vals @launch-configs) dir (:filename state)
+                                          (fn [p] (some? (os/stat p))))
+        existing (get @nrepl/connections root)]
+    (cond
+      existing (assoc state :message (str "Already connected to " (nrepl/conn-label existing)
+                                          " for " root " (C-c C-q first)"))
+      (= 1 (count candidates)) (launch-fn state root (first candidates))
+      (seq candidates) (choose-config state root candidates launch-fn)
+      :else (choose-config state root (vec (vals @launch-configs)) launch-fn))))
+
+(defcommand nrepl-jack-in
+  "Start an nREPL server for this buffer's project (lgx, Clojure CLI,
+   Babashka or plain lg, chosen from the project's files), connect to it,
+   and stop it again on C-c C-q or when the editor exits."
+  [state]
+  (jack-in-with state launch-default))
+
+(defcommand nrepl-jack-in-command
+  "nrepl-jack-in, but show the server command line for editing first."
+  [state]
+  (jack-in-with state launch-edited))
+
+(defcommand nrepl-server-log
+  "Show the output of this buffer's jacked-in server (or of the most
+   recent jack-in, if that failed)."
+  [state]
+  (if-let [proc (or (:process (nrepl/connection-for state)) @last-process)]
+    (help/pop-to-help state "*nrepl-server*" (log-lines proc))
+    (assoc state :message "No jacked-in server")))
+
+(bufs/add-exit-hook! :jack-in stop-all!)
+
+(km/bind-key! letgo/keymap "C-c M-j" :nrepl-jack-in)

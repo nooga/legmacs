@@ -1,0 +1,322 @@
+(ns legmacs.modes.letgo-complete
+  "Symbol completion for let-go-mode (and so for .clj/.cljc/.cljs/.bb
+   buffers, which open in it).
+
+   TAB indents as before, and completes instead when indenting would change
+   nothing and point sits right after a symbol -- Emacs's
+   `tab-always-indent 'complete`. M-TAB (what C-M-i sends) always
+   completes. One candidate is inserted; several that share a longer
+   prefix insert that prefix; otherwise the candidates open in the
+   minibuffer picker (fuzzy-filtered, type/ns muted beside each name,
+   arglists and doc on the selected one).
+
+   Candidates come from whichever backend the buffer evaluates with (see
+   legmacs.modes.letgo/eval-backend-for). In-process that is the editor's
+   own VM: the buffer's namespace if it is loaded (else the current one),
+   its aliases, plus the aliases its ns form requires; `alias/pre`
+   completes that namespace's publics. A remote backend registers a
+   completer with `register-completer!`; its answer arrives
+   asynchronously and is dropped if the symbol changed meanwhile."
+  (:require [string]
+            [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
+            [legmacs.completion :as completion]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.minibuffer :as mb]
+            [legmacs.path :as path]
+            [legmacs.lisp-syntax :as ls]
+            [legmacs.modes.letgo :as letgo]))
+
+;; --- symbol at point ------------------------------------------------------
+
+(def ^:private non-symbol-chars
+  #{\space \tab \newline \return \, \( \) \[ \] \{ \} \" \; \' \` \~ \@ \^ \\})
+
+(defn- symbol-char? [ch]
+  (and ch (not (contains? non-symbol-chars ch))))
+
+(defn prefix-at-point
+  "{:row :start :end :prefix} for the symbol point is in or right after:
+   `prefix` is the part before point, [start end) the whole symbol (what a
+   chosen candidate replaces). nil where there is nothing to complete: no
+   symbol, a keyword, or a number."
+  [state]
+  (let [row (:cursor-row state)
+        col (:cursor-col state)
+        line (nth (:lines state) row)
+        chars (vec (seq line))
+        n (count chars)
+        start (loop [c col]
+                (if (and (pos? c) (symbol-char? (nth chars (dec c)))) (recur (dec c)) c))
+        ;; #'foo and #(foo): the dispatch char is syntax, not symbol
+        start (loop [c start]
+                (if (and (< c col) (= \# (nth chars c))) (recur (inc c)) c))
+        end (loop [c col]
+              (if (and (< c n) (symbol-char? (nth chars c))) (recur (inc c)) c))
+        prefix (subs line start col)]
+    (when (and (seq prefix)
+               (not (string/starts-with? prefix ":"))
+               (not (re-matches #"[+-]?\d.*" prefix)))
+      {:row row :start start :end end :prefix prefix})))
+
+(defn symbol-at-point
+  "The whole symbol point is in, or right after, as a string; nil on a
+   keyword, a number, or nothing."
+  [state]
+  (let [line (nth (:lines state) (:cursor-row state))
+        col (:cursor-col state)
+        ;; at the symbol's first char, prefix-at-point has nothing before
+        ;; point -- look from one char in instead
+        probe (if (and (< col (count line)) (symbol-char? (nth (seq line) col)))
+                (assoc state :cursor-col (inc col))
+                state)]
+    (when-let [{:keys [start end]} (prefix-at-point probe)]
+      (subs line start end))))
+
+(defn- in-string-or-comment? [state]
+  (ls/point-in-string-or-comment-at?
+   (buf/buffer-chars state)
+   (buf/offset-of state (:cursor-row state) (:cursor-col state))))
+
+(defn completable-here?
+  "Point is at the end of a symbol, outside strings and comments."
+  [state]
+  (let [line (nth (:lines state) (:cursor-row state))
+        col (:cursor-col state)
+        at (when (< col (count line)) (nth (seq line) col))]
+    (boolean (and (not (symbol-char? at))
+                  (prefix-at-point state)
+                  (not (in-string-or-comment? state))))))
+
+;; --- in-process candidates ------------------------------------------------
+
+(def ^:private special-forms
+  '[def if do let let* fn fn* loop loop* recur quote var throw try catch
+    finally new set! letfn case])
+
+(defn- first-line [s]
+  (when (string? s) (string/trim (first (string/split s "\n")))))
+
+(defn- var-candidate [label v]
+  (let [m (meta v)
+        value (try (deref v) (catch e nil))]
+    {:candidate label
+     :type (cond (:macro m) "macro" (fn? value) "function" :else "var")
+     :ns (when-let [n (:ns m)] (str (ns-name n)))
+     :doc (string/trim (str (when-let [a (:arglists m)] (string/join " " (map pr-str a)))
+                            "  " (or (first-line (:doc m)) "")))}))
+
+(def ^:private head-lines
+  "How far down the buffer ns-form looks before reading all of it. An ns
+   form is at the top and rarely this long; eldoc asks on every keystroke,
+   so reading only the head matters in a big file."
+  80)
+
+(defn- ns-form? [f] (and (seq? f) (= 'ns (first f))))
+
+(defn ns-form
+  "The buffer's (ns ...) form, or nil: the first form of its head if
+   that's it, else the first ns form anywhere."
+  [state]
+  (let [lines (:lines state)
+        head (string/join "\n" (take head-lines lines))
+        first-form (try (read-string head) (catch e nil))]
+    (if (ns-form? first-form)
+      first-form
+      (try (some (fn [f] (when (ns-form? f) f))
+                 (read-all-string (if (<= (count lines) head-lines)
+                                    head
+                                    (buf/buffer-text state))))
+           (catch e nil)))))
+
+(defn ns-name-of
+  "The namespace symbol the buffer's ns form declares, or nil."
+  [state]
+  (let [n (second (ns-form state))]
+    (cond (symbol? n) n
+          (and (seq? n) (= 'with-meta (first n))) (second n)
+          :else nil)))
+
+(defn- spec-alias [spec]
+  (when (vector? spec)
+    (let [opts (apply hash-map (rest spec))]
+      (when-let [a (:as opts)]
+        (when-let [target (find-ns (first spec))] [a target])))))
+
+(defn require-aliases
+  "{alias-sym namespace} from the buffer's ns form's :require clauses, for
+   the required namespaces that exist in this VM -- so a file that was
+   never evaluated still completes `str/` after `[string :as str]`."
+  [state]
+  (into {}
+        (for [clause (rest (ns-form state))
+              :when (and (seq? clause) (= :require (first clause)))
+              pair (keep spec-alias (rest clause))]
+          pair)))
+
+(defn in-process-candidates
+  "Candidate maps {:candidate :type :ns :doc} for `prefix` in `ns-sym` (or
+   the current namespace when it isn't loaded), with `extra-aliases`."
+  [prefix ns-sym extra-aliases]
+  (let [ns (or (when ns-sym (find-ns ns-sym)) *ns*)
+        aliases (merge extra-aliases (ns-aliases ns))
+        slash (string/index-of prefix "/")]
+    (if (and slash (pos? slash))
+      (let [q (subs prefix 0 slash)
+            p (subs prefix (inc slash))
+            target (or (get aliases (symbol q)) (find-ns (symbol q)))]
+        (when target
+          (keep (fn [[s v]]
+                  (when (string/starts-with? (name s) p)
+                    (var-candidate (str q "/" (name s)) v)))
+                (ns-publics target))))
+      (concat
+       (keep (fn [[s v]]
+               (when (and (var? v) (string/starts-with? (name s) prefix))
+                 (var-candidate (name s) v)))
+             (ns-map ns))
+       (keep (fn [[a _]]
+               (when (string/starts-with? (name a) prefix)
+                 {:candidate (str a "/") :type "alias"}))
+             aliases)
+       (keep (fn [n]
+               (let [nm (str (ns-name n))]
+                 (when (string/starts-with? nm prefix)
+                   {:candidate nm :type "namespace"})))
+             (all-ns))
+       (keep (fn [s]
+               (when (string/starts-with? (name s) prefix)
+                 {:candidate (name s) :type "special form"}))
+             special-forms)))))
+
+(defn- in-process-completer [{:keys [prefix namespace state]}]
+  (in-process-candidates prefix namespace (require-aliases state)))
+
+(def completers
+  "backend keyword -> (fn [request] -> [candidate-map ...]). Remote
+   completers run inside a bufs/spawn-task future. The request is
+   {:prefix :namespace :state :backend :context {:filename :directory}}."
+  (atom {:in-process in-process-completer}))
+
+(defn register-completer!
+  "Supply completion for buffers evaluated by `backend`."
+  [backend completer]
+  (swap! completers assoc backend completer)
+  backend)
+
+;; --- offering them --------------------------------------------------------
+
+(defn- replace-symbol [state row start end text]
+  (let [line (nth (:lines state) row)]
+    (-> (buf/push-undo state)
+        (assoc-in [:lines row] (str (subs line 0 start) text (subs line end)))
+        (assoc :modified? true :cursor-row row
+               :cursor-col (+ start (count text)) :goal-col nil))))
+
+(defn- distinct-candidates [cands]
+  (->> cands
+       (reduce (fn [m c] (if (contains? m (:candidate c)) m (assoc m (:candidate c) c))) {})
+       vals
+       (sort-by :candidate)
+       vec))
+
+(defn- candidate-row [c]
+  {:label (:candidate c) :value (:candidate c)
+   :keys (string/join " " (remove string/blank? [(:type c) (:ns c)]))
+   :doc (:doc c)})
+
+(defn- picker-on-change [by-name names]
+  (fn [state input]
+    (assoc-in state [:minibuffer :candidates]
+              (mapv (fn [n] (candidate-row (get by-name n)))
+                    (completion/fuzzy-filter input names)))))
+
+(defn- picker-completer [names]
+  (fn [input] (completion/fuzzy-filter input names)))
+
+(defn- picker-submit [row start end]
+  (fn [state input]
+    (if (string/blank? input) state (replace-symbol state row start end input))))
+
+(defn- open-picker [state {:keys [row start end prefix]} cands]
+  (let [names (mapv :candidate cands)
+        by-name (zipmap names cands)]
+    (mb/open state "Complete: " (picker-submit row start end)
+             {:submit-selected? true
+              :initial prefix
+              :completer (picker-completer names)
+              :on-change (picker-on-change by-name names)})))
+
+(defn offer-completions
+  "Act on `cands` for the symbol at `at` (see prefix-at-point): insert the
+   only one, extend to a longer common prefix, or open the picker."
+  [state {:keys [row start end prefix] :as at} cands]
+  (let [cands (distinct-candidates cands)
+        names (mapv :candidate cands)
+        common (completion/longest-common-prefix names)]
+    (cond
+      (empty? cands) (assoc state :message (str "No completions for " prefix))
+      (= 1 (count cands)) (replace-symbol state row start end (first names))
+      (> (count common) (count prefix))
+      (-> (replace-symbol state row start end common)
+          (assoc :message (str (count cands) " completions")))
+      :else (open-picker state at cands))))
+
+(defn- completion-request [state]
+  {:prefix (:prefix (prefix-at-point state))
+   :namespace (letgo/buffer-ns-name state)
+   :state state
+   :backend (:backend (letgo/eval-backend-for state))
+   :context {:filename (:filename state)
+             :directory (path/default-directory state)}})
+
+(defn- still-there?
+  "The symbol an async completion was for is unchanged, point too."
+  [state buffer-id {:keys [row start prefix]}]
+  (and (= buffer-id (:current-buffer-id state))
+       (= row (:cursor-row state))
+       (= (+ start (count prefix)) (:cursor-col state))
+       (< row (count (:lines state)))
+       (= (:prefix (prefix-at-point state)) prefix)))
+
+(defn- resolve-remote [state buffer-id at outcome]
+  (cond
+    (contains? outcome :err)
+    (assoc state :message (str "Completion failed: " (or (ex-message (:err outcome)) (str (:err outcome)))))
+    (not (still-there? state buffer-id at)) state
+    :else (offer-completions state at (:ok outcome))))
+
+(defn- remote-then [buffer-id at]
+  (fn [state outcome] (resolve-remote state buffer-id at outcome)))
+
+(defn- completion-io [completer req]
+  (fn [] (vec (completer req))))
+
+(defcommand complete-symbol
+  "Complete the symbol before point from the buffer's eval backend (the
+   editor's VM, or the connected nREPL server)."
+  [state]
+  (if-let [at (prefix-at-point state)]
+    (let [req (completion-request state)
+          backend (:backend req)
+          completer (get @completers backend)]
+      (cond
+        (= :in-process backend) (offer-completions state at (in-process-completer req))
+        completer (bufs/spawn-task state (completion-io completer req)
+                                   (remote-then (:current-buffer-id state) at))
+        :else (assoc state :message (str "No completion for " (name backend)))))
+    (assoc state :message "Nothing to complete here")))
+
+(defcommand indent-or-complete
+  "TAB in let-go-mode: re-indent the line; if that changes nothing and
+   point is right after a symbol, complete it instead."
+  [state]
+  (let [indented (letgo/lisp-indent-line state)]
+    (if (and (= (:lines indented) (:lines state))
+             (= (:cursor-col indented) (:cursor-col state))
+             (completable-here? state))
+      (complete-symbol state)
+      indented)))
+
+(km/bind-key! letgo/keymap "TAB" :indent-or-complete)
+(km/bind-key! letgo/keymap "M-TAB" :complete-symbol)

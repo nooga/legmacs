@@ -27,6 +27,7 @@
             [legmacs.indent :as indent]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.modes :as modes]
+            [legmacs.path :as path]
             [legmacs.lisp-syntax :as ls]))
 
 (def keymap (atom {}))
@@ -358,7 +359,7 @@
         (and (seq? n) (= 'with-meta (first n))) (second n)
         :else nil))))
 
-(defn- buffer-ns-name
+(defn buffer-ns-name
   "The name in the first top-level `(ns ...)` form, or nil if the buffer
    has none (or can't be read)."
   [state]
@@ -497,35 +498,224 @@
 (defn- clear-highlight [state highlight]
   (if (= highlight (:eval-highlight state)) (dissoc state :eval-highlight) state))
 
-(defn- run-eval [state f]
-  (let [[status start end _source forms] (eval-selection state)]
+;; --- eval backends ------------------------------------------------------
+;;
+;; Every eval command builds one request map and hands it to the selected
+;; backend:
+;;
+;;   {:op      :eval | :load   ; :load is eval-buffer's whole-file load
+;;    :source  the text to evaluate
+;;    :forms   read forms (:eval only; the in-process backend wants them)
+;;    :state   the buffer snapshot (in-process only; remote backends ignore it)
+;;    :backend the backend chosen for this buffer when the command ran
+;;    :context {:text :source :start :end :filename :directory :line :column
+;;              :namespace}}
+;;
+;; Which backend a buffer uses is `eval-backend-for`: the first registered
+;; resolver that claims the buffer (nREPL claims buffers visiting files
+;; under a connected project's root), else the global
+;; `current-eval-backend`. So two projects on two servers, and *scratch*
+;; in the editor's own VM, all coexist.
+;;
+;; The in-process backend is also the synchronous one: while it is selected
+;; C-x C-e / C-j / C-c C-e eval right on the main thread, exactly as before
+;; backends existed, so editor-scripting forms like (km/bind-key! ...) take
+;; effect before the next frame. Any other backend (nREPL) runs every
+;; command through bufs/spawn-task and applies the result when it lands.
+;; A remote result is a printed-result -- the text the server already
+;; printed, plus any captured output -- since its value never existed in
+;; this VM to pr-str.
+
+(defn- load-preserving-ns
+  "load-in-editor `source`, putting *ns* back afterwards. Its own named fn
+   so callers' conditionals contain a call, not a capturing fn literal
+   (let-go AOT hoist, nooga/let-go#766)."
+  [source]
+  (preserving-ns (fn [] (load-in-editor source))))
+
+(defn- in-process-eval-backend
+  "The built-in evaluator backend: eval the request's forms in this VM."
+  [{:keys [op state forms source context]}]
+  (binding [*eval-replace-context* context]
+    (if (= op :load)
+      (load-preserving-ns source)
+      (reduce (fn [_ form] (eval-form-in-state state form)) nil forms))))
+
+(def eval-backends
+  "Registered eval backend functions, each (fn [request-map] -> value).
+   Backends run inside the generic async job and must not mutate buffers."
+  (atom {:in-process in-process-eval-backend}))
+
+(def current-eval-backend
+  "The backend every eval command uses. Kept as data so an nREPL client can
+   install and select itself without replacing the command or key binding."
+  (atom :in-process))
+
+(defn register-eval-backend!
+  "Register an async-safe evaluator function under `name`."
+  [name evaluator]
+  (swap! eval-backends assoc name evaluator)
+  name)
+
+(defn use-eval-backend!
+  "Select a registered evaluator backend. Returns name, or nil if unknown."
+  [name]
+  (when (contains? @eval-backends name)
+    (reset! current-eval-backend name)))
+
+(def eval-backend-resolvers
+  "Registered (fn [state] -> nil | {:backend kw :label str}) resolvers,
+   by name. Called for the lighter on every frame, so they must be cheap:
+   no filesystem, no network -- string checks against state they keep."
+  (atom {}))
+
+(defn register-eval-backend-resolver!
+  "Let `resolver` claim buffers for a backend (see eval-backend-resolvers)."
+  [name resolver]
+  (swap! eval-backend-resolvers assoc name resolver)
+  name)
+
+(defn- try-resolver [resolver state]
+  (try (resolver state) (catch e nil)))
+
+(defn eval-backend-for
+  "{:backend kw :label str-or-nil} for `state`: the first resolver that
+   claims it, else the global current-eval-backend."
+  [state]
+  (or (some (fn [r] (try-resolver r state)) (vals @eval-backend-resolvers))
+      (let [b @current-eval-backend]
+        {:backend b :label (when (not= :in-process b) (name b))})))
+
+(defn remote-eval-backend?
+  "True when `state`'s evals leave this VM, i.e. go async through
+   bufs/spawn-task."
+  [state]
+  (not= :in-process (:backend (eval-backend-for state))))
+
+(defn- eval-backend-status
+  "let-go-mode lighter: names the buffer's backend, but only when it isn't
+   the default in-process one."
+  [state]
+  (let [{:keys [backend label]} (eval-backend-for state)]
+    (when (not= :in-process backend) (or label (name backend)))))
+
+(defn printed-result
+  "What a remote backend returns: `text` is the value as the server printed
+   it; `out` is output captured during the eval (nil or \"\" for none).
+   Spliced verbatim by C-c C-v, shown verbatim by the other commands."
+  ([text] (printed-result text nil))
+  ([text out]
+   (cond-> (replacement-result :source text)
+     (not (string/blank? out)) (assoc :legmacs.eval/out out))))
+
+(defn- result-text
+  "The printed form of an eval result: a printed-result's own text, or
+   pr-str of an ordinary value."
+  [v]
+  (if (and (replacement-result? v) (= :source (:legmacs.eval/kind v)))
+    (:legmacs.eval/text v)
+    (format-result v)))
+
+(defn- result-message
+  "Echo-area text for a result: captured output (if any), then `=> value`."
+  [v]
+  (let [out (when (map? v) (:legmacs.eval/out v))
+        line (str "=> " (result-text v))]
+    (if out (str (string/trimr out) "\n" line) line)))
+
+(defn- eval-error-message [e]
+  (str "Eval error: " (or (ex-message e) (str e))))
+
+(defn- eval-request
+  "The backend request for [start end) of `state`, read into `forms`."
+  [state op start end source forms]
+  (let [[row column] (buf/row-col-of state start)]
+    {:op op :state state :forms forms :source source
+     :backend (:backend (eval-backend-for state))
+     :context {:text (buf/buffer-text state) :source source :start start :end end
+               :filename (:filename state) :directory (path/default-directory state)
+               :line (inc row) :column column
+               :namespace (buffer-ns-name state)}}))
+
+(defn- eval-backend-value [request]
+  (if-let [backend (get @eval-backends (:backend request))]
+    (backend request)
+    (throw (str "Unknown eval backend " (pr-str (:backend request))))))
+
+(defn- eval-backend-io [request]
+  (fn [] (eval-backend-value request)))
+
+(defn- span-intact?
+  "Did the job's source survive until its result landed? Same buffer, and
+   [start end) still holds exactly `source`."
+  [state buffer-id start end source]
+  (let [text (buf/buffer-text state)]
+    (and (= buffer-id (:current-buffer-id state))
+         (<= end (count text))
+         (= source (subs text start end)))))
+
+(defn- resolve-remote-eval
+  "Main-thread completion of an async C-x C-e / C-j. `f` is the same
+   (fn [state start end forms result]) the synchronous path calls; when
+   `needs-span?` (C-j inserts after the form), a moved form or a buffer
+   switch reports instead of inserting into the wrong place."
+  [state f needs-span? buffer-id start end source forms highlight outcome]
+  (let [state (clear-highlight state highlight)]
+    (cond
+      (contains? outcome :err) (assoc state :message (eval-error-message (:err outcome)))
+      (and needs-span? (not (span-intact? state buffer-id start end source)))
+      (assoc state :message (str "Eval: form moved before it completed; "
+                                 (result-message (:ok outcome))))
+      :else (f state start end forms (:ok outcome)))))
+
+(defn- remote-eval-then [f needs-span? buffer-id start end source forms highlight]
+  (fn [state outcome]
+    (resolve-remote-eval state f needs-span? buffer-id start end source forms highlight outcome)))
+
+(defn- run-eval-remote [state f needs-span? start end source forms]
+  (let [highlight {:start start :end end :sticky? true}]
+    (bufs/spawn-task (assoc state :eval-highlight highlight)
+                     (eval-backend-io (eval-request state :eval start end source forms))
+                     (remote-eval-then f needs-span? (:current-buffer-id state)
+                                       start end source forms highlight)
+                     "evaluating...")))
+
+(defn- run-eval-local [state f start end forms]
+  (try
+    (f (highlight-span state start end false)
+       start end forms
+       (reduce (fn [_ form] (eval-form-in-state state form)) nil forms))
+    (catch e (-> state
+                 (highlight-span start end false)
+                 (assoc :message (eval-error-message e))))))
+
+(defn- run-eval [state needs-span? f]
+  (let [[status start end source forms] (eval-selection state)]
     (case status
       :none (assoc state :message "No preceding sexp")
       :error (assoc state :message (str "Read error: " forms))
-      (try
-        (f (highlight-span state start end false)
-           start end forms
-           (reduce (fn [_ form] (eval-form-in-state state form)) nil forms))
-        (catch e (-> state
-                     (highlight-span start end false)
-                     (assoc :message (str "Eval error: " (or (ex-message e) (str e))))))))))
+      (if (remote-eval-backend? state)
+        (run-eval-remote state f needs-span? start end source forms)
+        (run-eval-local state f start end forms)))))
 
 (defcommand eval-last-sexp
   "Evaluate the s-expression immediately before point; show the result in
    the echo area, like Emacs's C-x C-e."
   [state]
-  (run-eval state (fn [state _start _end _form result]
-                     (assoc state :message (str "=> " (format-result result))))))
+  (run-eval state false
+            (fn [state _start _end _form result]
+              (assoc state :message (result-message result)))))
 
 (defcommand eval-print-last-sexp
   "Evaluate the s-expression immediately before point and insert the
    result right after it, like Emacs's C-j in lisp-interaction-mode --
    this is what makes *scratch* feel like a REPL transcript."
   [state]
-  (run-eval state (fn [state _start end _form result]
-                     (let [[row col] (buf/row-col-of state end)]
-                       (buf/insert-string (assoc state :cursor-row row :cursor-col col)
-                                          (str "\n" (format-result result)))))))
+  (run-eval state true
+            (fn [state _start end _form result]
+              (let [[row col] (buf/row-col-of state end)]
+                (buf/insert-string (assoc state :cursor-row row :cursor-col col)
+                                   (str "\n" (result-text result)))))))
 
 (defn- splice-offsets
   "Replace a flat [start end) span with text as one undo step."
@@ -543,7 +733,9 @@
 
 (defn- apply-source-result [state start end result]
   (-> (splice-offsets state start end (:legmacs.eval/text result))
-      (assoc :message "Evaluated and replaced")))
+      (assoc :message (if-let [out (:legmacs.eval/out result)]
+                        (str (string/trimr out) "\nEvaluated and replaced")
+                        "Evaluated and replaced"))))
 
 (register-eval-result-handler! :source apply-source-result)
 
@@ -555,54 +747,16 @@
     (-> (splice-offsets state start end (format-result result))
         (assoc :message "Evaluated and replaced"))))
 
-(defn- in-process-eval-backend
-  "The built-in evaluator backend. A future nREPL backend receives the same
-   request map but can use :source/:namespace without touching editor state."
-  [{:keys [state forms context]}]
-  (binding [*eval-replace-context* context]
-    (reduce (fn [_ form] (eval-form-in-state state form)) nil forms)))
-
-(def eval-backends
-  "Registered eval backend functions, each (fn [request-map] -> value).
-   Backends run inside the generic async job and must not mutate buffers."
-  (atom {:in-process in-process-eval-backend}))
-
-(def current-eval-backend
-  "The backend used by C-c C-v. Kept as data so an nREPL client can install
-   and select itself without replacing the command or key binding."
-  (atom :in-process))
-
-(defn register-eval-backend!
-  "Register an async-safe evaluator function under `name`."
-  [name evaluator]
-  (swap! eval-backends assoc name evaluator)
-  name)
-
-(defn use-eval-backend!
-  "Select a registered evaluator backend. Returns name, or nil if unknown."
-  [name]
-  (when (contains? @eval-backends name)
-    (reset! current-eval-backend name)))
-
-(defn- eval-replace-value [request]
-  (if-let [backend (get @eval-backends @current-eval-backend)]
-    (backend request)
-    (throw (str "Unknown eval backend " (pr-str @current-eval-backend)))))
-
-(defn- eval-replace-io [request]
-  (fn [] (eval-replace-value request)))
-
-(defn- resolve-eval-replace [state start end source highlight outcome]
+(defn- resolve-eval-replace [state buffer-id start end source highlight outcome]
   (let [state (clear-highlight state highlight)]
-    (if-let [err (:err outcome)]
-      (assoc state :message (str "Eval error: " (or (ex-message err) (str err))))
-      (let [text (buf/buffer-text state)]
-        (if-not (and (<= end (count text)) (= source (subs text start end)))
-          (assoc state :message "Eval: form moved before it completed")
-          (apply-replacement-result state start end (:ok outcome)))))))
+    (cond
+      (contains? outcome :err) (assoc state :message (eval-error-message (:err outcome)))
+      (not (span-intact? state buffer-id start end source))
+      (assoc state :message "Eval: form moved before it completed")
+      :else (apply-replacement-result state start end (:ok outcome)))))
 
-(defn- eval-replace-then [start end source highlight]
-  (fn [state outcome] (resolve-eval-replace state start end source highlight outcome)))
+(defn- eval-replace-then [buffer-id start end source highlight]
+  (fn [state outcome] (resolve-eval-replace state buffer-id start end source highlight outcome)))
 
 (defcommand eval-replace-sexp
   "Evaluate the region or s-expression at point asynchronously and replace
@@ -616,27 +770,35 @@
       (case status
         :none (assoc state :message "No s-expression at point")
         :error (assoc state :message (str "Read error: " forms))
-        (let [text (buf/buffer-text state)
-              [_row column] (buf/row-col-of state start)
-              context {:text text :source source :start start :end end
-                       :filename (:filename state) :column column
-                       :namespace (buffer-ns-name state)}
-              request {:state state :forms forms :source source :context context}
-              highlight {:start start :end end :sticky? true}
-              state (assoc state :eval-highlight highlight)]
-          (bufs/spawn-task state
-                           (eval-replace-io request)
-                           (eval-replace-then start end source highlight)
+        (let [highlight {:start start :end end :sticky? true}]
+          (bufs/spawn-task (assoc state :eval-highlight highlight)
+                           (eval-backend-io (eval-request state :eval start end source forms))
+                           (eval-replace-then (:current-buffer-id state) start end source highlight)
                            "evaluating..."))))))
+
+(defn- resolve-eval-buffer [state outcome]
+  (if (contains? outcome :err)
+    (assoc state :message (eval-error-message (:err outcome)))
+    (assoc state :message (result-message (:ok outcome)))))
+
+(defn- eval-buffer-remote [state]
+  (let [text (buf/buffer-text state)]
+    (bufs/spawn-task state
+                     (eval-backend-io (eval-request state :load 0 (count text) text nil))
+                     resolve-eval-buffer
+                     "loading buffer...")))
 
 (defcommand eval-buffer
   "Evaluate the entire buffer, top to bottom, form by form in the current
-   namespace (or the buffer's ns form, restored afterwards)."
+   namespace (or the buffer's ns form, restored afterwards). With a remote
+   backend this is the server's load-file."
   [state]
-  (try
-    (let [result (preserving-ns (fn [] (load-in-editor (buf/buffer-text state))))]
-      (assoc state :message (str "=> " (format-result result))))
-    (catch e (assoc state :message (str "Eval error: " (or (ex-message e) (str e)))))))
+  (if (remote-eval-backend? state)
+    (eval-buffer-remote state)
+    (try
+      (let [result (load-preserving-ns (buf/buffer-text state))]
+        (assoc state :message (result-message result)))
+      (catch e (assoc state :message (eval-error-message e))))))
 
 ;; --- auto-indent --------------------------------------------------------
 ;;
@@ -799,6 +961,24 @@
 (km/bind-key! keymap "}" :auto-close-brace)
 (km/bind-key! keymap "DEL" :auto-delete-pair)
 
+(def after-command-hooks
+  "name -> (fn [state] -> state), run after every command in let-go-mode,
+   after paren-matching. eldoc (legmacs.modes.letgo-lookup) is one. A
+   hook that throws is skipped for that command rather than breaking it."
+  (atom {}))
+
+(defn add-after-command-hook!
+  "Register (or replace) a let-go-mode after-command hook."
+  [name f]
+  (swap! after-command-hooks assoc name f)
+  name)
+
+(defn- run-hook [state f]
+  (try (f state) (catch e state)))
+
+(defn- let-go-after-command [state]
+  (reduce run-hook (update-paren-match state) (vals @after-command-hooks)))
+
 (modes/register-mode! :let-go keymap
                        (str "let-go-mode: C-x C-e eval-last-sexp, C-j eval-print-last-sexp, "
                             "C-c C-v eval-and-replace, "
@@ -806,7 +986,8 @@
                        {:highlighter highlight-line
                         :highlight-line highlight-line-carry
                         :highlight-carry highlight-carry
-                        :after-command update-paren-match})
+                        :after-command let-go-after-command
+                        :status eval-backend-status})
 (modes/register-auto-mode! ".lg" :let-go)
 ;; let-go is a Clojure dialect, and shares its reader syntax closely enough
 ;; (parens/brackets/braces, `;` line comments, `"`-delimited strings) that

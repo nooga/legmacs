@@ -1,0 +1,83 @@
+(ns test.letgo-complete-test
+  (:require [test :refer :all]
+            [string]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.bindings :as bindings]
+            [legmacs.dispatch :as dispatch]
+            [legmacs.modes.letgo]
+            [legmacs.modes.letgo-complete :as c]))
+
+(bindings/install!)
+
+(defn- lg-state [lines row col]
+  (-> (buf/new-state nil lines)
+      (modes/switch-to-mode :let-go)
+      (assoc :cursor-row row :cursor-col col)))
+
+(defn- at-end [lines]
+  (let [row (dec (count lines))] (lg-state lines row (count (nth lines row)))))
+
+(deftest prefix-at-point-cases
+  (is (= {:row 0 :start 1 :end 4 :prefix "map"} (c/prefix-at-point (lg-state ["(map"] 0 4))))
+  (testing "mid-symbol: prefix up to point, bounds over the whole symbol"
+    (is (= {:row 0 :start 1 :end 5 :prefix "ma"} (c/prefix-at-point (lg-state ["(mapv x)"] 0 3)))))
+  (testing "reader syntax isn't part of it"
+    (is (= "foo" (:prefix (c/prefix-at-point (lg-state ["#'foo"] 0 5)))))
+    (is (= "str/sp" (:prefix (c/prefix-at-point (lg-state ["@str/sp"] 0 7))))))
+  (testing "nothing to complete"
+    (is (nil? (c/prefix-at-point (lg-state ["(:foo"] 0 5))))
+    (is (nil? (c/prefix-at-point (lg-state ["(+ 12"] 0 5))))
+    (is (nil? (c/prefix-at-point (lg-state ["( "] 0 2))))))
+
+(deftest in-process-candidates-cases
+  (let [names (fn [prefix aliases]
+                (set (map :candidate (c/in-process-candidates prefix nil aliases))))]
+    (is (contains? (names "mapc" {}) "mapcat"))
+    (is (contains? (names "string/spl" {}) "string/split"))
+    (testing "an alias from the buffer's ns form"
+      (is (contains? (names "s/spl" {'s (find-ns 'string)}) "s/split"))
+      (is (contains? (names "s" {'s (find-ns 'string)}) "s/")))
+    (testing "special forms are there too"
+      (is (contains? (names "let" {}) "letfn")))))
+
+(deftest require-aliases-come-from-the-ns-form
+  (let [s (lg-state ["(ns demo (:require [string :as str] [no.such.lib :as nope]))"] 0 0)]
+    (is (= {'str (find-ns 'string)} (c/require-aliases s)))))
+
+(deftest completing-in-the-buffer
+  (testing "one candidate is inserted"
+    (let [s (c/complete-symbol (at-end ["(mapca"]))]
+      (is (= ["(mapcat"] (:lines s)))
+      (is (= 7 (:cursor-col s)))))
+  (testing "a longer common prefix is inserted first"
+    (let [s (c/complete-symbol (at-end ["(string/split-l"]))]
+      (is (= ["(string/split-lines"] (:lines s)))))
+  (testing "otherwise the picker opens on the prefix, and RET replaces the symbol"
+    (let [s (c/complete-symbol (at-end ["(string/s"]))
+          values (set (map :value (get-in s [:minibuffer :candidates])))]
+      (is (= "Complete: " (get-in s [:minibuffer :prompt])))
+      (is (= "string/s" (get-in s [:minibuffer :input])))
+      (is (contains? values "string/split"))
+      (is (contains? values "string/starts-with?"))
+      (let [chosen (:value (first (get-in s [:minibuffer :candidates])))
+            done (dispatch/dispatch s "RET")]
+        (is (nil? (:minibuffer done)))
+        (is (= [(str "(" chosen)] (:lines done))))))
+  (testing "no match says so and leaves the buffer alone"
+    (let [s (c/complete-symbol (at-end ["(zzqqxx"]))]
+      (is (= ["(zzqqxx"] (:lines s)))
+      (is (= "No completions for zzqqxx" (:message s))))))
+
+(deftest tab-indents-or-completes
+  (testing "TAB after a symbol on a well-indented line completes"
+    (let [s (dispatch/dispatch (at-end ["(mapca"]) "TAB")]
+      (is (= ["(mapcat"] (:lines s)))))
+  (testing "TAB on a mis-indented line still just indents"
+    (let [s (dispatch/dispatch (at-end ["(let [x 1]" "        mapca"]) "TAB")]
+      (is (= "  mapca" (second (:lines s))))))
+  (testing "TAB inside a string or comment never completes"
+    (is (= ["(str \"mapca"] (:lines (dispatch/dispatch (at-end ["(str \"mapca"]) "TAB"))))
+    (is (= ["; mapca"] (:lines (dispatch/dispatch (at-end ["; mapca"]) "TAB")))))
+  (testing "M-TAB always completes"
+    (is (= ["(mapcat"] (:lines (dispatch/dispatch (at-end ["(mapca"]) "M-TAB"))))))

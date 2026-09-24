@@ -1,0 +1,466 @@
+(ns legmacs.nrepl
+  "nREPL client: talk to a running let-go (or any bencode nREPL) server
+   and make it the eval and completion backend for a project's buffers.
+
+   Connections belong to project roots (the nearest directory with a
+   project marker such as deps.edn, lgx.edn or bb.edn). A let-go-mode
+   buffer visiting a file under a connected root evaluates there -- C-x
+   C-e, C-j, C-c C-v, C-c C-e -- and completes there (TAB / M-TAB, see
+   legmacs.modes.letgo-complete); the lighter reads `nrepl` (or
+   `nrepl:clj` etc. when jack-in started the server). Everything else,
+   *scratch* and *repl* included, keeps evaluating in the editor's own VM.
+
+   C-c M-j (legmacs.jack-in) starts a server and connects. M-x
+   nrepl-connect (C-c M-c) connects to one already running: it reads
+   host:port, pre-filled from the nearest .nrepl-port. C-c C-q
+   disconnects this buffer's project, stopping the server if jack-in
+   started it; every connection closes at editor exit.
+
+   The wire half is deliberately one blocking round trip at a time:
+   `request` takes the connection's lock, writes one message, and reads
+   replies until the one carrying our id says `done`. Backends already
+   run inside a bufs/spawn-task future, so blocking there costs the editor
+   nothing, and there is no long-lived reader goroutine for the main loop
+   to keep polling for. C-g drops a pending result as it does for any
+   async job; the request itself still finishes on the server."
+  (:require [string]
+            [os]
+            [async]
+            [net]
+            [bencode]
+            [legmacs.buffer :as buf]
+            [legmacs.buffers :as bufs]
+            [legmacs.keymap :as km :refer [defcommand]]
+            [legmacs.minibuffer :as mb]
+            [legmacs.path :as path]
+            [legmacs.modes.letgo :as letgo]
+            [legmacs.modes.letgo-complete :as complete]
+            [legmacs.modes.letgo-lookup :as lookup]))
+
+(def default-port 2137)
+
+;; --- pure helpers --------------------------------------------------------
+
+(defn parse-address
+  "\"7888\", \"host:7888\", or \"host\" -> [host port]; nil when the port
+   part isn't a number. Blank input means localhost on `fallback-port`."
+  [s fallback-port]
+  (let [s (string/trim (or s ""))
+        [host port] (if (string/includes? s ":")
+                      (let [i (string/last-index-of s ":")]
+                        [(subs s 0 i) (subs s (inc i))])
+                      (if (re-matches #"\d+" s) ["" s] [s nil]))
+        host (if (string/blank? host) "127.0.0.1" host)
+        port (if (string/blank? port)
+               fallback-port
+               (try (parse-long port) (catch e nil)))]
+    (when port [host port])))
+
+(defn strip-ansi
+  "`s` without ANSI color escapes."
+  [s]
+  (string/replace s #"\x1b\[[0-9;]*m" ""))
+
+(defn- excerpt-line?
+  "Where let-go's diagnostic stops being message and starts being the
+   source excerpt / stack trace."
+  [line]
+  (or (string/starts-with? line "-->")
+      (string/starts-with? line "|")
+      (string/starts-with? line "stack trace")
+      (re-matches #"\d+\s*\|.*" line)))
+
+(defn clean-error
+  "let-go's `err` text is a colored, multi-line diagnostic: a message and
+   its `caused by:` chain, then a source excerpt and stack. The echo area
+   wants the chain on one uncolored line, without the redundant `error:`
+   tag -- the cause is usually the useful half (\"compiling function
+   position: Can't resolve sq in this context\")."
+  [err]
+  (let [lines (->> (string/split (strip-ansi (or err "")) "\n")
+                   (map string/trim)
+                   (remove string/blank?)
+                   (take-while (complement excerpt-line?))
+                   (map #(string/replace % #"^(error|caused by):\s*" "")))]
+    (if (seq lines) (string/join ": " lines) "nREPL error")))
+
+(defn done? [reply]
+  (boolean (some #{"done"} (get reply "status"))))
+
+(defn combine-replies
+  "Fold every reply to one request into {:value :ns :out :err :ex :status}.
+   `value` and `ns` keep the last one (a multi-form eval answers once per
+   form); `out`/`err` concatenate; `status` collects every flag. Keys the
+   server never sent stay absent."
+  [replies]
+  (reduce (fn [acc r]
+            (cond-> acc
+              (get r "value") (assoc :value (get r "value"))
+              (get r "ns") (assoc :ns (get r "ns"))
+              (get r "out") (update :out str (get r "out"))
+              (get r "err") (update :err str (get r "err"))
+              (get r "ex") (assoc :ex (get r "ex"))
+              (get r "status") (update :status into (get r "status"))))
+          {:status #{}}
+          replies))
+
+(defn eval-failed?
+  "An error reply: an explicit eval-error status, or err text with no value
+   (let-go's server sends the latter)."
+  [combined]
+  (boolean (or (contains? (:status combined) "eval-error")
+               (and (:err combined) (nil? (:value combined))))))
+
+(defn- ns-note
+  "let-go's server evaluates in `user` rather than failing when asked for a
+   namespace it has never seen. Say so, since otherwise defs silently land
+   in the wrong place."
+  [requested combined]
+  (when (and requested (:ns combined) (not= (str requested) (:ns combined)))
+    (str "(evaluated in " (:ns combined) ": " requested
+         " isn't loaded on the server -- C-c C-e loads the buffer)")))
+
+(defn reply->result
+  "A combined reply as what letgo's eval commands expect: a printed-result,
+   or a throw carrying the cleaned-up error. `requested-ns` (a symbol or
+   nil) is what the request asked for."
+  [combined requested-ns]
+  (if (eval-failed? combined)
+    (throw (ex-info (clean-error (:err combined)) combined))
+    (let [note (ns-note requested-ns combined)
+          out (string/join "\n" (remove string/blank? [(:out combined) note]))]
+      (letgo/printed-result (or (:value combined) "nil") out))))
+
+(defn eval-message
+  "The bencode message for an eval request map (see legmacs.modes.letgo's
+   eval-backends comment). Bencode has no nil, so absent context stays
+   absent rather than being sent empty."
+  [{:keys [op source context]}]
+  (let [{:keys [namespace filename line column]} context
+        file (when filename (path/absolute-path filename))]
+    (if (= op :load)
+      (cond-> {:op "load-file" :file source}
+        file (assoc :file-path file
+                    :file-name (last (string/split file "/"))))
+      (cond-> {:op "eval" :code source}
+        namespace (assoc :ns (str namespace))
+        file (assoc :file file)
+        line (assoc :line line)
+        column (assoc :column (inc column))))))
+
+(defn find-port-file
+  "The nearest `.nrepl-port` at or above `dir`, as its trimmed contents,
+   or nil."
+  [dir]
+  (loop [dir (path/absolute-path (or dir "."))]
+    (let [text (try (slurp (path/join dir ".nrepl-port")) (catch e nil))]
+      (cond
+        (and text (not (string/blank? text))) (string/trim text)
+        (or (= dir "/") (string/blank? dir)) nil
+        :else (let [up (path/dirname dir)]
+                (when (not= up dir) (recur up)))))))
+
+;; --- the wire ------------------------------------------------------------
+
+(defn- new-lock []
+  (let [ch (async/chan 1)]
+    (async/>!! ch :token)
+    ch))
+
+(defn- with-lock
+  "Run `thunk` holding `lock`. The reify-outcome shape (not `finally`) so
+   the token goes back even when thunk throws -- see CLAUDE.md's `finally`
+   gotcha."
+  [lock thunk]
+  (async/<!! lock)
+  (let [outcome (try {:ok (thunk)} (catch e {:err e}))]
+    (async/>!! lock :token)
+    (if (contains? outcome :err) (throw (:err outcome)) (:ok outcome))))
+
+(defn- read-replies
+  "Read until the reply for `id` that says done; replies for other ids
+   (stragglers from an earlier, abandoned request) are skipped."
+  [socket id]
+  (loop [acc []]
+    (let [reply (bencode/read! socket)]
+      (cond
+        (nil? reply) (throw "nREPL connection closed")
+        (not= id (get reply "id")) (recur acc)
+        (done? reply) (conj acc reply)
+        :else (recur (conj acc reply))))))
+
+(defn- round-trip [conn msg]
+  (let [id (str (swap! (:next-id conn) inc))]
+    (bencode/write! (:socket conn)
+                    (cond-> (assoc msg :id id)
+                      (:session conn) (assoc :session (:session conn))))
+    (read-replies (:socket conn) id)))
+
+(defn request
+  "Send `msg` (keyword keys, no nils) and return every reply to it, in order.
+   Blocks; one request at a time per connection."
+  [conn msg]
+  (with-lock (:lock conn) (fn [] (round-trip conn msg))))
+
+(defn- reply-ops [replies]
+  (set (map name (keys (some #(get % "ops") replies)))))
+
+(defn open-connection
+  "Dial host:port, clone a session, and ask which ops the server has
+   (`:ops`, a set of strings -- let-go's server has a handful, cider-nrepl
+   dozens). Throws when dialing or cloning fails."
+  [host port]
+  (let [conn {:socket (net/dial host port) :host host :port port
+              :lock (new-lock) :next-id (atom 0)}
+        session (some #(get % "new-session") (request conn {:op "clone"}))
+        conn (assoc conn :session session)
+        ops (try (reply-ops (request conn {:op "describe"})) (catch e #{}))]
+    (assoc conn :ops ops)))
+
+(defn close-connection
+  "Close the socket, then run the connection's :on-close (jack-in uses it
+   to stop the server process it started)."
+  [conn]
+  (try (net/close! (:socket conn)) (catch e nil))
+  (when-let [f (:on-close conn)] (try (f) (catch e nil)))
+  nil)
+
+;; --- connections, one per project ---------------------------------------
+;;
+;; Like CIDER's sesman, but only the part that matters day to day: each
+;; connection belongs to a project root, and a buffer visiting a file
+;; under that root evaluates there. Two projects on two servers, and
+;; *scratch* in the editor's own VM, coexist without switching anything.
+
+(def project-markers
+  "Files that mark a project root. legmacs.jack-in adds each launch
+   config's markers here."
+  (atom #{"lgx.edn" "deps.edn" "bb.edn" "project.clj" "shadow-cljs.edn"}))
+
+(defn- has-marker? [dir markers]
+  (some (fn [m] (some? (os/stat (path/join dir m)))) markers))
+
+(defn find-project-root
+  "The nearest directory at or above `dir` holding a project marker, or
+   nil."
+  [dir]
+  (loop [dir (path/absolute-path dir)]
+    (cond
+      (has-marker? dir @project-markers) dir
+      :else (let [up (path/dirname dir)]
+              (when (and up (not= up dir)) (recur up))))))
+
+(def connections
+  "Live connections by project root (an absolute directory)."
+  (atom {}))
+
+(defn- under-root? [dir root]
+  (or (= dir root)
+      (string/starts-with? dir (if (string/ends-with? root os/file-separator)
+                                 root
+                                 (str root os/file-separator)))))
+
+(defn connection-for-dir
+  "The connection whose root is the longest one containing `dir`."
+  [dir]
+  (when dir
+    (->> @connections
+         (filter (fn [[root _]] (under-root? dir root)))
+         (sort-by (fn [[root _]] (- (count root))))
+         first
+         second)))
+
+(defn connection-for
+  "The connection a buffer evaluates with: by the directory of the file it
+   visits. Buffers without a file (*scratch*, *repl*) have none -- they
+   stay in the editor's VM. Cheap: string prefixes, no filesystem, since
+   the lighter asks every frame."
+  [state]
+  (when-let [f (:filename state)]
+    (when (seq @connections)
+      (connection-for-dir (path/directory-of f)))))
+
+(defn- connection-for-request
+  "The connection for a backend request, from its :context. If the buffer
+   is under no root but exactly one connection exists (the global backend
+   was selected by hand), that one."
+  [req]
+  (let [{:keys [filename directory]} (:context req)
+        dir (if filename (path/directory-of filename) directory)]
+    (or (connection-for-dir dir)
+        (when (= 1 (count @connections)) (first (vals @connections)))
+        (throw "No nREPL connection for this buffer (C-c M-j jacks in)"))))
+
+(defn connected? [] (boolean (seq @connections)))
+
+(defn conn-label
+  "`host:port`, plus the jack-in type when there is one."
+  [conn]
+  (str (:host conn) ":" (:port conn)
+       (when-let [t (:label conn)] (str " (" t ")"))))
+
+(defn register-connection!
+  "Make `conn` the connection for `root`, closing whatever was there."
+  [root conn]
+  (when-let [old (get @connections root)]
+    (when-not (identical? old conn) (close-connection old)))
+  (swap! connections assoc root (assoc conn :root root))
+  conn)
+
+(defn remove-connection!
+  "Close and forget the connection for `root`."
+  [root]
+  (when-let [conn (get @connections root)]
+    (swap! connections dissoc root)
+    (close-connection conn)))
+
+(defn close-all!
+  "Close every connection (and so stop every jacked-in server). Runs at
+   editor exit."
+  []
+  (doseq [root (keys @connections)] (remove-connection! root)))
+
+(defn nrepl-backend
+  "The :nrepl eval backend: (fn [request] -> printed-result)."
+  [req]
+  (let [conn (connection-for-request req)]
+    (-> (combine-replies (request conn (eval-message req)))
+        ;; a load *is* the fix the ns note suggests, so it never gets one
+        (reply->result (when (not= :load (:op req))
+                         (get-in req [:context :namespace]))))))
+
+(defn- lighter [conn]
+  (str "nrepl" (when-let [s (:short conn)] (str ":" s))))
+
+(defn- nrepl-resolver [state]
+  (when-let [conn (connection-for state)]
+    {:backend :nrepl :label (lighter conn)}))
+
+(letgo/register-eval-backend! :nrepl nrepl-backend)
+(letgo/register-eval-backend-resolver! :nrepl nrepl-resolver)
+
+;; --- completion ------------------------------------------------------------
+
+(defn completion-message
+  "cider-nrepl's `complete` is context-aware, so prefer it; plain nREPL
+   (and let-go's server) have `completions` with the same reply shape."
+  [conn prefix ns]
+  (cond-> {:op (if (contains? (:ops conn) "complete") "complete" "completions")
+           :prefix prefix}
+    ns (assoc :ns (str ns))))
+
+(defn reply->completions [replies]
+  (vec (for [r replies
+             c (get r "completions")]
+         {:candidate (get c "candidate") :type (get c "type") :ns (get c "ns")})))
+
+(defn nrepl-completer [req]
+  (let [conn (connection-for-request req)]
+    (reply->completions
+     (request conn (completion-message conn (:prefix req) (:namespace req))))))
+
+(complete/register-completer! :nrepl nrepl-completer)
+
+;; --- lookup (eldoc, doc, M-.) ----------------------------------------------
+
+(defn lookup-message
+  "cider-nrepl's `eldoc` for eldoc when the server has it, else `info`
+   (cider-nrepl, let-go) or nREPL 1.x's built-in `lookup`."
+  [conn sym ns want]
+  (let [ops (:ops conn)
+        op (cond (and (= want :eldoc) (contains? ops "eldoc")) "eldoc"
+                 (contains? ops "info") "info"
+                 (contains? ops "lookup") "lookup"
+                 :else "info")]
+    (cond-> {:op op :sym sym}
+      ns (assoc :ns (str ns)))))
+
+(defn- eldoc-arglist [args]
+  (str "[" (string/join " " args) "]"))
+
+(defn reply->info
+  "An info map (see legmacs.modes.letgo-lookup) from `info`, `lookup`
+   (which nests its answer under \"info\") or `eldoc` replies; nil when
+   the server knows nothing about the symbol."
+  [replies]
+  (let [r (reduce (fn [acc r] (merge acc (or (get r "info") r))) {} replies)
+        status (set (mapcat #(get % "status") replies))
+        arglists (cond
+                   (seq (get r "eldoc")) (mapv eldoc-arglist (get r "eldoc"))
+                   (get r "arglists-str") (vec (remove string/blank?
+                                                       (string/split (get r "arglists-str") "\n")))
+                   :else [])]
+    (when (and (not (contains? status "no-info")) (or (get r "name") (get r "doc")))
+      {:name (get r "name")
+       :ns (get r "ns")
+       :kind (cond (get r "special-form") "special form"
+                   (get r "macro") "macro"
+                   (get r "type") (get r "type")
+                   :else nil)
+       :arglists arglists
+       :doc (or (get r "doc") (get r "docstring"))
+       :file (get r "file")
+       :line (get r "line")
+       :column (get r "column")})))
+
+(defn nrepl-lookup [req]
+  (let [conn (connection-for-request req)]
+    (reply->info
+     (request conn (lookup-message conn (:symbol req) (:namespace req) (:want req))))))
+
+(lookup/register-lookup! :nrepl nrepl-lookup)
+
+;; --- commands ------------------------------------------------------------
+
+(defn root-for
+  "Where a connection made from `state` belongs: its project root, else
+   its directory."
+  [state]
+  (let [dir (path/default-directory state)]
+    (or (find-project-root dir) (path/absolute-path dir))))
+
+(defn- resolve-connect [root state outcome]
+  (if-let [err (:err outcome)]
+    (assoc state :message (str "nREPL connect failed: " (or (ex-message err) (str err))))
+    (let [conn (register-connection! root (:ok outcome))]
+      (assoc state :message (str "Connected to " (conn-label conn) " for " root)))))
+
+(defn- connect-then [root]
+  (fn [state outcome] (resolve-connect root state outcome)))
+
+(defn- connect-io [host port]
+  (fn [] (open-connection host port)))
+
+(defn- submit-address [root]
+  (fn [state input]
+    (if-let [[host port] (parse-address input default-port)]
+      (bufs/spawn-task state (connect-io host port) (connect-then root)
+                       (str "Connecting to " host ":" port "..."))
+      (assoc state :message (str "Not a host:port: " input)))))
+
+(defcommand nrepl-connect
+  "Connect to a running nREPL server for this buffer's project: files
+   under the project root evaluate and complete there. Prompts for
+   host:port, pre-filled from the nearest .nrepl-port; a bare port means
+   localhost."
+  [state]
+  (let [root (root-for state)
+        found (find-port-file (path/default-directory state))]
+    (mb/open state "nREPL (host:port): " (submit-address root)
+             {:initial (if found (str "localhost:" found) "")})))
+
+(defcommand nrepl-disconnect
+  "Close this buffer's nREPL connection -- stopping the server too if
+   jack-in started it. Its files go back to evaluating in the editor."
+  [state]
+  (let [conn (or (connection-for state)
+                 (when (= 1 (count @connections)) (first (vals @connections))))]
+    (if conn
+      (do (remove-connection! (:root conn))
+          (assoc state :message (str "Disconnected from " (conn-label conn))))
+      (assoc state :message "Not connected to nREPL"))))
+
+(bufs/add-exit-hook! :nrepl close-all!)
+
+(km/bind-key! letgo/keymap "C-c M-c" :nrepl-connect)
+(km/bind-key! letgo/keymap "C-c C-q" :nrepl-disconnect)

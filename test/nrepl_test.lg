@@ -1,0 +1,270 @@
+(ns test.nrepl-test
+  (:require [test :refer :all]
+            [string]
+            [os]
+            [net]
+            [bencode]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.modes.letgo :as lg-mode]
+            [legmacs.modes.letgo-lookup :as lookup]
+            [legmacs.nrepl :as nrepl]))
+
+;; The pure half is tested directly; the wire half against a fake server
+;; on a real loopback socket, so bencode framing, ids and sessions are the
+;; genuine article. Nothing here needs `lg -n` running.
+
+(def esc (str (char 27)))
+
+(deftest parse-address-cases
+  (is (= ["127.0.0.1" 7888] (nrepl/parse-address "7888" 1)))
+  (is (= ["localhost" 7888] (nrepl/parse-address " localhost:7888 " 1)))
+  (is (= ["box" 2137] (nrepl/parse-address "box" 2137)))
+  (is (= ["127.0.0.1" 2137] (nrepl/parse-address "" 2137)))
+  (is (nil? (nrepl/parse-address "box:nope" 2137))))
+
+(deftest clean-error-keeps-the-message-chain
+  (is (= "divide by zero"
+         (nrepl/clean-error (str esc "[1;31merror:" esc "[0m divide by zero\n"
+                                 "  " esc "[1;34m-->" esc "[0m <default>:1:1\n"))))
+  (is (= "compiling function position: Can't resolve sq in this context"
+         (nrepl/clean-error (str esc "[1;31merror:" esc "[0m compiling function position\n"
+                                 "caused by: Can't resolve sq in this context\n"
+                                 "  " esc "[1;34m-->" esc "[0m <default>:1:1\n"
+                                 "   " esc "[1;34m|" esc "[0m\n"
+                                 " " esc "[1;34m1" esc "[0m " esc "[1;34m|" esc "[0m (sq 12)\n"))))
+  (is (= "Syntax error" (nrepl/clean-error "\n\n  Syntax error\n")))
+  (is (= "nREPL error" (nrepl/clean-error nil))))
+
+(deftest combine-replies-folds-one-request
+  (let [c (nrepl/combine-replies [{"id" "2" "out" "a\n"}
+                                  {"id" "2" "value" "1" "ns" "user"}
+                                  {"id" "2" "out" "b\n"}
+                                  {"id" "2" "value" "#'user/f" "ns" "user"}
+                                  {"id" "2" "status" ["done"]}])]
+    (is (= "#'user/f" (:value c)))
+    (is (= "a\nb\n" (:out c)))
+    (is (= #{"done"} (:status c)))
+    (is (not (contains? c :err)))
+    (is (not (nrepl/eval-failed? c))))
+  (testing "let-go signals failure as err with no value"
+    (is (nrepl/eval-failed? (nrepl/combine-replies [{"err" "boom"} {"status" ["done"]}]))))
+  (testing "other servers use an eval-error status"
+    (is (nrepl/eval-failed? (nrepl/combine-replies [{"status" ["eval-error"]} {"status" ["done"]}])))))
+
+(deftest reply->result-cases
+  (testing "a value becomes a printed-result C-c C-v splices verbatim"
+    (let [r (nrepl/reply->result {:value "{:a 1}" :ns "user" :status #{"done"}} nil)]
+      (is (= "{:a 1}" (:legmacs.eval/text r)))
+      (is (= :source (:legmacs.eval/kind r)))
+      (is (nil? (:legmacs.eval/out r)))))
+  (testing "output rides along"
+    (is (= "hi\n" (:legmacs.eval/out (nrepl/reply->result {:value "nil" :out "hi\n"} nil)))))
+  (testing "an unknown ns fell back to user: say so"
+    (is (string/includes? (:legmacs.eval/out (nrepl/reply->result {:value "3" :ns "user"} 'my.ns))
+                          "my.ns isn't loaded")))
+  (testing "an error throws its cleaned message"
+    (is (= "divide by zero"
+           (try (nrepl/reply->result {:err "error: divide by zero\n  --> x"} nil)
+                (catch e (ex-message e)))))))
+
+(deftest eval-message-carries-context-and-no-nils
+  (is (= {:op "eval" :code "(+ 1 2)"}
+         (nrepl/eval-message {:op :eval :source "(+ 1 2)" :context {}})))
+  (is (= {:op "eval" :code "(f)" :ns "my.ns" :file "/src/a.lg" :line 3 :column 5}
+         (nrepl/eval-message {:op :eval :source "(f)"
+                              :context {:namespace 'my.ns :filename "/src/a.lg"
+                                        :line 3 :column 4}})))
+  (is (= {:op "load-file" :file "(ns a)" :file-path "/src/a.lg" :file-name "a.lg"}
+         (nrepl/eval-message {:op :load :source "(ns a)" :context {:filename "/src/a.lg"}}))))
+
+(deftest find-port-file-walks-up
+  (let [root (str (os/temp-dir) "legmacs-nrepl-test-" (rand-int 1000000))
+        deep (str root "/a/b")]
+    (os/sh "mkdir" "-p" deep)
+    (try
+      (spit (str root "/.nrepl-port") "7888\n")
+      (is (= "7888" (nrepl/find-port-file deep)))
+      (is (= "7888" (nrepl/find-port-file root)))
+      (finally (os/sh "rm" "-rf" root)))))
+
+;; --- fake server ----------------------------------------------------------
+
+(defn- reply! [c msg m]
+  (bencode/write! c (assoc m "id" (get msg "id") "session" (get msg "session" ""))))
+
+(defn- serve-one! [c msg]
+  (let [op (get msg "op")
+        code (or (get msg "code") (get msg "file"))
+        ns (get msg "ns" "user")]
+    (case op
+      "clone" (reply! c msg {"new-session" "sess-1" "status" ["done"]})
+      "info" (if (= "sq" (get msg "sym"))
+               (reply! c msg {"name" "sq" "ns" "demo.core" "doc" "Squares."
+                              "arglists-str" "[x]" "file" "file:/src/demo.lg"
+                              "line" 2 "column" 1 "status" ["done"]})
+               (reply! c msg {"status" ["done" "no-info"]}))
+      ("eval" "load-file")
+      (do
+        ;; a straggler for some other id first: the client must skip it
+        (bencode/write! c {"id" "stale" "value" "wrong"})
+        (cond
+          (= code "(boom)")
+          (reply! c msg {"err" (str esc "[1;31merror:" esc "[0m kaboom\n  --> x") "ex" "E"})
+          :else
+          (do (when (string/includes? code "println")
+                (reply! c msg {"out" "hi\n"}))
+              (reply! c msg {"value" (str "v:" code) "ns" ns})))
+        (reply! c msg {"status" ["done"]}))
+      (reply! c msg {"status" ["done" "unknown-op"]}))))
+
+(defn- start-fake-server
+  "Serve one connection on a free loopback port. Returns {:port :seen} where
+   :seen is an atom of every message received."
+  []
+  (let [listener (net/listen "127.0.0.1" 0)
+        seen (atom [])]
+    (future
+      (let [c (net/accept listener)]
+        (loop []
+          (when-let [msg (try (bencode/read! c) (catch e nil))]
+            (swap! seen conj msg)
+            (serve-one! c msg)
+            (recur)))
+        (net/close! listener)))
+    {:port (:port (net/local-address listener)) :seen seen}))
+
+(defn- settle-first-job [state]
+  (let [job (first (:async-jobs state))
+        outcome (deref (:promise job))]
+    ((:then job) (assoc state :async-jobs nil) outcome)))
+
+(defn- with-fake-connection
+  "Run (f conn seen) with a fake server connected for the /src project."
+  [f]
+  (let [{:keys [port seen]} (start-fake-server)
+        conn (nrepl/register-connection! "/src" (nrepl/open-connection "127.0.0.1" port))]
+    (let [outcome (try {:ok (f conn seen)} (catch e {:err e}))]
+      (nrepl/remove-connection! "/src")
+      (when (contains? outcome :err) (throw (:err outcome)))
+      (:ok outcome))))
+
+(defn- lg-buffer [lines col]
+  (-> (buf/new-state "/src/demo.lg" lines)
+      (modes/switch-to-mode :let-go)
+      (assoc :cursor-col col)))
+
+(deftest wire-round-trips
+  (with-fake-connection
+    (fn [conn seen]
+      (testing "clone gave us a session every later message carries"
+        (is (= "sess-1" (:session conn)))
+        (nrepl/request conn {:op "eval" :code "(+ 1 2)"})
+        (is (= "sess-1" (get (last @seen) "session"))))
+      (testing "replies are this request's only, ending at done"
+        (let [replies (nrepl/request conn {:op "eval" :code "(+ 1 2)"})]
+          (is (= ["v:(+ 1 2)" nil] (mapv #(get % "value") replies)))
+          (is (nrepl/done? (last replies))))))))
+
+(deftest eval-commands-go-through-the-server
+  (with-fake-connection
+    (fn [_conn seen]
+      (testing "C-x C-e is async and shows the server's printed value"
+        (let [s (lg-buffer ["(ns demo.core)" "(+ 1 2)"] 0)
+              s (assoc s :cursor-row 1 :cursor-col 7)
+              running (lg-mode/eval-last-sexp s)
+              done (settle-first-job running)]
+          (is (= "evaluating..." (:message running)))
+          (is (:sticky? (:eval-highlight running)))
+          (is (= "=> v:(+ 1 2)" (:message done)))
+          (is (nil? (:eval-highlight done)))
+          (let [msg (last @seen)]
+            (is (= "demo.core" (get msg "ns")))
+            (is (= "/src/demo.lg" (get msg "file")))
+            (is (= 2 (get msg "line"))))))
+      (testing "output is shown above the value"
+        (let [done (settle-first-job (lg-mode/eval-last-sexp (lg-buffer ["(println 1)"] 11)))]
+          (is (= "hi\n=> v:(println 1)" (:message done)))))
+      (testing "C-j inserts the printed value, not a pr-str of a string"
+        (let [done (settle-first-job (lg-mode/eval-print-last-sexp (lg-buffer ["(+ 1 2)"] 7)))]
+          (is (= ["(+ 1 2)" "v:(+ 1 2)"] (:lines done)))))
+      (testing "C-j refuses to insert when the form moved meanwhile"
+        (let [running (lg-mode/eval-print-last-sexp (lg-buffer ["(+ 1 2)"] 7))
+              edited (assoc running :lines ["x(+ 1 2)"])
+              done (settle-first-job edited)]
+          (is (= ["x(+ 1 2)"] (:lines done)))
+          (is (string/includes? (:message done) "form moved"))))
+      (testing "C-c C-v splices the printed value"
+        (let [done (settle-first-job (lg-mode/eval-replace-sexp (lg-buffer ["a (+ 1 2) b"] 4)))]
+          (is (= ["a v:(+ 1 2) b"] (:lines done)))))
+      (testing "C-c C-e is load-file with the whole buffer"
+        (let [done (settle-first-job (lg-mode/eval-buffer (lg-buffer ["(ns demo.core)" "(def x 1)"] 0)))]
+          (is (= "=> v:(ns demo.core)\n(def x 1)" (:message done)))
+          (is (= "load-file" (get (last @seen) "op")))
+          (is (= "demo.lg" (get (last @seen) "file-name")))))
+      (testing "a server error is an ordinary eval error"
+        (let [done (settle-first-job (lg-mode/eval-last-sexp (lg-buffer ["(boom)"] 6)))]
+          (is (= "Eval error: kaboom" (:message done)))))
+      (testing "the let-go-mode lighter names the backend, for this project only"
+        (is (= "nrepl" ((modes/mode-status :let-go) {:filename "/src/demo.lg"})))
+        (is (nil? ((modes/mode-status :let-go) {:filename "/elsewhere/x.lg"})))
+        (is (nil? ((modes/mode-status :let-go) {}))))
+      (testing "a buffer outside the project stays in-process"
+        (let [s (-> (buf/new-state "/elsewhere/x.lg" ["(+ 1 2)"])
+                    (modes/switch-to-mode :let-go)
+                    (assoc :cursor-col 7))]
+          (is (= "=> 3" (:message (lg-mode/eval-last-sexp s)))))))))
+
+(deftest reply->info-shapes
+  (testing "cider-nrepl info"
+    (is (= {:name "sq" :ns "demo" :kind nil :arglists ["[x]" "[x y]"] :doc "Sq."
+            :file "file:/a.clj" :line 3 :column 1}
+           (nrepl/reply->info [{"name" "sq" "ns" "demo" "doc" "Sq." "arglists-str" "[x]\n[x y]"
+                                "file" "file:/a.clj" "line" 3 "column" 1 "status" ["done"]}]))))
+  (testing "cider-nrepl eldoc"
+    (is (= ["[f]" "[f coll]"]
+           (:arglists (nrepl/reply->info [{"name" "map" "ns" "clojure.core" "type" "function"
+                                           "eldoc" [["f"] ["f" "coll"]] "status" ["done"]}])))))
+  (testing "nREPL's built-in lookup nests its answer"
+    (is (= "Sq." (:doc (nrepl/reply->info [{"info" {"name" "sq" "doc" "Sq."} "status" ["done"]}])))))
+  (testing "nothing known"
+    (is (nil? (nrepl/reply->info [{"status" ["done" "no-info"]}])))
+    (is (nil? (nrepl/reply->info [{"status" ["done"]}])))))
+
+(deftest lookup-message-picks-the-op
+  (is (= {:op "eldoc" :sym "map" :ns "demo"}
+         (nrepl/lookup-message {:ops #{"eldoc" "info"}} "map" 'demo :eldoc)))
+  (is (= {:op "info" :sym "map" :ns "demo"}
+         (nrepl/lookup-message {:ops #{"eldoc" "info"}} "map" 'demo :info)))
+  (is (= {:op "lookup" :sym "map"} (nrepl/lookup-message {:ops #{"lookup"}} "map" nil :eldoc))))
+
+(deftest lookups-go-through-the-server
+  (with-fake-connection
+    (fn [_conn _seen]
+      (testing "eldoc: asks in the background, then shows the answer"
+        (let [s (-> (lg-buffer ["(sq 1)"] 3) (assoc :message nil))
+              asking (lookup/eldoc s)
+              done (settle-first-job asking)]
+          (is (nil? (:message asking)))
+          (is (seq (:async-jobs asking)))
+          (is (= "demo.core/sq: [x]" (:message done)))
+          (testing "and answers from its cache next time, without asking"
+            (let [again (lookup/eldoc (assoc s :message nil))]
+              (is (= "demo.core/sq: [x]" (:message again)))
+              (is (empty? (:async-jobs again)))))))
+      (testing "doc"
+        (let [done (settle-first-job (lookup/show-doc (lg-buffer ["(sq 1)"] 2)))]
+          (is (= "demo.core/sq" (first (get-in done [:buffer-command :state :lines]))))))
+      (testing "M-. in the same file moves point"
+        (let [done (settle-first-job (lookup/find-definition (lg-buffer ["(sq 1)" "(defn sq [x])"] 2)))]
+          (is (= [1 0] [(:cursor-row done) (:cursor-col done)]))
+          (is (nil? (:message done))))))))
+
+(deftest disconnected-means-in-process-again
+  (is (not (nrepl/connected?)))
+  (is (= :in-process @lg-mode/current-eval-backend))
+  (let [s (lg-mode/eval-last-sexp (lg-buffer ["(+ 1 2)"] 7))]
+    (is (= "=> 3" (:message s)))
+    (is (nil? (:async-jobs s))))
+  (is (nil? ((modes/mode-status :let-go) {:filename "/src/demo.lg"})))
+  (is (= "Not connected to nREPL" (:message (nrepl/nrepl-disconnect (lg-buffer [""] 0))))))

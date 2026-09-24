@@ -42,8 +42,11 @@ lg test/run.lg
 Run a single test namespace (faster iteration than the full suite):
 
 ```sh
-lg -e "(require '[test :refer [run-tests]] '[test.region-test]) (run-tests)"
+lg -e "(require '[test :refer [run-tests]] '[test.region-test]) (run-tests 'test.region-test)"
 ```
+
+(`run-tests` with no arguments tests only `*ns*`, like Clojure's, so name
+the namespace -- a bare `(run-tests)` reports 0 tests and success.)
 
 There's no separate build/lint step — `lg` interprets `.lg` source directly.
 `test/run.lg` is a hand-maintained list of every test namespace; adding a
@@ -254,11 +257,46 @@ form at point, highlights it, snapshots its source, and evaluates it through
 `bufs/spawn-task`. Completion verifies that the source span is unchanged
 before replacing it. Ordinary values use `pr-str`; functions that need
 source-aware application return `replacement-result` with a registered
-result-kind handler. This async/result seam is also the intended boundary
-for a future nREPL backend: `register-eval-backend!` installs an async-safe
-`(fn [request] -> value)` and `use-eval-backend!` selects it. Requests carry
-the source plus filename/column/namespace context; backends never touch live
-buffer state.
+result-kind handler. The same seam carries every other eval command: all four build one
+request (`:op` `:eval`/`:load`, `:source`, `:forms`, `:state`, `:backend`,
+and filename/directory/line/column/namespace `:context`) and hand it to
+the buffer's backend. Which backend is `letgo/eval-backend-for`: the
+first registered resolver that claims the buffer, else the global
+`current-eval-backend` -- resolvers run every frame (the lighter), so they
+must stay string checks, no filesystem. With `:in-process`,
+`C-x C-e`/`C-j`/`C-c C-e` still eval synchronously on the main thread (so
+editor-scripting forms take effect before the next frame); any other
+backend makes them `spawn-task` jobs too. Remote backends return
+`printed-result` (text the server printed, plus captured output) since
+the value never existed in this VM. Completion
+(`legmacs.modes.letgo-complete`, TAB/M-TAB) routes the same way through a
+per-backend `completers` registry, and so do eldoc, doc and `M-.`
+(`legmacs.modes.letgo-lookup`, a `lookups` registry of `(fn [request] ->
+info-map)`). let-go-mode's single `:after-command` now runs
+paren-matching and then `letgo/after-command-hooks` (eldoc is one), each
+in a try so a failing hook can't break editing. eldoc runs every key, so
+it scans only back to the enclosing top-level form (a `(` in column 0)
+and reads the ns form from the buffer's first 80 lines; remote answers
+come from a short-TTL cache, fetched by a quiet `spawn-task`. Goto uses
+a `:visit` buffer-command (show buffer by `:id`/`:filename`/`:name`, or
+open `:state`, at `:row`/`:col`) and a shared `:xref-stack` for `M-,`.
+
+`legmacs.nrepl` is the nREPL backend: one connection per project root
+(buffers with a `:filename` under it resolve to it; fileless buffers like
+`*scratch*` never do), one blocking bencode round trip per request,
+serialized by a channel-token lock, inside the job's future -- so no
+long-lived reader goroutine exists for `loop-wait` to keep polling.
+`legmacs.jack-in` starts servers from data launch configs. let-go
+interop can't reach `cmd.Process`, so a server runs under `sh -c` that
+writes a pid file, redirects output to a log (an unread pipe would fill
+and block it) and `exec`s the command; the editor holds its stdin pipe
+open (`lg -n` exits on EOF) and stops it with SIGTERM + closing stdin.
+Liveness is `ps -o stat=`, not `kill -0`: an exited child is a zombie
+until Waited, and `kill -0` says a zombie is alive. `bufs/add-exit-hook!`
+hooks run after `main.lg` restores the terminal; both namespaces use it
+so no server outlives the editor. The editor picks the port
+(`os/free-port`) rather than reading `.nrepl-port`, which Babashka
+doesn't write for port 0. Backends never touch live buffer state.
 
 `legmacs.vibe/vibe` uses that protocol rather than owning a special key
 command. Under the dynamic `letgo/*eval-replace-context*` it derives its
