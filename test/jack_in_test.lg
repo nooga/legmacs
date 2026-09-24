@@ -64,7 +64,7 @@
       (is (= "server exited: $ sh -c 'echo no such flag >&2; exit 3' | no such flag"
              (try (j/await-server proc 20000) (catch e (or (ex-message e) (str e))))))
       (is (not (j/alive? proc)))
-      (finally (j/stop! proc) (os/delete-tree dir)))))
+      (finally (j/stop! proc) (os/sh "rm" "-rf" dir)))))
 
 (deftest jack-in-starts-connects-and-stops-plain-lg
   (let [dir (temp-project)
@@ -92,4 +92,4 @@
           (is (not (contains? @j/processes (:pid-file proc))))))
       (finally
         (nrepl/close-all!)
-        (os/delete-tree dir)))))
+        (os/sh "rm" "-rf" dir)))))

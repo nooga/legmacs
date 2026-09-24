@@ -86,7 +86,7 @@
       (spit (str root "/.nrepl-port") "7888\n")
       (is (= "7888" (nrepl/find-port-file deep)))
       (is (= "7888" (nrepl/find-port-file root)))
-      (finally (os/delete-tree root)))))
+      (finally (os/sh "rm" "-rf" root)))))
 
 ;; --- fake server ----------------------------------------------------------
 

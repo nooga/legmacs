@@ -37,9 +37,11 @@ jobs:
         run: |
           go build -C "$GITHUB_WORKSPACE/../let-go" -o "$GITHUB_WORKSPACE/../lg" .
 
+      # lg goes on PATH too: the jack-in tests start a real `lg -n` server
+      # the same way the editor does.
       - name: Run test suite
         run: |
-          "$GITHUB_WORKSPACE/../lg" test/run.lg
+          PATH="$GITHUB_WORKSPACE/..:$PATH" "$GITHUB_WORKSPACE/../lg" test/run.lg
 
       # Full AOT native build (build lg, lower legmacs.*, bundle, go build) -- the
       # same path release.yml ships. Guards against a build break landing on main.
