@@ -30,7 +30,9 @@
             [test.kbd-macro-test]
             [test.acme-extension-test]
             [test.vibe-test]
-            [test.nrepl-test]))
+            [test.nrepl-test]
+            [test.jack-in-test]
+            [test.letgo-complete-test]))
 
 ;; run-tests with no args only tests *ns* (test.run itself, which has none).
 (run-all-tests #"test\..*-test")

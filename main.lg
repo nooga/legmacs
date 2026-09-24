@@ -27,7 +27,9 @@
             [legmacs.modes.crutch]
             [legmacs.modes.keycast]
             [legmacs.modes.help]
+            [legmacs.modes.letgo-complete]
             [legmacs.nrepl]
+            [legmacs.jack-in]
             ;; :refer, not just :as -- (vibe "...") typed into a buffer is
             ;; read and evaluated *in this namespace* (see legmacs.modes.letgo's
             ;; docstring). vibe.lg also intern's `vibe` into let-go.core so a
@@ -171,7 +173,8 @@
     (try
       (run workspace)
       (finally
-        (shutdown-terminal!)))))
+        (shutdown-terminal!)
+        (bufs/run-exit-hooks!)))))
 
 ;; Guard the launch so AOT compilation (`lg -c` / `lg -b`, which set
 ;; *compiling-aot* true before running top-level forms to harvest the

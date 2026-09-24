@@ -529,6 +529,24 @@
   [v orig]
   (alter-var-root v (constantly (make-tracked-spawn orig))))
 
+(def exit-hooks
+  "name -> (fn [] ...) run once as the editor exits, after the terminal is
+   restored. For resources that must not outlive the editor -- a jacked-in
+   nREPL server process, for one."
+  (atom {}))
+
+(defn add-exit-hook!
+  "Register (or replace) the exit hook called `name`."
+  [name f]
+  (swap! exit-hooks assoc name f)
+  name)
+
+(defn run-exit-hooks!
+  "Run every exit hook; a throwing hook doesn't stop the others."
+  []
+  (doseq [f (vals @exit-hooks)]
+    (try (f) (catch e nil))))
+
 (defn install-spawn-tracking!
   "Wrap go* and future* so loop-wait can poll while they run. Idempotent.
    async/go* is a copy of the native taken at boot, not the core var, so

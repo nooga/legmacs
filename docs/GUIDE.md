@@ -236,10 +236,12 @@ forms that aren't also valid let-go:
 | `C-j` | evaluate the s-expression before point, insert the result right there |
 | `C-c C-v` | asynchronously evaluate the region or form at point and replace it with the result |
 | `C-c C-e` | evaluate the whole buffer |
-| `C-c M-c` | connect to an nREPL server; every eval key above then runs there (see [nREPL](#nrepl)) |
-| `C-c C-q` | disconnect from nREPL, back to in-process eval |
+| `C-c M-j` | jack in: start the project's nREPL server (lgx, Clojure CLI, Babashka or `lg`) and connect (see [nREPL](#nrepl)) |
+| `C-c M-c` | connect to an nREPL server that is already running |
+| `C-c C-q` | disconnect this project from nREPL (stopping a jacked-in server), back to in-process eval |
 | `RET` | newline, aligned under the form it's inside |
-| `TAB` | re-indent the current line the same way |
+| `TAB` | re-indent the current line the same way; if that changes nothing and point is after a symbol, complete it |
+| `M-TAB` | complete the symbol at point (`C-M-i` sends this) |
 | `C-c e` | expand the selection outward (word → sexp → next sexp up → ...) |
 | `C-c u` | contract the selection back in, undoing the last expand |
 | `(` / `[` / `{` | insert the matching closer too, point left between them |
@@ -426,13 +428,71 @@ other commands show verbatim. While any backend other than `:in-process`
 is selected, `C-x C-e`, `C-j` and `C-c C-e` go through it asynchronously
 too, and the let-go-mode lighter names it.
 
+### Completion
+
+`TAB` in let-go-mode re-indents, and when the line is already indented
+right and point sits just after a symbol, completes it instead (Emacs's
+`tab-always-indent 'complete`); `M-TAB` always completes. One candidate
+is inserted; several sharing a longer prefix insert that prefix; otherwise
+they open in the minibuffer picker, fuzzy-filtered, with each candidate's
+type and namespace beside it and arglists/doc on the selected one.
+
+Candidates come from wherever the buffer evaluates. In-process that is the
+editor's own VM: the buffer's namespace if it's loaded (else the current
+one), `alias/` prefixes from its aliases *and* from its `ns` form's
+`:require`s (so a file you haven't evaluated still completes `str/`), and
+special forms. On an nREPL connection the server answers, using
+cider-nrepl's context-aware `complete` when it has it. A backend supplies
+its own with
+`(legmacs.modes.letgo-complete/register-completer! :backend f)`.
+
 ### nREPL
 
-[`legmacs/nrepl.lg`](../legmacs/nrepl.lg) is the one such backend that
-ships. Start a server next to your project with `lg -n` (it writes
-`.nrepl-port`), then `C-c M-c` (`M-x nrepl-connect`) in a let-go buffer:
-the prompt is pre-filled from the nearest `.nrepl-port` at or above the
-buffer's directory, and a bare port means localhost. From then on:
+legmacs is an nREPL client
+([`legmacs/nrepl.lg`](../legmacs/nrepl.lg)), and can start the server for
+you ([`legmacs/jack_in.lg`](../legmacs/jack_in.lg)), CIDER-style.
+
+**Jack-in.** `C-c M-j` (`M-x nrepl-jack-in`) in a let-go/Clojure buffer
+finds the project root (the nearest directory with a marker file), picks
+how to start it, starts it on a free port, waits for it, and connects:
+
+| Project | Marker | Server command |
+|---|---|---|
+| lgx | `lgx.edn` | `lgx nrepl --port N` |
+| Clojure CLI | `deps.edn` | `clojure -Sdeps '{nrepl + cider-nrepl}' -M -m nrepl.cmdline --port N --middleware '[cider.nrepl/cider-middleware]'` |
+| Babashka | `bb.edn` | `bb nrepl-server N` |
+| let-go (`lg`) | `deps.edn`, or none | `lg -n -p N` |
+
+`deps.edn` is both a Clojure CLI and a plain-`lg` project file, and
+`bb.edn` often sits next to it, so the buffer's extension decides (`.lg`
+→ lgx, else lg; `.clj`/`.cljc`/`.cljs` → Clojure CLI; `.bb` → Babashka);
+a real tie asks. A lone `.lg` file with no project gets `lg -n` in its
+own directory. `M-x nrepl-jack-in-command` shows the command line for
+editing first (CIDER's `C-u C-c M-j`), and `M-x nrepl-server-log` shows
+the server's output -- which is also where to look when a jack-in fails
+(the echo area gets the log's last lines). The first Clojure CLI jack-in
+in a project downloads nrepl and cider-nrepl, which can take a couple of
+minutes; the editor stays usable meanwhile. Knobs:
+`legmacs.jack-in/clojure-cli-aliases` (e.g. `":dev:test"`),
+`nrepl-version`, `cider-nrepl-version` and `startup-timeout-ms` are atoms.
+A new kind of project is one `register-launch-config!` call (see the
+namespace docstring for the map's keys).
+
+**Connections are per project.** A buffer visiting a file under a
+connected project's root evaluates and completes on that project's
+server; the lighter says `nrepl:clj` (or `:bb`, `:lg`, `:lgx`, or plain
+`nrepl` for a manual connection). Buffers without a file, `*scratch*`
+and `*repl*` among them, stay in the editor's VM, so two projects on two
+servers and editor scripting all work at once. `C-c C-q` disconnects the
+buffer's project and stops its server if jack-in started it; every
+connection and server is closed when the editor exits.
+
+**Connecting by hand.** For a server you started yourself, `C-c M-c`
+(`M-x nrepl-connect`) prompts for host:port, pre-filled from the nearest
+`.nrepl-port` (`lg -n` and `lgx nrepl` write one); a bare port means
+localhost.
+
+While connected:
 
 - `C-x C-e` / `C-j` / `C-c C-v` send the form with the buffer's `ns`,
   file, line and column; `C-c C-e` is the server's `load-file`
@@ -445,12 +505,10 @@ buffer's directory, and a bare port means localhost. From then on:
 - `C-j` checks the form is still where it was before inserting, like
   `C-c C-v` does, and both check you're still in the same buffer
 
-`C-c C-q` (`M-x nrepl-disconnect`) goes back to in-process eval. The
-`*repl*` buffer always stays in-process: it is the editor's own REPL.
 Requests are one blocking round trip at a time inside the usual
 `spawn-task` future, so there is no background reader for the main loop to
 poll; `C-g` drops a pending result but the server still finishes the
-request (let-go's server doesn't implement `interrupt` yet).
+request.
 
 Any file ending in `.md` or `.markdown` opens into **markdown-mode**
 (highlighting only, no key bindings of its own, so every global key still
@@ -850,7 +908,9 @@ Set `LEGMACS_CONFIG_DIR` to use a different directory than
 | [`legmacs/lisp_syntax.lg`](../legmacs/lisp_syntax.lg) | Pure bracket/string/comment scanner. What paren matching, syntax highlighting, auto-indent, and expand-region are all built on. |
 | [`legmacs/modes/letgo.lg`](../legmacs/modes/letgo.lg) | let-go-mode: structural form discovery, in-process eval, async eval-and-replace, syntax highlighting, paren matching, auto-indent, expand-region, auto-paired brackets. Registered for `*scratch*`, `.lg` files, and (syntax-only) `.clj`/`.cljc`/`.cljs`/`.bb`/`.edn` files. |
 | [`legmacs/modes/repl.lg`](../legmacs/modes/repl.lg) | The `*repl*` buffer (`C-c C-z`): plain let-go-mode plus a `:repl` minor mode that reinterprets `RET` as evaluate-if-complete, else newline-and-indent. |
-| [`legmacs/nrepl.lg`](../legmacs/nrepl.lg) | nREPL client (`C-c M-c` / `C-c C-q`): bencode round trips over `net`, registered as the `:nrepl` eval backend so every let-go-mode eval command runs on the server while connected. |
+| [`legmacs/nrepl.lg`](../legmacs/nrepl.lg) | nREPL client (`C-c M-c` / `C-c C-q`): bencode round trips over `net`, one connection per project root, registered as the `:nrepl` eval backend and completer for buffers under a connected root. |
+| [`legmacs/jack_in.lg`](../legmacs/jack_in.lg) | `C-c M-j`: launch configs (lgx, Clojure CLI, Babashka, lg), project detection, and the server process's lifecycle -- spawn under `sh`, wait for the port, stop on disconnect or exit. |
+| [`legmacs/modes/letgo_complete.lg`](../legmacs/modes/letgo_complete.lg) | Symbol completion for let-go-mode (`TAB` / `M-TAB`): in-process from the editor's VM, or from the buffer's nREPL server. |
 | [`legmacs/vibe.lg`](../legmacs/vibe.lg) | `(vibe "...")`: ask an LLM for let-go code, deriving surrounding-buffer context when invoked by generic `C-c C-v`, then use a tagged eval-result handler to rewrite namespaces and add missing `(:require ...)`s. |
 | [`legmacs/modes/markdown.lg`](../legmacs/modes/markdown.lg) | markdown-mode: syntax highlighting only (headers, emphasis, code, links, quotes, lists, rules, and fenced code blocks carried across lines). Registered for `.md`/`.markdown` files. |
 | [`legmacs/modes/prog.lg`](../legmacs/modes/prog.lg) | The language pack: one spec-driven line scanner (comments, strings, keyword/type/constant sets, `#directives`, `$variables`, call sites, and multi-line strings carried across lines) behind major modes for Go, JS/TS, Python, C/C++, shell, rc, Rust, JSON, YAML, TOML, Lua, Ruby, SQL, Dockerfile, CSS, HTML, Zig, Java, Kotlin, Swift, C#, PHP, and Makefile. `register-prog-mode!` is the one-call way to add a language; the same spec map also becomes the mode's `:syntax-spec`. |

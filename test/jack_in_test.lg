@@ -1,0 +1,95 @@
+(ns test.jack-in-test
+  (:require [test :refer :all]
+            [string]
+            [os]
+            [legmacs.buffer :as buf]
+            [legmacs.modes :as modes]
+            [legmacs.modes.letgo :as lg-mode]
+            [legmacs.nrepl :as nrepl]
+            [legmacs.jack-in :as j]))
+
+(defn- configs [] (vals @j/launch-configs))
+
+(defn- exists-in [files]
+  (let [files (set files)] (fn [p] (contains? files p))))
+
+(defn- detected [files dir filename]
+  (let [{:keys [root candidates]} (j/detect (configs) dir filename (exists-in files))]
+    [root (mapv :name candidates)]))
+
+(deftest detection-picks-root-and-config
+  (testing "the nearest marker wins, and the extension picks between deps.edn users"
+    (is (= ["/p" [:let-go]] (detected ["/p/deps.edn"] "/p/src/a" "/p/src/a/core.lg")))
+    (is (= ["/p" [:clojure-cli]] (detected ["/p/deps.edn"] "/p/src" "/p/src/core.clj"))))
+  (testing "lgx outranks plain lg for .lg files"
+    (is (= ["/p" [:lgx]] (detected ["/p/deps.edn" "/p/lgx.edn"] "/p" "/p/main.lg"))))
+  (testing "bb.edn next to deps.edn: .clj goes to the CLI, .bb to Babashka"
+    (is (= ["/p" [:clojure-cli]] (detected ["/p/deps.edn" "/p/bb.edn"] "/p" "/p/x.clj")))
+    (is (= ["/p" [:babashka]] (detected ["/p/deps.edn" "/p/bb.edn"] "/p" "/p/tasks.bb"))))
+  (testing "a Babashka-only project takes any Clojure file"
+    (is (= ["/p" [:babashka]] (detected ["/p/bb.edn"] "/p" "/p/script.clj"))))
+  (testing "no file to go by is a genuine tie: ask, best guess first"
+    (is (= ["/p" [:clojure-cli :let-go]] (detected ["/p/deps.edn"] "/p" nil))))
+  (testing "a lone .lg file with no project runs plain lg where it is"
+    (is (= ["/tmp/x" [:let-go]] (detected [] "/tmp/x" "/tmp/x/hack.lg")))))
+
+(deftest commands-are-quoted-for-sh
+  (is (= "'it'\\''s'" (j/shell-quote "it's")))
+  (is (= "'lg' '-n' '-p' '7000'" (j/command-line (j/lg-command 7000))))
+  (let [argv (j/clojure-cli-command 7000)]
+    (is (= "clojure" (first argv)))
+    (is (some #{"-M"} argv))
+    (is (string/includes? (nth argv 2) "cider/cider-nrepl"))
+    (is (= ["--port" "7000"] (take 2 (drop-while #(not= "--port" %) argv)))))
+  (let [old @j/clojure-cli-aliases]
+    (reset! j/clojure-cli-aliases ":dev:test")
+    (is (some #{"-M:dev:test"} (j/clojure-cli-command 1)))
+    (reset! j/clojure-cli-aliases old)))
+
+(defn- temp-project []
+  (let [dir (str (os/temp-dir) "legmacs-jack-in-test-" (rand-int 1000000))]
+    (os/sh "mkdir" "-p" (str dir "/src"))
+    (spit (str dir "/deps.edn") "{:paths [\"src\"]}")
+    (spit (str dir "/src/demo.lg") "(ns demo)\n(defn sq [x] (* x x))\n(sq 7)")
+    dir))
+
+(defn- settle [state]
+  (let [job (first (:async-jobs state))]
+    ((:then job) (assoc state :async-jobs nil) (deref (:promise job)))))
+
+(deftest a-server-that-dies-is-reported-not-waited-for
+  (let [dir (temp-project)
+        proc (j/spawn! dir "sh -c 'echo no such flag >&2; exit 3'" (os/free-port))]
+    (try
+      (is (= "server exited: $ sh -c 'echo no such flag >&2; exit 3' | no such flag"
+             (try (j/await-server proc 20000) (catch e (or (ex-message e) (str e))))))
+      (is (not (j/alive? proc)))
+      (finally (j/stop! proc) (os/delete-tree dir)))))
+
+(deftest jack-in-starts-connects-and-stops-plain-lg
+  (let [dir (temp-project)
+        file (str dir "/src/demo.lg")
+        s (-> (buf/new-state file (buf/split-lines (slurp file)))
+              (modes/switch-to-mode :let-go))]
+    (try
+      (let [starting (j/nrepl-jack-in s)
+            connected (settle starting)
+            conn (nrepl/connection-for connected)
+            proc (:process conn)]
+        (is (string/starts-with? (:message starting) "Starting let-go (lg) nREPL in "))
+        (is (string/starts-with? (:message connected) "Jacked in: 127.0.0.1:"))
+        (is (= dir (:root conn)))
+        (is (= "nrepl:lg" ((modes/mode-status :let-go) connected)))
+        (testing "the buffer now evaluates in the server"
+          (is (= "=> 49" (:message (settle (lg-mode/eval-buffer connected))))))
+        (testing "a second jack-in for the same project refuses"
+          (is (string/starts-with? (:message (j/nrepl-jack-in connected)) "Already connected")))
+        (testing "disconnecting stops the server"
+          (nrepl/nrepl-disconnect connected)
+          (sleep 300)
+          (is (not (j/alive? proc)))
+          (is (nil? (nrepl/connection-for connected)))
+          (is (not (contains? @j/processes (:pid-file proc))))))
+      (finally
+        (nrepl/close-all!)
+        (os/delete-tree dir)))))

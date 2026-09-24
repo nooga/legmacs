@@ -27,6 +27,7 @@
             [legmacs.indent :as indent]
             [legmacs.keymap :as km :refer [defcommand]]
             [legmacs.modes :as modes]
+            [legmacs.path :as path]
             [legmacs.lisp-syntax :as ls]))
 
 (def keymap (atom {}))
@@ -358,7 +359,7 @@
         (and (seq? n) (= 'with-meta (first n))) (second n)
         :else nil))))
 
-(defn- buffer-ns-name
+(defn buffer-ns-name
   "The name in the first top-level `(ns ...)` form, or nil if the buffer
    has none (or can't be read)."
   [state]
@@ -506,7 +507,15 @@
 ;;    :source  the text to evaluate
 ;;    :forms   read forms (:eval only; the in-process backend wants them)
 ;;    :state   the buffer snapshot (in-process only; remote backends ignore it)
-;;    :context {:text :source :start :end :filename :line :column :namespace}}
+;;    :backend the backend chosen for this buffer when the command ran
+;;    :context {:text :source :start :end :filename :directory :line :column
+;;              :namespace}}
+;;
+;; Which backend a buffer uses is `eval-backend-for`: the first registered
+;; resolver that claims the buffer (nREPL claims buffers visiting files
+;; under a connected project's root), else the global
+;; `current-eval-backend`. So two projects on two servers, and *scratch*
+;; in the editor's own VM, all coexist.
 ;;
 ;; The in-process backend is also the synchronous one: while it is selected
 ;; C-x C-e / C-j / C-c C-e eval right on the main thread, exactly as before
@@ -554,16 +563,41 @@
   (when (contains? @eval-backends name)
     (reset! current-eval-backend name)))
 
+(def eval-backend-resolvers
+  "Registered (fn [state] -> nil | {:backend kw :label str}) resolvers,
+   by name. Called for the lighter on every frame, so they must be cheap:
+   no filesystem, no network -- string checks against state they keep."
+  (atom {}))
+
+(defn register-eval-backend-resolver!
+  "Let `resolver` claim buffers for a backend (see eval-backend-resolvers)."
+  [name resolver]
+  (swap! eval-backend-resolvers assoc name resolver)
+  name)
+
+(defn- try-resolver [resolver state]
+  (try (resolver state) (catch e nil)))
+
+(defn eval-backend-for
+  "{:backend kw :label str-or-nil} for `state`: the first resolver that
+   claims it, else the global current-eval-backend."
+  [state]
+  (or (some (fn [r] (try-resolver r state)) (vals @eval-backend-resolvers))
+      (let [b @current-eval-backend]
+        {:backend b :label (when (not= :in-process b) (name b))})))
+
 (defn remote-eval-backend?
-  "True when evals leave this VM, i.e. go async through bufs/spawn-task."
-  []
-  (not= :in-process @current-eval-backend))
+  "True when `state`'s evals leave this VM, i.e. go async through
+   bufs/spawn-task."
+  [state]
+  (not= :in-process (:backend (eval-backend-for state))))
 
 (defn- eval-backend-status
-  "let-go-mode lighter: names the backend, but only when it isn't the
-   default in-process one."
-  [_state]
-  (when (remote-eval-backend?) (name @current-eval-backend)))
+  "let-go-mode lighter: names the buffer's backend, but only when it isn't
+   the default in-process one."
+  [state]
+  (let [{:keys [backend label]} (eval-backend-for state)]
+    (when (not= :in-process backend) (or label (name backend)))))
 
 (defn printed-result
   "What a remote backend returns: `text` is the value as the server printed
@@ -597,14 +631,16 @@
   [state op start end source forms]
   (let [[row column] (buf/row-col-of state start)]
     {:op op :state state :forms forms :source source
+     :backend (:backend (eval-backend-for state))
      :context {:text (buf/buffer-text state) :source source :start start :end end
-               :filename (:filename state) :line (inc row) :column column
+               :filename (:filename state) :directory (path/default-directory state)
+               :line (inc row) :column column
                :namespace (buffer-ns-name state)}}))
 
 (defn- eval-backend-value [request]
-  (if-let [backend (get @eval-backends @current-eval-backend)]
+  (if-let [backend (get @eval-backends (:backend request))]
     (backend request)
-    (throw (str "Unknown eval backend " (pr-str @current-eval-backend)))))
+    (throw (str "Unknown eval backend " (pr-str (:backend request))))))
 
 (defn- eval-backend-io [request]
   (fn [] (eval-backend-value request)))
@@ -658,7 +694,7 @@
     (case status
       :none (assoc state :message "No preceding sexp")
       :error (assoc state :message (str "Read error: " forms))
-      (if (remote-eval-backend?)
+      (if (remote-eval-backend? state)
         (run-eval-remote state f needs-span? start end source forms)
         (run-eval-local state f start end forms)))))
 
@@ -757,7 +793,7 @@
    namespace (or the buffer's ns form, restored afterwards). With a remote
    backend this is the server's load-file."
   [state]
-  (if (remote-eval-backend?)
+  (if (remote-eval-backend? state)
     (eval-buffer-remote state)
     (try
       (let [result (load-preserving-ns (buf/buffer-text state))]

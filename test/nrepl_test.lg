@@ -133,16 +133,13 @@
         outcome (deref (:promise job))]
     ((:then job) (assoc state :async-jobs nil) outcome)))
 
-(defn- with-fake-connection [f]
+(defn- with-fake-connection
+  "Run (f conn seen) with a fake server connected for the /src project."
+  [f]
   (let [{:keys [port seen]} (start-fake-server)
-        old @lg-mode/current-eval-backend
-        conn (nrepl/open-connection "127.0.0.1" port)]
-    (reset! nrepl/connection conn)
-    (lg-mode/use-eval-backend! :nrepl)
+        conn (nrepl/register-connection! "/src" (nrepl/open-connection "127.0.0.1" port))]
     (let [outcome (try {:ok (f conn seen)} (catch e {:err e}))]
-      (nrepl/close-connection conn)
-      (reset! nrepl/connection nil)
-      (reset! lg-mode/current-eval-backend old)
+      (nrepl/remove-connection! "/src")
       (when (contains? outcome :err) (throw (:err outcome)))
       (:ok outcome))))
 
@@ -202,8 +199,15 @@
       (testing "a server error is an ordinary eval error"
         (let [done (settle-first-job (lg-mode/eval-last-sexp (lg-buffer ["(boom)"] 6)))]
           (is (= "Eval error: kaboom" (:message done)))))
-      (testing "the let-go-mode lighter names the backend"
-        (is (= "nrepl" ((modes/mode-status :let-go) {})))))))
+      (testing "the let-go-mode lighter names the backend, for this project only"
+        (is (= "nrepl" ((modes/mode-status :let-go) {:filename "/src/demo.lg"})))
+        (is (nil? ((modes/mode-status :let-go) {:filename "/elsewhere/x.lg"})))
+        (is (nil? ((modes/mode-status :let-go) {}))))
+      (testing "a buffer outside the project stays in-process"
+        (let [s (-> (buf/new-state "/elsewhere/x.lg" ["(+ 1 2)"])
+                    (modes/switch-to-mode :let-go)
+                    (assoc :cursor-col 7))]
+          (is (= "=> 3" (:message (lg-mode/eval-last-sexp s)))))))))
 
 (deftest disconnected-means-in-process-again
   (is (not (nrepl/connected?)))
@@ -211,5 +215,5 @@
   (let [s (lg-mode/eval-last-sexp (lg-buffer ["(+ 1 2)"] 7))]
     (is (= "=> 3" (:message s)))
     (is (nil? (:async-jobs s))))
-  (is (nil? ((modes/mode-status :let-go) {})))
+  (is (nil? ((modes/mode-status :let-go) {:filename "/src/demo.lg"})))
   (is (= "Not connected to nREPL" (:message (nrepl/nrepl-disconnect (lg-buffer [""] 0))))))

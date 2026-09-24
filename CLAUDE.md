@@ -258,18 +258,36 @@ form at point, highlights it, snapshots its source, and evaluates it through
 before replacing it. Ordinary values use `pr-str`; functions that need
 source-aware application return `replacement-result` with a registered
 result-kind handler. The same seam carries every other eval command: all four build one
-request (`:op` `:eval`/`:load`, `:source`, `:forms`, `:state`, and
-filename/line/column/namespace `:context`) and hand it to the selected
-backend. With `:in-process` selected, `C-x C-e`/`C-j`/`C-c C-e` still eval
-synchronously on the main thread (so editor-scripting forms take effect
-before the next frame); any other backend makes them `spawn-task` jobs too.
-Remote backends return `printed-result` (text the server printed, plus
-captured output) since the value never existed in this VM. `legmacs.nrepl`
-is that backend for nREPL: one blocking bencode round trip per request,
+request (`:op` `:eval`/`:load`, `:source`, `:forms`, `:state`, `:backend`,
+and filename/directory/line/column/namespace `:context`) and hand it to
+the buffer's backend. Which backend is `letgo/eval-backend-for`: the
+first registered resolver that claims the buffer, else the global
+`current-eval-backend` -- resolvers run every frame (the lighter), so they
+must stay string checks, no filesystem. With `:in-process`,
+`C-x C-e`/`C-j`/`C-c C-e` still eval synchronously on the main thread (so
+editor-scripting forms take effect before the next frame); any other
+backend makes them `spawn-task` jobs too. Remote backends return
+`printed-result` (text the server printed, plus captured output) since
+the value never existed in this VM. Completion
+(`legmacs.modes.letgo-complete`, TAB/M-TAB) routes the same way through a
+per-backend `completers` registry.
+
+`legmacs.nrepl` is the nREPL backend: one connection per project root
+(buffers with a `:filename` under it resolve to it; fileless buffers like
+`*scratch*` never do), one blocking bencode round trip per request,
 serialized by a channel-token lock, inside the job's future -- so no
-long-lived reader goroutine exists for `loop-wait` to keep polling. The
-`*repl*` buffer deliberately stays in-process. Backends never touch live
-buffer state.
+long-lived reader goroutine exists for `loop-wait` to keep polling.
+`legmacs.jack-in` starts servers from data launch configs. let-go
+interop can't reach `cmd.Process`, so a server runs under `sh -c` that
+writes a pid file, redirects output to a log (an unread pipe would fill
+and block it) and `exec`s the command; the editor holds its stdin pipe
+open (`lg -n` exits on EOF) and stops it with SIGTERM + closing stdin.
+Liveness is `ps -o stat=`, not `kill -0`: an exited child is a zombie
+until Waited, and `kill -0` says a zombie is alive. `bufs/add-exit-hook!`
+hooks run after `main.lg` restores the terminal; both namespaces use it
+so no server outlives the editor. The editor picks the port
+(`os/free-port`) rather than reading `.nrepl-port`, which Babashka
+doesn't write for port 0. Backends never touch live buffer state.
 
 `legmacs.vibe/vibe` uses that protocol rather than owning a special key
 command. Under the dynamic `letgo/*eval-replace-context*` it derives its
